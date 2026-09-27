@@ -97,16 +97,33 @@ factory.example.com {
 }
 ```
 
-## Dry-run (no external services needed)
-
-Exercises the full agent loop against a throwaway local repo with a mock card:
+## Tests
 
 ```bash
-npx tsx src/dry-run.ts
+npm test              # vitest run — hermetic unit tests
+npm run test:watch
+npm run test:coverage # + v8 coverage, fails under the per-area thresholds
+npm run typecheck     # tsc over src + scripts + test
 ```
 
-Verified working: agent reads the repo, makes the change, tests it, commits
-with a `factory:` prefix.
+Tests live in `test/`, mirroring `src/`. They are hermetic: temp dirs for SQLite and
+git fixtures, `vi.stubEnv` for env, mocked module boundaries (`@octokit/rest`,
+`discord.js`, the pi SDK, `fetch`). Nothing touches `./data/`, the target repo, your
+`.env` or the network, and no real Trello/GitHub/Discord credentials are needed.
+
+Real seams, not mocks, cover the internals: `createStore(dbPath)`,
+`runCard(cardId, bot, deps)`, `createWorktree(cardId, repoPath)`,
+`handleGitHubWebhook(req, res, bot, deps)` and `createWebhookServer(bot, deps)`.
+
+TypeScript config: `npm run build` compiles `src/` only (that is what `dist/` ships);
+`npm run typecheck` uses `tsconfig.test.json`, which adds `test/` and `scripts/`.
+CI (`.github/workflows/ci.yml`) runs build → typecheck → test on every push and PR.
+
+### Integration smoke (opt-in, real model)
+
+`npm run test:integration` runs `scripts/dry-run.ts`: a throwaway local repo plus a
+mock card, through the full agent loop. It calls a real LLM, so it is never part of
+`npm test` or CI. Override the scratch repo with `REPO_PATH=<tmp-repo>`.
 
 ## Discord commands
 
@@ -120,5 +137,6 @@ with a `factory:` prefix.
 - CI gate: after the PR opens, the worker polls GitHub statuses every 30s
   (up to `CI_TIMEOUT_MS`, default 15 min). Pass → card to Review. Fail/timeout →
   job failed, card stays in Ready (move it out and back to re-trigger).
-  Repos with no CI configured pass immediately.
+  A branch with no statuses at all reports `pending`, so repos without CI run the
+  full timeout and fail — open item, see plan/2.0-testing.md.
 - Progress embeds fire per tool call; throttle in `runner.ts` if it gets noisy

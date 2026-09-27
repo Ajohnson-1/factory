@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { config } from "../config.js";
-import { store } from "../state/store.js";
-import { trello } from "../trello/client.js";
+import { store as defaultStore, type Store } from "../state/store.js";
+import { trello as defaultTrello } from "../trello/client.js";
 import { doneEmbed } from "../discord/embeds.js";
 import type { DiscordBot } from "../discord/bot.js";
 import { json, readBody } from "../trello/webhook.js";
@@ -28,7 +28,17 @@ export function verifySignature(
   const expected =
     "sha256=" +
     crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  const given = Buffer.from(sig);
+  const want = Buffer.from(expected);
+  // timingSafeEqual throws when lengths differ — a malformed signature is a
+  // rejection, not a 500.
+  if (given.length !== want.length) return false;
+  return crypto.timingSafeEqual(given, want);
+}
+
+export interface GitHubWebhookDeps {
+  store?: Store;
+  trello?: typeof defaultTrello;
 }
 
 /**
@@ -38,8 +48,11 @@ export function verifySignature(
 export async function handleGitHubWebhook(
   req: IncomingMessage,
   res: ServerResponse,
-  bot: DiscordBot
+  bot: DiscordBot,
+  deps: GitHubWebhookDeps = {}
 ): Promise<void> {
+  const store = deps.store ?? defaultStore;
+  const trello = deps.trello ?? defaultTrello;
   const event = req.headers["x-github-event"] as string | undefined;
   const rawBody = await readBody(req);
 
@@ -77,6 +90,12 @@ export async function handleGitHubWebhook(
   } catch (err) {
     console.error("[github] trello update failed:", err);
   }
-  await bot.send(doneEmbed(job.card_name, payload.pull_request.html_url));
+  // A Discord outage must not swallow the response: no answer means GitHub
+  // times out and redelivers, re-sending an embed for an already-done card.
+  try {
+    await bot.send(doneEmbed(job.card_name, payload.pull_request.html_url));
+  } catch (err) {
+    console.error("[github] discord send failed:", err);
+  }
   json(res, 200, { done: cardId });
 }

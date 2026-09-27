@@ -2,7 +2,10 @@
  * Dry-run: exercises the full factory loop against a throwaway local repo.
  * No Trello/Discord/GitHub needed — a mock card is used.
  *
- * Usage: REPO_PATH=<tmp-repo> npx tsx src/dry-run.ts
+ * This is the opt-in integration smoke test (`npm run test:integration`);
+ * it calls a real model, so it is not part of `npm test` or CI.
+ *
+ * Usage: REPO_PATH=<tmp-repo> npx tsx scripts/dry-run.ts
  */
 import { execSync } from "node:child_process";
 import fs from "node:fs";

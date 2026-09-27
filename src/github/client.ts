@@ -38,7 +38,12 @@ export const github = {
     if (statuses.state === "failure") return "failed";
     return "pending";
   },
-  /** Poll CI until passed/failed/timeout. Repos with no CI pass immediately. */
+  /**
+   * Poll CI until passed/failed/timeout. Note: a branch whose head commit has no
+   * statuses at all (repo without CI, or checks that have not started) reports
+   * `pending`, so it polls until `timeoutMs` elapses. Behaviour fix deferred —
+   * see "Found while testing" in plan/2.0-testing.md.
+   */
   async waitForCI(
     branch: string,
     opts: { timeoutMs?: number; pollMs?: number } = {}
@@ -47,7 +52,8 @@ export const github = {
     const pollMs = opts.pollMs ?? 30_000;
     const start = Date.now();
     for (;;) {
-      const status = await this.ciStatus(branch);
+      // via `github`, not `this`, so the method survives being passed around bare
+      const status = await github.ciStatus(branch);
       if (status !== "pending") return status;
       if (Date.now() - start > timeoutMs) return "timeout";
       await new Promise((r) => setTimeout(r, pollMs));

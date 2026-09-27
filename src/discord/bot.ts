@@ -8,11 +8,36 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { store } from "../state/store.js";
+import type { Job } from "../state/store.js";
 
-const PAUSE_FLAG = path.resolve(process.cwd(), "data", "paused");
+function defaultDataDir(): string {
+  return path.resolve(process.cwd(), "data");
+}
 
-export function isPaused(): boolean {
-  return fs.existsSync(PAUSE_FLAG);
+/** Turn the worker on/off by writing (or removing) a flag file. */
+export function setPaused(paused: boolean, dataDir: string = defaultDataDir()): void {
+  const flag = path.join(dataDir, "paused");
+  if (paused) {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(flag, "1");
+  } else {
+    fs.rmSync(flag, { force: true });
+  }
+}
+
+export function isPaused(dataDir: string = defaultDataDir()): boolean {
+  return fs.existsSync(path.join(dataDir, "paused"));
+}
+
+/** Plain-text body of `/factory status`. */
+export function buildStatusText(jobs: Job[]): string {
+  if (jobs.length === 0) return "No jobs yet.";
+  return jobs
+    .map(
+      (j) =>
+        `${j.status.toUpperCase()} — ${j.card_name}${j.pr_url ? ` (${j.pr_url})` : ""}`
+    )
+    .join("\n");
 }
 
 export class DiscordBot {
@@ -45,29 +70,15 @@ export class DiscordBot {
     console.log("[discord] bot online");
   }
 
-  private async onInteraction(i: import("discord.js").Interaction): Promise<void> {
+  async onInteraction(i: import("discord.js").Interaction): Promise<void> {
     if (!i.isChatInputCommand()) return;
     if (i.commandName !== "factory") return;
     const sub = i.options.getSubcommand();
     if (sub === "status") {
-      const jobs = store.all();
-      const text =
-        jobs.length === 0
-          ? "No jobs yet."
-          : jobs
-              .map(
-                (j) =>
-                  `${j.status.toUpperCase()} — ${j.card_name}${j.pr_url ? ` (${j.pr_url})` : ""}`
-              )
-              .join("\n");
+      const text = buildStatusText(store.all());
       await i.reply({ content: `**Factory status**\n\`\`\`${text}\`\`\`` });
     } else if (sub === "pause" || sub === "resume") {
-      if (sub === "pause") {
-        fs.mkdirSync(path.dirname(PAUSE_FLAG), { recursive: true });
-        fs.writeFileSync(PAUSE_FLAG, "1");
-      } else {
-        fs.rmSync(PAUSE_FLAG, { force: true });
-      }
+      setPaused(sub === "pause");
       await i.reply(`Factory ${sub === "pause" ? "paused" : "resumed"}.`);
     }
   }

@@ -11,6 +11,13 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Card ids come from Trello/webhooks — keep them inside their path segment. */
+function seg(id: string): string {
+  return encodeURIComponent(id);
+}
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
 export interface TrelloCard {
   id: string;
   name: string;
@@ -21,28 +28,41 @@ export interface TrelloCard {
 
 export const trello = {
   async getCard(cardId: string): Promise<TrelloCard> {
-    return api<TrelloCard>(`/cards/${cardId}`);
+    return api<TrelloCard>(`/cards/${seg(cardId)}`);
   },
+  /** PUT /1/cards/{id} — update a card, here: move it to another list. */
   async moveCard(cardId: string, listId: string): Promise<void> {
-    await api(`/cards/${cardId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    await api(`/cards/${seg(cardId)}`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
       body: JSON.stringify({ idList: listId }),
     });
   },
+  /** POST /1/cards/{id}/actions/comments */
   async addComment(cardId: string, text: string): Promise<void> {
-    await api(`/cards/${cardId}/actionsComment`, {
+    await api(`/cards/${seg(cardId)}/actions/comments`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: JSON_HEADERS,
       body: JSON.stringify({ text }),
     });
   },
-  async createWebhook(cardId: string, callbackUrl: string): Promise<void>
-  {
-    await api(`/cards/${cardId}/webhooks`, {
+  /**
+   * POST /1/webhooks — webhooks are a top-level resource; the watched object
+   * (card, list or board) is the `idModel` parameter.
+   */
+  async createWebhook(
+    cardId: string,
+    callbackUrl: string,
+    description = "factory"
+  ): Promise<void> {
+    await api(`/webhooks`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: callbackUrl }),
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        callbackURL: callbackUrl,
+        idModel: cardId,
+        description,
+      }),
     });
   },
 };

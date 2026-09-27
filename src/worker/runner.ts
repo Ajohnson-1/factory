@@ -3,10 +3,9 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
 import { config } from "../config.js";
-import { trello } from "../trello/client.js";
-import { github } from "../github/client.js";
+import { trello as defaultTrello } from "../trello/client.js";
+import { github as defaultGithub } from "../github/client.js";
 import {
   startedEmbed,
   progressEmbed,
@@ -14,53 +13,108 @@ import {
   failedEmbed,
 } from "../discord/embeds.js";
 import type { DiscordBot } from "../discord/bot.js";
-import { store } from "../state/store.js";
-import { createWorktree, removeWorktree } from "./worktree.js";
+import { store as defaultStore, type Store } from "../state/store.js";
+import {
+  createWorktree,
+  removeWorktree,
+  pushBranch,
+  type Worktree,
+} from "./worktree.js";
 
 let modelRuntime: ModelRuntime | undefined;
 
+export interface AgentRunOptions {
+  dir: string;
+  prompt: string;
+  /** Called for every tool the agent starts, for Discord progress updates. */
+  onTool?: (toolName: string) => void;
+}
+
+export type RunAgent = (opts: AgentRunOptions) => Promise<void>;
+
+/** The git-side operations runCard needs. */
+export interface WorktreeOps {
+  create(cardId: string, repoPath?: string): Worktree;
+  remove(cardId: string, repoPath?: string): void;
+  push(dir: string, branch: string): void;
+}
+
+export interface RunCardDeps {
+  store?: Store;
+  trello?: typeof defaultTrello;
+  github?: typeof defaultGithub;
+  worktree?: WorktreeOps;
+  runAgent?: RunAgent;
+}
+
+/** The instruction block every factory agent is started with. */
+export function buildAgentPrompt(card: { name: string; desc: string }): string {
+  return [
+    `You are a factory coding agent. Complete this task from our Trello board.`,
+    ``,
+    `Task: ${card.name}`,
+    card.desc ? `Details:\n${card.desc}` : ``,
+    ``,
+    `Rules:`,
+    `- Work only in the current directory.`,
+    `- Make the smallest correct change that fulfills the task.`,
+    `- Run the project's tests if they exist; fix failures you cause.`,
+    `- When done, commit all changes with a message starting "factory: ".`,
+  ].join("\n");
+}
+
+/** Default agent: one pi session per card, disposed after the prompt. */
+async function runAgent({ dir, prompt, onTool }: AgentRunOptions): Promise<void> {
+  if (!modelRuntime) modelRuntime = await ModelRuntime.create();
+
+  const { session } = await createAgentSession({
+    cwd: dir,
+    modelRuntime,
+    sessionManager: SessionManager.inMemory(dir),
+  });
+
+  session.subscribe((event) => {
+    if (event.type === "tool_execution_start") onTool?.(event.toolName);
+  });
+
+  await session.prompt(prompt);
+  session.dispose();
+}
+
 /** Run one card end-to-end: worktree → pi agent → push → PR → CI. */
-export async function runCard(cardId: string, bot: DiscordBot): Promise<void> {
+export async function runCard(
+  cardId: string,
+  bot: DiscordBot,
+  deps: RunCardDeps = {}
+): Promise<void> {
+  const store = deps.store ?? defaultStore;
+  const trello = deps.trello ?? defaultTrello;
+  const github = deps.github ?? defaultGithub;
+  const worktree: WorktreeOps = deps.worktree ?? {
+    create: createWorktree,
+    remove: removeWorktree,
+    push: pushBranch,
+  };
+  const agent = deps.runAgent ?? runAgent;
+
   const job = store.get(cardId);
   if (!job) return;
   const card = await trello.getCard(cardId);
-  const { dir, branch } = createWorktree(cardId);
+  const { dir, branch } = worktree.create(cardId);
   store.setRunning(cardId, branch);
   await bot.send(startedEmbed(card.name, branch));
 
   try {
-    if (!modelRuntime) modelRuntime = await ModelRuntime.create();
-
-    const prompt = [
-      `You are a factory coding agent. Complete this task from our Trello board.`,
-      ``,
-      `Task: ${card.name}`,
-      card.desc ? `Details:\n${card.desc}` : ``,
-      ``,
-      `Rules:`,
-      `- Work only in the current directory.`,
-      `- Make the smallest correct change that fulfills the task.`,
-      `- Run the project's tests if they exist; fix failures you cause.`,
-      `- When done, commit all changes with a message starting "factory: ".`,
-    ].join("\n");
-
-    const { session } = await createAgentSession({
-      cwd: dir,
-      modelRuntime,
-      sessionManager: SessionManager.inMemory(dir),
+    await agent({
+      dir,
+      prompt: buildAgentPrompt(card),
+      onTool: (toolName) => {
+        void bot.send(progressEmbed(card.name, `tool: ${toolName}`));
+      },
     });
-
-    session.subscribe((event) => {
-      if (event.type === "tool_execution_start") {
-        void bot.send(progressEmbed(card.name, `tool: ${event.toolName}`));
-      }
-    });
-
-    await session.prompt(prompt);
-    session.dispose();
 
     // Push branch and open PR
-    execSync(`git -C ${dir} push -u origin ${branch}`, { stdio: "inherit" });
+    worktree.push(dir, branch);
     const prUrl = await github.createPR(
       branch,
       `factory: ${card.name}`,
@@ -85,13 +139,17 @@ export async function runCard(cardId: string, bot: DiscordBot): Promise<void> {
     store.setReview(cardId, prUrl);
     await bot.send(prReadyEmbed(card.name, prUrl));
     await trello.moveCard(cardId, config.trello.reviewListId());
-    await trello.addComment(cardId, `Factory opened PR: ${prUrl}`);
+    // Bookkeeping only: the PR is open and green, so a Trello comment failure
+    // must not flip a healthy run back to failed.
+    await trello
+      .addComment(cardId, `Factory opened PR: ${prUrl}`)
+      .catch((err) => console.error("[runner] trello comment failed:", err));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     store.setFailed(cardId, msg);
     await bot.send(failedEmbed(card.name, msg));
     await trello.addComment(cardId, `Factory run failed: ${msg}`).catch(() => {});
   } finally {
-    removeWorktree(cardId);
+    worktree.remove(cardId);
   }
 }

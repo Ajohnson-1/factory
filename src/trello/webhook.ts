@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { config } from "../config.js";
-import { store } from "../state/store.js";
+import { store as defaultStore, type Store } from "../state/store.js";
 import { trello } from "./client.js";
 
 export interface TrelloWebhookEvent {
@@ -10,13 +10,19 @@ export interface TrelloWebhookEvent {
   list?: { id: string; name: string };
 }
 
+export interface TrelloWebhookDeps {
+  store?: Store;
+}
+
 /**
  * Handle a Trello webhook POST. We react to card moves into the Ready list.
  * Returns true if the event was handled.
  */
 export async function handleTrelloWebhook(
-  body: TrelloWebhookEvent
+  body: TrelloWebhookEvent,
+  deps: TrelloWebhookDeps = {}
 ): Promise<boolean> {
+  const store = deps.store ?? defaultStore;
   if (body.model !== "card" || body.action !== "updateCard" || !body.card) {
     return false;
   }
