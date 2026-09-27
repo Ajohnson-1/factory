@@ -11,6 +11,28 @@ agents (pi); Discord is the command center.
 - **Orchestrator host:** server/VPS (Node 22 + pi, systemd, Caddy for HTTPS)
 - **Discord↔Trello bridge:** built into the orchestrator (webhooks + discord.js)
 
+## Phase plans (2.x)
+
+- [2.0 — Test suite for the MVP](2.0-testing.md) — Vitest, testability refactors,
+  per-module unit tests, CI gate. Do first; later phases build on its seams.
+- [2.1 — Secret isolation](2.1-secret-isolation.md) — agents run in ephemeral Docker
+  containers (worktree + LLM key only); `.env` never reachable.
+- [2.2 — Agent graphs](2.2-agent-graph.md) — orchestrator agent with `spawn_agent`
+  tool fans out spec-writer / researcher / coder / verifier in parallel worktrees.
+- [2.3 — PR reviewer](2.3-pr-reviewer.md) — reviewer agent pulls down factory PRs on
+  create/update and posts PR comments (summary + line comments).
+
+Order: 2.0 → 2.1 → 2.2 → 2.3 (each reuses the previous phase's seams).
+
+## Decisions (2.x, confirmed)
+
+- **Test framework:** Vitest (ESM/TS, vi.mock, coverage); tests in `test/` mirroring `src/`
+- **Secret boundary:** container isolation — one Docker container per agent session
+  (pi CLI `--mode json`); push/PR stay on the host with real tokens
+- **Agent graph:** dynamic — orchestrator agent decides roles at runtime via a
+  `spawn_agent` custom tool; parallel children in detached worktrees merged back into
+  the card branch
+
 ## Architecture
 
 ```
@@ -45,6 +67,13 @@ factory/
 6. Card → **Review**; Discord gets "✅ PR ready" with link
 7. PR merges (GitHub webhook) → card → **Done**
 8. Discord commands: `/factory status`, `/factory retry`, `/factory pause`
+
+## Testing
+
+- Vitest; `npm test` (unit, hermetic — no network, temp dirs, mocked SDKs),
+  `npm run test:integration` (opt-in, real LLM).
+- Testability seams: `createStore(dbPath)` factory, `runCard(deps)`, git helpers via
+  `execFileSync`. See [2.0](2.0-testing.md) for the policy.
 
 ## MVP scope
 
