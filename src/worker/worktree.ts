@@ -204,6 +204,17 @@ export function changedFiles(dir: string, baseRef: string): string[] {
     .sort();
 }
 
+/**
+ * `git diff --stat baseRef...HEAD` — the human-readable size of a child's work,
+ * which is what the orchestrator gets back so it can judge a run by more than
+ * "it said it finished".
+ */
+export function diffStat(dir: string, baseRef: string): string {
+  return execFileSync("git", ["-C", dir, "diff", "--stat", `${baseRef}...HEAD`], {
+    encoding: "utf8",
+  }).trim();
+}
+
 export type MergeResult =
   | { ok: true; commit: string }
   | { ok: false; conflict: true; files: string[]; output: string };

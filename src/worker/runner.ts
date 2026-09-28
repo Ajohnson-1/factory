@@ -9,7 +9,12 @@ import {
   progressEmbed,
   prReadyEmbed,
   failedEmbed,
+  agentStartedEmbed,
+  agentDoneEmbed,
+  agentLabel,
 } from "../discord/embeds.js";
+import { runCardGraph, type GraphDeps, type GraphResult } from "../agents/graph.js";
+import type { AgentEvent } from "../agents/spawn.js";
 import type { DiscordBot } from "../discord/bot.js";
 import { store as defaultStore, type Store } from "../state/store.js";
 import {
@@ -41,6 +46,37 @@ export interface RunCardDeps {
   github?: typeof defaultGithub;
   worktree?: WorktreeOps;
   runAgent?: RunAgent;
+  /**
+   * The phase 2.2 graph runner. Injectable because a test must be able to drive
+   * a whole card without docker, and the graph otherwise owns N containers.
+   */
+  graph?: (deps: GraphDeps) => Promise<GraphResult>;
+}
+
+/**
+ * One agent's timeline entry, as Discord sees it: `[coder-1] tool: edit`.
+ *
+ * Children run in parallel, so these interleave by design — the role and run
+ * prefix is what keeps an interleaved stream readable.
+ */
+async function reportAgentEvent(
+  bot: DiscordBot,
+  cardName: string,
+  event: AgentEvent
+): Promise<void> {
+  switch (event.kind) {
+    case "started":
+      await bot.send(agentStartedEmbed(cardName, event.role, event.runId, event.task));
+      return;
+    case "done":
+      await bot.send(agentDoneEmbed(cardName, event.role, event.runId, event.status));
+      return;
+    case "tool":
+      await bot.send(
+        progressEmbed(cardName, `[${agentLabel(event.role, event.runId)}] tool: ${event.toolName}`)
+      );
+      return;
+  }
 }
 
 /** The instruction block every factory agent is started with. */
@@ -103,6 +139,11 @@ export async function runCard(
     gitDir: commonGitDir,
   };
   const agent = deps.runAgent ?? selectAgentRuntime();
+  // An explicit single-agent override always wins: it is the seam tests and
+  // `AGENT_RUNTIME=process` use, and routing it through a graph would make
+  // `deps.runAgent` mean two different things.
+  const graphMode =
+    deps.graph !== undefined || (!deps.runAgent && config.factory.agentGraph);
 
   const job = store.get(cardId);
   if (!job) return;
@@ -113,19 +154,42 @@ export async function runCard(
   await bot.send(startedEmbed(card.name, branch));
 
   try {
-    await agent({
-      dir,
-      gitDir,
-      prompt: buildAgentPrompt(card),
-      onTool: (toolName) => {
-        void bot.send(progressEmbed(card.name, `tool: ${toolName}`));
-      },
-    });
+    if (graphMode) {
+      const graph = deps.graph ?? runCardGraph;
+      const outcome = await graph({
+        store,
+        cardId,
+        baseDir: dir,
+        gitDir,
+        card,
+        onEvent: (event) => {
+          void reportAgentEvent(bot, card.name, event).catch(() => {});
+        },
+      });
+      if (outcome.status !== "ok") {
+        throw new Error(outcome.summary || `agent graph ${outcome.status}`);
+      }
+      // Children committed and merged onto the card branch already, so a clean
+      // working tree here is the normal case and must not fail the run the way a
+      // clean tree fails a single agent that was meant to leave changes behind.
+      // Anything still uncommitted (a shared-role file the spawner could not
+      // commit) is taken here.
+      worktree.commit(dir, `factory: ${card.name}`);
+    } else {
+      await agent({
+        dir,
+        gitDir,
+        prompt: buildAgentPrompt(card),
+        onTool: (toolName) => {
+          void bot.send(progressEmbed(card.name, `tool: ${toolName}`));
+        },
+      });
 
-    // Commit on the host: the agent's container has no writable .git and no
-    // push credentials, which is the point of the boundary.
-    if (!worktree.commit(dir, `factory: ${card.name}`)) {
-      throw new Error("the agent left no changes to ship");
+      // Commit on the host: the agent's container has no writable .git and no
+      // push credentials, which is the point of the boundary.
+      if (!worktree.commit(dir, `factory: ${card.name}`)) {
+        throw new Error("the agent left no changes to ship");
+      }
     }
 
     // Push branch and open PR

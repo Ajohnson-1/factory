@@ -28,6 +28,35 @@ RUN useradd -m agent \
   && mkdir -p /home/agent/.pi/agent \
   && chmod -R 0777 /home/agent
 
+# The orchestrator's custom tool, baked in rather than mounted.
+#
+# An extension resolves its imports from its own directory upward, and pi's own
+# dependencies are nested inside its package — `@earendil-works/pi-ai` is not in
+# `$(npm root -g)`. Mounting the extension anywhere else fails the import with
+# ERR_MODULE_NOT_FOUND (verified against this image). /opt/factory/node_modules
+# links the two packages the extension is allowed to import, and the check below
+# fails the *build* if that layout ever stops holding, instead of failing a card
+# at run time.
+RUN set -eux; \
+    ROOT="$(npm root -g)"; \
+    PI="$ROOT/@earendil-works/pi-coding-agent"; \
+    test -f "$PI/package.json"; \
+    mkdir -p /opt/factory/extensions /opt/factory/node_modules/@earendil-works; \
+    ln -s "$PI" /opt/factory/node_modules/@earendil-works/pi-coding-agent; \
+    for pkg in pi-ai pi-agent-core; do \
+      if [ -d "$PI/node_modules/@earendil-works/$pkg" ]; then \
+        ln -s "$PI/node_modules/@earendil-works/$pkg" "/opt/factory/node_modules/@earendil-works/$pkg"; \
+      elif [ -d "$ROOT/@earendil-works/$pkg" ]; then \
+        ln -s "$ROOT/@earendil-works/$pkg" "/opt/factory/node_modules/@earendil-works/$pkg"; \
+      fi; \
+    done; \
+    test -d /opt/factory/node_modules/@earendil-works/pi-ai; \
+    cd /opt/factory; \
+    node --input-type=module -e "import('@earendil-works/pi-ai').then((m) => process.exit(m.Type ? 0 : 1)).catch(() => process.exit(1))"; \
+    node --input-type=module -e "import('@earendil-works/pi-coding-agent').then((m) => process.exit(m.defineTool ? 0 : 1)).catch(() => process.exit(1))"
+
+COPY extensions/spawn-agent.ts /opt/factory/extensions/spawn-agent.ts
+
 # The only repository in sight is the one the orchestrator mounted on purpose,
 # and its owner uid will not match ours, so git's "dubious ownership" check has
 # nothing here to protect. The mount is read-only: the agent can read history and

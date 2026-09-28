@@ -530,6 +530,15 @@ describe("runCard", () => {
 });
 
 describe("agent runtime selection", () => {
+  // These are the MVP's single-agent handoff tests: they assert exactly what one
+  // container is handed. Phase 2.2 made the graph the default path for a card
+  // with no injected agent, so this block opts out of it explicitly rather than
+  // quietly testing something else — the graph path has its own tests in
+  // test/worker/runner-graph.test.ts.
+  beforeEach(() => {
+    vi.stubEnv("AGENT_GRAPH", "0");
+  });
+
   it("defaults to the container runtime", () => {
     vi.stubEnv("AGENT_RUNTIME", "container");
 

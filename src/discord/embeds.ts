@@ -27,6 +27,41 @@ export function progressEmbed(cardName: string, detail: string): EmbedBuilder {
     );
 }
 
+/**
+ * How one agent on a card's timeline is named: `[coder-1]`, `[verifier]`.
+ *
+ * Run ids are minted as `c1`, `c2`… so the suffix is folded into the label;
+ * anything else (the orchestrator's `orch`) reads better unqualified than
+ * doubled into `orchestrator-orch`.
+ */
+export function agentLabel(role: string, runId: string): string {
+  const seq = /^c(\d+)$/.exec(runId ?? "");
+  return seq ? `${role}-${seq[1]}` : role;
+}
+
+export function agentStartedEmbed(cardName: string, role: string, runId: string, task: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle(`🤖 ${agentLabel(role, runId)} started`)
+    .addFields(
+      { name: "Card", value: cardName, inline: true },
+      { name: "Task", value: task.slice(0, 1024) }
+    );
+}
+
+export function agentDoneEmbed(
+  cardName: string,
+  role: string,
+  runId: string,
+  status: string
+): EmbedBuilder {
+  const good = status === "ok";
+  return new EmbedBuilder()
+    .setColor(good ? COLORS.success : COLORS.failure)
+    .setTitle(`${good ? "✅" : "❌"} ${agentLabel(role, runId)} ${status}`)
+    .addFields({ name: "Card", value: cardName, inline: true });
+}
+
 export function prReadyEmbed(cardName: string, prUrl: string): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(COLORS.success)

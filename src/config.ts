@@ -74,5 +74,70 @@ export const config = {
     get agentCpus(): number {
       return num("AGENT_CPUS", 1);
     },
+    /**
+     * How many child containers one card may have running at once. Children are
+     * the point: N coders at `AGENT_MEMORY` each is the number that can hurt the
+     * host, so this caps the fan-out the orchestrator can ask for.
+     */
+    get maxParallelAgents(): number {
+      return Math.max(1, num("MAX_PARALLEL_AGENTS", 4));
+    },
+    /** Per-child wall clock. On expiry the container is killed, not just abandoned. */
+    get agentTimeoutMs(): number {
+      return num("AGENT_TIMEOUT_MS", 20 * 60_000);
+    },
+    /**
+     * Hard budget of agent runs per card, so an orchestrator that loops cannot
+     * spend unbounded tokens. Told to the orchestrator in its system prompt and
+     * enforced on the host, which is the only place that can actually refuse.
+     */
+    get maxAgentRuns(): number {
+      return num("MAX_AGENT_RUNS", 12);
+    },
+    /** Model pattern for every agent run. Empty keeps pi's own default. */
+    get agentModel(): string {
+      return opt("AGENT_MODEL");
+    },
+    /** Model for the orchestrator only — it is the long-lived, expensive session. */
+    get orchestratorModel(): string {
+      return opt("ORCHESTRATOR_MODEL") || opt("AGENT_MODEL");
+    },
+    /**
+     * Whether a card is driven by an orchestrator agent that fans out children
+     * (phase 2.2) or by the MVP's single agent per card. On by default; off is
+     * the escape hatch for a card whose graph misbehaves, since the two paths
+     * differ only in who decides the work.
+     */
+    get agentGraph(): boolean {
+      return opt("AGENT_GRAPH", "1").toLowerCase() !== "0";
+    },
+    /**
+     * Address the host's spawn-IPC listener binds to. Loopback by default, and
+     * loopback is what works on Docker Desktop (verified: a container reaches a
+     * host `127.0.0.1` listener through `host.docker.internal`). On a Linux host
+     * `--add-host=host.docker.internal:host-gateway` arrives at the bridge
+     * address instead, so a real deployment has to widen this — and then a
+     * per-run token is the only thing gating an endpoint that starts containers.
+     */
+    get ipcBind(): string {
+      return opt("FACTORY_IPC_BIND", "127.0.0.1");
+    },
+    /** 0 lets the OS pick a free port, which is what parallel cards need. */
+    get ipcPort(): number {
+      return num("FACTORY_IPC_PORT", 0);
+    },
+    /** Extra seconds the in-container tool waits on the host before giving up. */
+    get ipcSlackMs(): number {
+      return num("FACTORY_IPC_SLACK_MS", 60_000);
+    },
+    /**
+     * Host path to a pi `models.json` (custom/openai-compatible endpoints),
+     * mounted read-only into every agent container. Off by default: the two
+     * mount paths are the agent's whole filesystem view and adding a third has
+     * to be a deliberate choice. It is how the local test models reach agents.
+     */
+    get agentModelsFile(): string {
+      return opt("FACTORY_AGENT_MODELS_FILE");
+    },
   },
 };

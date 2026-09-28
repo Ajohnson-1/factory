@@ -1,0 +1,38 @@
+{
+  // The in-container agent extensions (deploy/docker/extensions/*.ts).
+  //
+  // They are excluded from tsconfig.json because that config emits `src` into
+  // `dist`: these files are loaded by pi's jiti inside the agent image and must
+  // not be compiled by the build. They are still typechecked here, because an
+  // extension that fails to load takes every graph run down with it, and the
+  // failure otherwise surfaces only inside a container.
+  //
+  // The imports stay bare (`@earendil-works/pi-ai`) because that is what jiti
+  // resolves at run time, through the /opt/factory/node_modules shim the image
+  // builds. On the host, npm nests pi-ai under pi instead of hoisting it, so the
+  // specifier is unreachable from this checkout — hence `paths`.
+  //
+  // They point at the declaration file rather than the package directory:
+  // mapping a directory makes TypeScript read pi through its CommonJS exports
+  // entry and reject pi's ES output ("the COPIED .js file ... is not a match for
+  // the ORIGINAL .d.ts"), while naming the .d.ts checks the code the way Node
+  // runs it. If pi moves these files the typecheck fails loudly, which is the
+  // right outcome next to a container that cannot start.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // tsconfig.json pins rootDir to `src` for the build; this program sits
+    // outside it, and leaving the inherited value makes tsc refuse the file.
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-coding-agent": [
+        "./node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+      ],
+      "@earendil-works/pi-ai": [
+        "./node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
+      ]
+    }
+  },
+  "include": ["deploy/docker/extensions"]
+}
