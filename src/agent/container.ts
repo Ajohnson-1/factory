@@ -13,6 +13,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { config } from "../config.js";
 import { buildAgentEnv } from "./env.js";
 import type { AgentRunResult } from "./types.js";
 
@@ -63,6 +64,25 @@ export interface DockerArgsOptions {
   gitDir?: string;
   /** `--user uid:gid`; defaults to the orchestrator's own ids so host files stay its. */
   user?: string;
+  /** `--memory`. Empty/undefined means no limit. */
+  memory?: string;
+  /** `--cpus`. Undefined/0/negative means no limit. */
+  cpus?: number;
+}
+
+/** Values that mean "do not cap this container". */
+const UNLIMITED = new Set(["", "0", "none", "off", "unlimited"]);
+
+/** `--memory <v>` / `--cpus <v>`, omitted when unset or asked to be unlimited. */
+export function buildResourceArgs(opts: { memory?: string; cpus?: number }): string[] {
+  const args: string[] = [];
+  const memory = (opts.memory ?? "").trim().toLowerCase();
+  if (memory && !UNLIMITED.has(memory)) args.push("--memory", opts.memory!.trim());
+  const cpus = opts.cpus;
+  if (typeof cpus === "number" && Number.isFinite(cpus) && cpus > 0) {
+    args.push("--cpus", String(cpus));
+  }
+  return args;
 }
 
 /**
@@ -84,6 +104,7 @@ export function buildDockerArgs(
     "--security-opt",
     "no-new-privileges",
     "--init",
+    ...buildResourceArgs(opts),
     ...(opts.user ? ["--user", opts.user] : []),
     ...buildEnvArgs(opts.env ?? buildAgentEnv()),
     opts.image ?? AGENT_IMAGE,
@@ -288,6 +309,11 @@ export function runAgentInContainer(
   const args = buildDockerArgs(opts.dir, opts.prompt, {
     ...opts,
     user: opts.user ?? currentUserId(),
+    // Resource limits are resolved here rather than at each call site: phase 2.2
+    // starts N containers per card, and a child that forgot to pass them would
+    // be the one that takes the host down. Explicit opts always win.
+    memory: opts.memory ?? config.factory.agentMemory,
+    cpus: opts.cpus ?? config.factory.agentCpus,
   });
   const collector = createAgentEventCollector(opts.onTool);
 

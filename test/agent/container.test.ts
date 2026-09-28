@@ -12,11 +12,13 @@ import {
   buildDockerArgs,
   buildEnvArgs,
   buildMountArgs,
+  buildResourceArgs,
   createAgentEventCollector,
   findGitConfigSecrets,
   runAgentInContainer,
 } from "../../src/agent/container.js";
 import { FACTORY_SECRET_ENV_KEYS } from "../../src/agent/env.js";
+import { config } from "../../src/config.js";
 import { makeTempDir, removeTempDir } from "../helpers/tmp.js";
 
 // Nothing here may exec a real docker binary — the unit suite stays hermetic.
@@ -250,8 +252,59 @@ describe("buildDockerArgs", () => {
     expect(call?.[0]).toBe("docker");
     expect(call?.[2]).toMatchObject({ stdio: ["ignore", "pipe", "pipe"] });
     expect(call?.[1]).toEqual(
-      buildDockerArgs(WT, PROMPT, { gitDir: GIT_DIR, user: hostUser() })
+      buildDockerArgs(WT, PROMPT, {
+        gitDir: GIT_DIR,
+        user: hostUser(),
+        // the spawner fills these from config; spelled out here so the expected
+        // argv is the whole argv, not a partial match that hides a missing flag
+        memory: config.factory.agentMemory,
+        cpus: config.factory.agentCpus,
+      })
     );
+  });
+});
+
+describe("buildResourceArgs", () => {
+  it("caps memory and cpus when both are given", () => {
+    expect(buildResourceArgs({ memory: "2g", cpus: 1.5 })).toEqual(["--memory", "2g", "--cpus", "1.5"]);
+  });
+
+  // Every one of these means "leave this container uncapped" — a plain 0 or an
+  // empty AGENT_MEMORY= in the deploy env must not reach docker.
+  it("omits limits that are unset or asked to be unlimited", () => {
+    for (const memory of [undefined, "", "0", "none", "off", "unlimited", " NONE "]) {
+      expect(buildResourceArgs({ memory }), `memory=${JSON.stringify(memory)}`).toEqual([]);
+    }
+    for (const cpus of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(buildResourceArgs({ cpus }), `cpus=${String(cpus)}`).toEqual([]);
+    }
+  });
+
+  it("passes a docker-sized memory value through untouched", () => {
+    // docker accepts `512m`, `2g`, `1073741824`; we are not in the business of
+    // parsing them, only of not mangling them.
+    for (const memory of ["512m", "2g", "1073741824"]) {
+      expect(buildResourceArgs({ memory })).toEqual(["--memory", memory]);
+    }
+  });
+});
+
+describe("buildDockerArgs — resource limits", () => {
+  it("places the limits before the image so docker still parses them", () => {
+    const a = buildDockerArgs(WT, PROMPT, { gitDir: GIT_DIR, memory: "2g", cpus: 1 });
+    const imageAt = a.indexOf(AGENT_IMAGE);
+
+    expect(a.indexOf("--memory")).toBeGreaterThan(-1);
+    expect(a.indexOf("--memory") + 1).toBeLessThan(imageAt);
+    expect(a[a.indexOf("--memory") + 1]).toBe("2g");
+    expect(a[a.indexOf("--cpus") + 1]).toBe("1");
+  });
+
+  it("adds nothing when the limits are not asked for", () => {
+    const a = buildDockerArgs(WT, PROMPT).join("\n");
+
+    expect(a).not.toContain("--memory");
+    expect(a).not.toContain("--cpus");
   });
 });
 
@@ -521,6 +574,27 @@ describe("runAgentInContainer (fake docker)", () => {
     expect(result.ok).toBe(false);
     expect(result.text).toContain("failed to start the agent container");
     expect(result.text).toContain("ENOENT");
+  });
+
+  // Parallel children (phase 2.2) are the reason the cap lives here instead of
+  // at each call site: a spawn path that forgets it still gets bounded.
+  it("applies the configured resource limits by default", async () => {
+    vi.stubEnv("AGENT_MEMORY", "512m");
+    vi.stubEnv("AGENT_CPUS", "0.5");
+    await drive([], { dir: WT, prompt: PROMPT });
+
+    const argv = spawnMock.mock.calls[0]?.[1] ?? [];
+    expect(argv[argv.indexOf("--memory") + 1]).toBe("512m");
+    expect(argv[argv.indexOf("--cpus") + 1]).toBe("0.5");
+  });
+
+  it("lets an explicit unlimited opt out of the configured cap", async () => {
+    vi.stubEnv("AGENT_MEMORY", "2g");
+    await drive([], { dir: WT, prompt: PROMPT, memory: "none", cpus: 0 });
+
+    const argv = spawnMock.mock.calls[0]?.[1] ?? [];
+    expect(argv).not.toContain("--memory");
+    expect(argv).not.toContain("--cpus");
   });
 
   it("hands dir, gitDir and image through to argv", async () => {

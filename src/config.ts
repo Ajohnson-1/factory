@@ -63,5 +63,16 @@ export const config = {
     get agentImage(): string {
       return opt("AGENT_IMAGE", "factory-agent");
     },
+    /**
+     * `docker run --memory` for every agent container. Phase 2.2 runs N children
+     * at once, so the cap is per container, not per card. Set empty to lift it.
+     */
+    get agentMemory(): string {
+      return opt("AGENT_MEMORY", "2g");
+    },
+    /** `docker run --cpus` for every agent container. Set 0 to lift it. */
+    get agentCpus(): number {
+      return num("AGENT_CPUS", 1);
+    },
   },
 };
