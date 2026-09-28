@@ -356,59 +356,73 @@ export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
   }): Promise<{ status: SpawnStatus; summary: string; diff: string }> {
     const { role, runId, dir, baseHead, result, detached } = args;
     const workDir = detached ? dir : deps.baseDir;
-    const changed = safe(() => worktree.changedFiles(workDir, baseHead), [] as string[]);
-    const diff = safe(() => worktree.diffStat(workDir, baseHead), "");
     let status: SpawnStatus = result.ok ? "ok" : looksLikeTimeout(result.text) ? "timeout" : "failed";
     let landing: string;
+    let changed: string[] = [];
+    let diff = "";
 
     if (status !== "ok") {
       landing = "run did not finish cleanly; nothing was committed or merged";
-    } else if (changed.length === 0) {
-      // "It said it finished and wrote nothing" is a failure the orchestrator has
-      // to be able to see, or an empty child silently becomes a shipped no-op.
-      status = "failed";
-      landing = "reported success but changed no files";
-    } else if (detached && role.mergeBack) {
-      landing = await merges.withLock(async () => {
-        if (!safe(() => worktree.commit(dir, `factory: ${role.id} ${runId}`), false)) {
-          status = "failed";
-          return "nothing could be committed from the child worktree";
-        }
-        const merged = safe(
-          () =>
-            worktree.merge(
-              deps.baseDir,
-              childBranchFor(deps.cardId, runId),
-              `factory: merge ${role.id} ${runId}`
-            ),
-          undefined
-        );
-        if (!merged) {
-          status = "failed";
-          return "the merge command failed";
-        }
-        if (merged.ok) {
-          return `merged into the card branch as ${merged.commit.slice(0, 8)}`;
-        }
-        // The plan keeps conflict resolution inside the LLM loop: base is already
-        // clean (mergeChildIntoBase aborts), so say what clashed and let the
-        // orchestrator re-spawn the task with that in its context.
-        status = "failed";
-        return (
-          `MERGE CONFLICT with the card branch — nothing from this run landed. ` +
-          `Conflicting files: ${merged.files.join(", ") || "(unknown)"}. ` +
-          `Re-spawn this task with the conflict above as context.`
-        );
-      });
-    } else if (!detached && role.writesWork) {
-      // Shared-worktree roles are single writers by design: the host commits
-      // straight onto the card branch, there is nothing to merge.
-      landing = safe(() => worktree.commit(deps.baseDir, `factory: ${role.id} ${runId}`), false)
-        ? "committed to the card branch"
-        : "nothing could be committed";
-      if (landing !== "committed to the card branch") status = "failed";
+    } else if (!role.writesWork) {
+      // `verifier` exists to report. An empty diff is its *successful* outcome,
+      // so the "changed nothing" guard below must not apply to it — otherwise
+      // every passing verification would be reported to the orchestrator as a
+      // failed child.
+      landing = "report only — this role changes nothing";
     } else {
-      landing = "report only — this role's work is not merged";
+      // Commit FIRST, on the host, before measuring anything. A child container's
+      // `.git` is read-only, so a real agent always leaves its work uncommitted in
+      // the working tree — and `changedFiles`/`diffStat` compare commits, so
+      // measuring before committing reads as "changed no files" and throws the
+      // child's work away. Caught by scripts/graph-smoke.ts against a real model.
+      const committed = safe(
+        () => worktree.commit(workDir, `factory: ${role.id} ${runId}`),
+        false
+      );
+      changed = safe(() => worktree.changedFiles(workDir, baseHead), [] as string[]);
+      diff = safe(() => worktree.diffStat(workDir, baseHead), "");
+
+      if (!committed && changed.length === 0) {
+        // "It said it finished and wrote nothing" is a failure the orchestrator
+        // has to see, or an empty child silently becomes a shipped no-op.
+        status = "failed";
+        landing = "reported success but changed no files";
+      } else if (detached && role.mergeBack) {
+        landing = await merges.withLock(async () => {
+          const merged = safe(
+            () =>
+              worktree.merge(
+                deps.baseDir,
+                childBranchFor(deps.cardId, runId),
+                `factory: merge ${role.id} ${runId}`
+              ),
+            undefined
+          );
+          if (!merged) {
+            status = "failed";
+            return "the merge command failed";
+          }
+          if (merged.ok) {
+            return `merged into the card branch as ${merged.commit.slice(0, 8)}`;
+          }
+          // The plan keeps conflict resolution inside the LLM loop: base is already
+          // clean (mergeChildIntoBase aborts), so say what clashed and let the
+          // orchestrator re-spawn the task with that in its context.
+          status = "failed";
+          return (
+            `MERGE CONFLICT with the card branch — nothing from this run landed. ` +
+            `Conflicting files: ${merged.files.join(", ") || "(unknown)"}. ` +
+            `Re-spawn this task with the conflict above as context.`
+          );
+        });
+      } else if (committed) {
+        // Shared-worktree roles are single writers by design: the host committed
+        // straight onto the card branch, so there is nothing to merge.
+        landing = "committed to the card branch";
+      } else {
+        status = "failed";
+        landing = "the change is in the working tree but could not be committed";
+      }
     }
 
     const summary = truncate(

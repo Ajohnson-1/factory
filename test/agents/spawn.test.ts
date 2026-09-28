@@ -7,28 +7,24 @@
  * `afterEach`.
  *
  * ---------------------------------------------------------------------
- * BUG-1 (read before trusting the "happy path" tests here)
+ * BUG-1 — found by scripts/graph-smoke.ts, fixed in src/agents/spawn.ts
  *
- * `land()` measures a child's work with
- * `changedFiles(dir, baseHead)` = `git diff --name-only <baseHead>...HEAD`,
- * i.e. a commit-to-commit range, taken *before* the host commits anything
- * (`src/agents/spawn.ts`, the two `const changed` / `const diff` lines).
- * The only work a child can ever leave is uncommitted -- its container has
- * `.git` mounted read-only -- and a child worktree's HEAD is its fork point,
- * i.e. exactly `baseHead`. So the range is always empty.
+ * `land()` used to measure a child's work with
+ * `changedFiles(dir, baseHead)` = `git diff --name-only <baseHead>...HEAD`, a
+ * commit-to-commit range, taken *before* the host committed anything. But the
+ * only work a child can ever leave is uncommitted — its container has `.git`
+ * mounted read-only — and a child worktree's HEAD is its fork point, exactly
+ * `baseHead`, so the range was always empty and every successful child was
+ * reported as "changed no files" and thrown away.
  *
- * Consequences, all asserted rather than assumed:
- *  - any run that reports success and leaves uncommitted work is classified
- *    `failed: reported success but changed no files`;
- *  - the commit+merge branch and the shared-worktree commit branch below it
- *    are unreachable with the default worktree ops;
- *  - the "reported success but changed no files" guard fires for *every*
- *    successful run, so it cannot distinguish an empty run from a full one.
+ * The unit suite stayed green through all of that because `committingFake`
+ * committed half of its own work to make the host path reachable, which modelled
+ * a child that cannot exist. Worth remembering as the shape of a bad fake: it did
+ * not just hide the bug, it made the green tests evidence that the bug was absent.
  *
- * The landing tests therefore use a fake that commits half of its work
- * (`committingFake`) so the host's commit + merge path is genuinely reached.
- * Tests that pin the current behaviour are marked BUG-1 and assert what the
- * code does today, not what the plan asked for.
+ * `land()` now commits on the host before measuring, so every fake here writes
+ * files and leaves them uncommitted — the only thing a real child can do. The
+ * two tests at the end of "detached coder" pin the regression directly.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -128,24 +124,31 @@ function writeOnlyFake(files: Record<string, string>, text = "implemented"): Run
 }
 
 /**
- * A fake that leaves a commit *and* a further uncommitted edit.
+ * A fake that leaves its work uncommitted, exactly like a real child.
  *
- * The commit half exists purely because of BUG-1: `changedFiles` only sees
- * commits, so without it every run reads as "changed no files" and the host's
- * commit step is never reached. The uncommitted half is what the host itself
- * commits, so the real `commitWork` + `mergeChildIntoBase` code runs.
+ * This used to make its own commit, because `changedFiles` only saw commits and
+ * an uncommitted child was wrongly reported as "changed no files" — so the fake
+ * had to work around the ordering bug for the host path to be reachable at all.
+ * `land()` now commits on the host before measuring, which is what
+ * scripts/graph-smoke.ts proved was needed against a real model.
  */
 function committingFake(files: Record<string, string>, text = "implemented"): RunChild {
+  return writeOnlyFake(files, text);
+}
+
+/**
+ * A fake writing a different file on every call.
+ *
+ * Two children that write byte-identical content genuinely change nothing on the
+ * second run — the child branches from a base that already has that file — so a
+ * test that wants N landed runs needs N distinct changes.
+ */
+function sequentialFileFake(): RunChild {
+  let n = 0;
   return async (options) => {
-    writeFiles(options.dir, files);
-    commitIn(options.dir, "fake child: first half");
-    writeFiles(
-      options.dir,
-      Object.fromEntries(
-        Object.entries(files).map(([name, body]) => [name, `${body}\n// landed by the host\n`])
-      )
-    );
-    return { ok: true, text };
+    n += 1;
+    writeFiles(options.dir, { [`src/part${n}.js`]: `export const part${n} = ${n};\n` });
+    return { ok: true, text: `wrote src/part${n}.js` };
   };
 }
 
@@ -274,7 +277,7 @@ describe("run budget", () => {
       cardId: CARD,
       baseDir,
       gitDir,
-      runChild: committingFake({ "src/greet.js": "export const greet = () => 'hi';\n" }),
+      runChild: sequentialFileFake(),
       limits,
     });
 
@@ -340,7 +343,7 @@ describe("detached coder", () => {
     expect(gitOut(baseDir, "log", "-1", "--pretty=%s")).toBe("factory: merge coder c1");
     expect(treeFiles(baseDir)).toContain("src/greet.js");
     expect(fs.readFileSync(path.join(baseDir, "src", "greet.js"), "utf8")).toContain(
-      "landed by the host"
+      "export const greet"
     );
     expect(gitOut(baseDir, "status", "--porcelain")).toBe("");
 
@@ -443,7 +446,10 @@ describe("detached coder", () => {
     expect(summaries[1]).toContain("diff --stat");
   });
 
-  it("BUG-1: a coder that leaves only uncommitted work is reported as changing no files, and nothing lands", async () => {
+  it("lands a coder's uncommitted work: the host commits it, then merges it", async () => {
+    // The behaviour scripts/graph-smoke.ts exposed against a real model: an agent
+    // container has a read-only .git, so uncommitted work is the ONLY state a
+    // finished child can be in. Measuring it before committing threw the work away.
     const spawner = createAgentSpawner({
       store,
       cardId: CARD,
@@ -456,19 +462,43 @@ describe("detached coder", () => {
 
     const outcome = await spawner.spawn({ role: "coder", task: "implement greet()" });
 
-    // What the plan expects here is a landed merge. What the code does is decide
-    // the child changed nothing, because `changedFiles` diffs `<base>...HEAD` and
-    // the child's work is not committed (see the BUG-1 note at the top).
-    expect(outcome.status).toBe("failed");
-    expect(outcome.summary).toContain("reported success but changed no files");
-    expect(outcome.summary).toContain("diff --stat: (nothing)");
+    expect(outcome.status).toBe("ok");
+    expect(outcome.summary).toContain("merged into the card branch");
+    expect(outcome.summary).toContain("src/greet.js");
+    expect(outcome.summary).toContain("diff --stat:");
+    expect(outcome.summary).not.toContain("changed no files");
 
-    // nothing reached the base, and it is left clean and usable
-    expect(headCommit(baseDir)).toBe(before);
+    // the child's file is on the card branch, via a merge commit. (A merge's
+    // combined `show --name-only` is empty by design, so ask the tree.)
+    expect(headCommit(baseDir)).not.toBe(before);
+    expect(treeFiles(baseDir)).toContain("src/greet.js");
+    expect(gitOut(baseDir, "rev-list", "--parents", "-1", "HEAD").trim().split(/\s+/).length).toBe(3);
     expect(gitOut(baseDir, "status", "--porcelain")).toBe("");
-    expect(store.runsFor(CARD)[0].status).toBe("failed");
-    // the child worktree is still cleaned up on this path
+    expect(store.runsFor(CARD)[0].status).toBe("ok");
+    // and the child worktree is gone again
     expect(gitOut(fixture.repoPath, "worktree", "list")).not.toContain(`wt-${CARD}-c1`);
+  });
+
+  it("reports a verifier that changed nothing as a success, not an empty run", async () => {
+    // The empty-diff guard is for writers. A verifier that runs the suite and
+    // changes nothing has done its job; failing it would teach the orchestrator
+    // that verification always means something went wrong.
+    const spawner = createAgentSpawner({
+      store,
+      cardId: CARD,
+      baseDir,
+      gitDir,
+      runChild: async () => ({ ok: true, text: "npm test: 406 passed" }),
+      limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
+    });
+    const before = headCommit(baseDir);
+
+    const outcome = await spawner.spawn({ role: "verifier", task: "run the tests" });
+
+    expect(outcome.status).toBe("ok");
+    expect(outcome.summary).toContain("report only");
+    expect(headCommit(baseDir)).toBe(before);
+    expect(store.runsFor(CARD)[0].status).toBe("ok");
   });
 });
 
@@ -536,9 +566,9 @@ describe("failure classification", () => {
 
     const outcome = await spawner.spawn({ role: "coder", task: "tidy up" });
 
-    // BUG-1 caveat: this guard is supposed to catch an *empty* run, but it also
-    // catches every run today, so this assertion pins the message, not the
-    // discrimination.
+    // A coder that wrote nothing is a failure the orchestrator must see, or an
+    // empty child becomes a shipped no-op. The verifier test above pins the other
+    // half: a role that is not meant to write is not failed for not writing.
     expect(outcome.status).toBe("failed");
     expect(outcome.summary).toContain("reported success but changed no files");
     expect(headCommit(baseDir)).toBe(before);

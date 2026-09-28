@@ -139,6 +139,18 @@ try {
   console.log(`[smoke] timeline  ${timeline.length} events`);
   console.log(`[smoke] report    ${result.summary.slice(0, 700)}`);
 
+  // When a child fails, the reason is in its own landing line, not in the
+  // orchestrator's prose — and "the model 500'd" has to be tellable apart from
+  // "the merge went wrong" without re-running anything.
+  if (runs.some((r) => r.status !== "ok")) {
+    for (const run of runs) {
+      if (run.status === "ok") continue;
+      const lines = (run.summary ?? "(no summary)").split("\n");
+      console.log(`\n[smoke] --- ${run.role} ${run.run_id} (${run.status}) ---`);
+      console.log(lines.slice(0, 7).map((line) => `  ${line}`).join("\n"));
+    }
+  }
+
   const checks: Array<[string, boolean]> = [
     ["the graph reported ok", result.status === "ok"],
     ["the base branch advanced", result.baseHeadAfter !== result.baseHeadBefore],
@@ -157,6 +169,19 @@ try {
   ];
 
   console.log("");
+  // A provider outage looks identical to a broken graph in the check list above
+  // (everything red, zero runs), so say which one this is before the reader
+  // goes looking for a bug in src/agents.
+  if (/server_error|Internal gateway|500|overloaded|no running instances/i.test(result.summary)) {
+    console.log(
+      "NOTE  the orchestrator's model request failed at the provider, so no plan\n" +
+        "      was ever produced. That is an endpoint outage, not a graph failure:\n" +
+        "      check with a direct call first, e.g.\n" +
+        '      curl -sS $BASE/v1/chat/completions -d \'{"model":"…","messages":[{"role":"user","content":"hi"}]}\''
+    );
+    // The checks below still report the run honestly; only the ordering of blame
+    // is corrected.
+  }
   for (const [label, pass] of checks) {
     console.log(`${pass ? "PASS" : "FAIL"}  ${label}`);
     if (!pass) failed = true;
