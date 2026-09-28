@@ -139,5 +139,18 @@ export const config = {
     get agentModelsFile(): string {
       return opt("FACTORY_AGENT_MODELS_FILE");
     },
+    /**
+     * Host path to a pi `settings.json`, mounted read-only next to models.json.
+     *
+     * This exists for one setting: `httpIdleTimeoutMs`, which defaults to 300000
+     * (5 min) and is what `retry.provider.timeoutMs` inherits. A slow local model
+     * server therefore fails *inside pi* long before `AGENT_TIMEOUT_MS` is
+     * reached, and the failure looks like a broken agent rather than a patient
+     * one. There is no CLI flag or env var for it — settings.json is the only way
+     * in, and the container has no access to the host's.
+     */
+    get agentSettingsFile(): string {
+      return opt("FACTORY_AGENT_SETTINGS_FILE");
+    },
   },
 };

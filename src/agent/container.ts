@@ -43,7 +43,8 @@ export interface ContainerMount {
 export function buildContainerMounts(
   worktreeDir: string,
   gitDir?: string,
-  modelsFile?: string
+  modelsFile?: string,
+  settingsFile?: string
 ): ContainerMount[] {
   const mounts: ContainerMount[] = [
     { source: worktreeDir, target: CONTAINER_WORKDIR },
@@ -52,7 +53,14 @@ export function buildContainerMounts(
   if (modelsFile) {
     mounts.push({
       source: modelsFile,
-      target: `${AGENT_CONTAINER_HOME}/.pi/agent/models.json`,
+      target: AGENT_MODELS_CONTAINER_PATH,
+      readOnly: true,
+    });
+  }
+  if (settingsFile) {
+    mounts.push({
+      source: settingsFile,
+      target: AGENT_SETTINGS_CONTAINER_PATH,
       readOnly: true,
     });
   }
@@ -74,6 +82,8 @@ export function buildEnvArgs(env: Record<string, string>): string[] {
 
 /** Where a mounted pi `models.json` has to land for pi to find it. */
 export const AGENT_MODELS_CONTAINER_PATH = `${AGENT_CONTAINER_HOME}/.pi/agent/models.json`;
+/** Where a mounted pi `settings.json` has to land. */
+export const AGENT_SETTINGS_CONTAINER_PATH = `${AGENT_CONTAINER_HOME}/.pi/agent/settings.json`;
 
 /** Keeps generated container names unique within this process. */
 let nameCounter = 0;
@@ -94,6 +104,8 @@ export interface DockerArgsOptions {
   containerName?: string;
   /** Host file mounted read-only as the agent's pi `models.json`. */
   modelsFile?: string;
+  /** Host file mounted read-only as the agent's pi `settings.json`. */
+  settingsFile?: string;
   /** `--add-host=<spec>`; how the container finds the host's spawn IPC. */
   addHosts?: string[];
   /**
@@ -211,7 +223,12 @@ export function buildDockerArgs(
     ...(opts.containerName ? ["--name", opts.containerName] : []),
     ...(opts.addHosts ?? []).map((spec) => `--add-host=${spec}`),
     ...buildMountArgs(
-      buildContainerMounts(worktreeDir, opts.gitDir, opts.modelsFile)
+      buildContainerMounts(
+        worktreeDir,
+        opts.gitDir,
+        opts.modelsFile,
+        opts.settingsFile
+      )
     ),
     "-w",
     CONTAINER_WORKDIR,
@@ -453,6 +470,7 @@ export function runAgentInContainer(
     cpus: opts.cpus ?? config.factory.agentCpus,
     containerName,
     modelsFile: opts.modelsFile ?? config.factory.agentModelsFile,
+    settingsFile: opts.settingsFile ?? config.factory.agentSettingsFile,
   });
   const collector = createAgentEventCollector(opts.onTool);
 

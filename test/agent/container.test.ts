@@ -6,6 +6,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import {
   AGENT_IMAGE,
+  AGENT_MODELS_CONTAINER_PATH,
+  AGENT_SETTINGS_CONTAINER_PATH,
   CONTAINER_WORKDIR,
   assertGitDirSafeToMount,
   buildContainerMounts,
@@ -359,6 +361,82 @@ describe("buildDockerArgs — resource limits", () => {
 
     expect(a).not.toContain("--memory");
     expect(a).not.toContain("--cpus");
+  });
+});
+
+describe("agent-dir config mounts", () => {
+  // The agent dir is where pi keeps auth.json. Mounting a whole directory in
+  // there to give an agent its model/provider config would hand it the host's
+  // credentials too, so these two files are mounted individually, read-only.
+  it("mounts nothing extra by default: the worktree and the read-only .git", () => {
+    expect(buildContainerMounts(WT, GIT_DIR)).toEqual([
+      { source: WT, target: CONTAINER_WORKDIR },
+      { source: GIT_DIR, target: GIT_DIR, readOnly: true },
+    ]);
+  });
+
+  it("adds models.json as a single read-only file at pi's own path", () => {
+    const mounts = buildContainerMounts(WT, GIT_DIR, "/host/models.json");
+
+    expect(mounts).toHaveLength(3);
+    expect(mounts[2]).toEqual({
+      source: "/host/models.json",
+      target: AGENT_MODELS_CONTAINER_PATH,
+      readOnly: true,
+    });
+    expect(AGENT_MODELS_CONTAINER_PATH).toBe("/home/agent/.pi/agent/models.json");
+  });
+
+  it("adds settings.json the same way, and never the directory holding it", () => {
+    const mounts = buildContainerMounts(WT, undefined, undefined, "/host/settings.json");
+
+    expect(mounts).toHaveLength(2);
+    expect(mounts[1]).toEqual({
+      source: "/host/settings.json",
+      target: AGENT_SETTINGS_CONTAINER_PATH,
+      readOnly: true,
+    });
+    expect(AGENT_SETTINGS_CONTAINER_PATH).toBe("/home/agent/.pi/agent/settings.json");
+    // Neither mount may be a directory: that is where auth.json lives.
+    for (const mount of buildContainerMounts(WT, GIT_DIR, "/h/models.json", "/h/settings.json")) {
+      expect(mount.target).not.toBe("/home/agent/.pi/agent");
+      expect(mount.source).not.toMatch(/\/\.pi\/agent\/?$/);
+    }
+  });
+
+  it("keeps the git mount read-only when both config files are present", () => {
+    const args = buildDockerArgs(WT, PROMPT, {
+      gitDir: GIT_DIR,
+      modelsFile: "/h/models.json",
+      settingsFile: "/h/settings.json",
+    });
+    const readOnly = args.filter((a) => typeof a === "string" && a.endsWith(":ro"));
+
+    expect(readOnly).toEqual([
+      `${GIT_DIR}:${GIT_DIR}:ro`,
+      `/h/models.json:${AGENT_MODELS_CONTAINER_PATH}:ro`,
+      `/h/settings.json:${AGENT_SETTINGS_CONTAINER_PATH}:ro`,
+    ]);
+  });
+
+  it("takes both paths from config when the caller does not say otherwise", async () => {
+    vi.stubEnv("FACTORY_AGENT_MODELS_FILE", "/cfg/models.json");
+    vi.stubEnv("FACTORY_AGENT_SETTINGS_FILE", "/cfg/settings.json");
+    await drive([], { dir: WT, prompt: PROMPT });
+
+    const argv = spawnMock.mock.calls[0]?.[1] ?? [];
+    expect(argv).toContain(`/cfg/models.json:${AGENT_MODELS_CONTAINER_PATH}:ro`);
+    expect(argv).toContain(`/cfg/settings.json:${AGENT_SETTINGS_CONTAINER_PATH}:ro`);
+  });
+
+  // settings.json is how a slow model survives pi's 5-minute httpIdleTimeoutMs.
+  it("mounts no config file when the option is unset", () => {
+    vi.stubEnv("FACTORY_AGENT_MODELS_FILE", "");
+    vi.stubEnv("FACTORY_AGENT_SETTINGS_FILE", "");
+
+    expect(config.factory.agentModelsFile).toBe("");
+    expect(config.factory.agentSettingsFile).toBe("");
+    expect(buildContainerMounts(WT, GIT_DIR)).toHaveLength(2);
   });
 });
 

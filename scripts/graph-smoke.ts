@@ -18,6 +18,9 @@
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
+import os from "node:os";
 import path from "node:path";
 import { runCardGraph } from "../src/agents/graph.js";
 import type { AgentEvent } from "../src/agents/spawn.js";
@@ -51,6 +54,122 @@ try {
 } catch {
   skip("docker is not available");
 }
+
+/**
+ * Where the model actually lives, read out of the same models.json the agent
+ * container will mount — so the pre-flight cannot disagree with the run.
+ */
+function endpoint(
+  modelsFile: string,
+  model: string
+): { host: string; port: number; tls: boolean } | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(modelsFile, "utf8")) as {
+      providers?: Record<string, { baseUrl?: string }>;
+    };
+    const providers = parsed.providers ?? {};
+    const hinted = model.includes("/") ? model.slice(0, model.indexOf("/")) : "";
+    const key =
+      providers[hinted]?.baseUrl ? hinted : Object.keys(providers).find((k) => providers[k]?.baseUrl);
+    const base = key ? providers[key]?.baseUrl : undefined;
+    if (!base) return undefined;
+    const url = new URL(base);
+    return {
+      host: url.hostname,
+      port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
+      tls: url.protocol === "https:",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask the endpoint one cheap question before spending a graph's worth of
+ * containers on it. A model server that is down or glacial produces exactly the
+ * same all-red check list as a broken graph, and this is what tells them apart.
+ */
+async function preflight(): Promise<void> {
+  const where = endpoint(MODELS_FILE, MODEL);
+  if (!where) {
+    console.log(`[pre-flight] no baseUrl found in ${MODELS_FILE} for ${MODEL}; skipping probe`);
+    return;
+  }
+  const id = MODEL.includes("/") ? MODEL.slice(MODEL.indexOf("/") + 1) : MODEL;
+  const started = Date.now();
+  const secs = (): string => `${((Date.now() - started) / 1000).toFixed(1)}s`;
+  console.log(`[pre-flight] ${where.tls ? "https" : "http"}://${where.host}:${where.port} …`);
+
+  const reply = await new Promise<string>((resolve) => {
+    const transport = where.tls ? https : http;
+    const req = transport.request(
+      {
+        host: where.host,
+        port: where.port,
+        path: "/v1/chat/completions",
+        method: "POST",
+        timeout: 180_000,
+        headers: { "content-type": "application/json" },
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => (body += chunk));
+        res.on("end", () => resolve(`${res.statusCode ?? "?"} ${body.slice(0, 120)}`));
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.on("error", (err: NodeJS.ErrnoException) => resolve(`error ${err.code ?? err.message}`));
+    req.write(JSON.stringify({ model: id, max_tokens: 8, messages: [{ role: "user", content: "hi" }] }));
+    req.end();
+  });
+
+  console.log(`[pre-flight] ${secs()} -> ${reply}`);
+  if (!reply.startsWith("200")) {
+    skip(
+      reply.startsWith("error ECONNREFUSED")
+        ? `nothing is listening on ${where.host}:${where.port}`
+        : `the model endpoint is not answering (${reply})`
+    );
+  }
+  if (Date.now() - started > Number(process.env.AGENT_TIMEOUT_MS ?? 300_000) / 2) {
+    console.log(
+      "[pre-flight] WARNING: a single request already took longer than half of " +
+        "AGENT_TIMEOUT_MS; one agent turn needs many of them."
+    );
+  }
+}
+
+/**
+ * pi's `httpIdleTimeoutMs` defaults to 5 minutes and `retry.provider.timeoutMs`
+ * inherits it, so a slow model fails *inside pi* well before AGENT_TIMEOUT_MS —
+ * and it looks like a broken agent. settings.json is the only way to raise it in
+ * a container, so when the caller has budgeted for slowness, write a settings
+ * file that matches that budget instead of letting the default win.
+ */
+function ensureSettingsForSlowModel(): void {
+  if (process.env.FACTORY_AGENT_SETTINGS_FILE) return;
+  const budget = Number(process.env.AGENT_TIMEOUT_MS ?? "0");
+  if (budget <= 300_000) return;
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "factory-agent-settings-")), "settings.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        httpIdleTimeoutMs: budget,
+        retry: { provider: { timeoutMs: budget } },
+      },
+      null,
+      2
+    )
+  );
+  process.env.FACTORY_AGENT_SETTINGS_FILE = file;
+  console.log(`[pre-flight] wrote ${file} (httpIdleTimeoutMs=${budget}) so a slow model is not cut off at pi's 5-minute default`);
+}
+
+await preflight();
+ensureSettingsForSlowModel();
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
