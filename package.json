@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:integration": "tsx scripts/dry-run.ts",
-    "dry-run": "tsx scripts/dry-run.ts"
+    "dry-run": "tsx scripts/dry-run.ts",
+    "test:graph-smoke": "tsx scripts/graph-smoke.ts"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.2",

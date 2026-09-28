@@ -133,7 +133,9 @@ function job() {
 }
 
 function titles(): string[] {
-  return send.mock.calls.map((call: [EmbedBuilder]) => String(call[0].data?.title));
+  return (send.mock.calls as unknown as Array<[EmbedBuilder]>).map(
+    (call) => String(call[0].data?.title)
+  );
 }
 
 function activityOf(titleFragment: string): string | undefined {

@@ -170,12 +170,12 @@ describe("runCardGraph", () => {
     const runContainer = vi.fn(async () => ({ ok: true, text: "done" }));
 
     await runCardGraph(deps({ runContainer, spawnChild: fakeSpawn() }));
-    expect(runContainer.mock.calls[0]?.[0].model).toBeUndefined();
+    expect(firstOptions(runContainer).model).toBeUndefined();
 
     vi.stubEnv("ORCHESTRATOR_MODEL", "vmlx/local-model");
     runContainer.mockClear();
     await runCardGraph(deps({ runContainer, spawnChild: fakeSpawn() }));
-    expect(runContainer.mock.calls[0]?.[0].model).toBe("vmlx/local-model");
+    expect(firstOptions(runContainer).model).toBe("vmlx/local-model");
   });
 
   // The load-bearing one: the container is told a port and a token over env, and
@@ -376,6 +376,11 @@ describe("runCardGraph", () => {
 });
 
 let lastReply = "";
+
+/** What the container fake was handed on its first call. */
+function firstOptions(runContainer: ReturnType<typeof vi.fn>): ContainerOptions {
+  return (runContainer.mock.calls as unknown as Array<[ContainerOptions]>)[0]![0];
+}
 
 function fakeSpawn(): GraphDeps["spawnChild"] {
   return vi.fn(
