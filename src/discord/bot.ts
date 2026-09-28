@@ -8,6 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { store } from "../state/store.js";
+import type { AgentRun } from "../state/store.js";
+import { agentLabel } from "./embeds.js";
 import type { Job } from "../state/store.js";
 
 function defaultDataDir(): string {
@@ -29,14 +31,31 @@ export function isPaused(dataDir: string = defaultDataDir()): boolean {
   return fs.existsSync(path.join(dataDir, "paused"));
 }
 
-/** Plain-text body of `/factory status`. */
-export function buildStatusText(jobs: Job[]): string {
+/**
+ * Plain-text body of `/factory status`.
+ *
+ * `runs` are the card's in-flight `agent_runs` (phase 2.2): a card being driven
+ * by a graph is otherwise indistinguishable from a single-agent card, which
+ * makes a stalled fan-out invisible to whoever is watching the channel.
+ */
+export function buildStatusText(jobs: Job[], runs: AgentRun[] = []): string {
   if (jobs.length === 0) return "No jobs yet.";
+
+  const byCard = new Map<string, AgentRun[]>();
+  for (const run of runs) {
+    const list = byCard.get(run.card_id);
+    if (list) list.push(run);
+    else byCard.set(run.card_id, [run]);
+  }
+
   return jobs
-    .map(
-      (j) =>
-        `${j.status.toUpperCase()} — ${j.card_name}${j.pr_url ? ` (${j.pr_url})` : ""}`
-    )
+    .map((j) => {
+      const head = `${j.status.toUpperCase()} — ${j.card_name}${j.pr_url ? ` (${j.pr_url})` : ""}`;
+      const children = (byCard.get(j.card_id) ?? []).map(
+        (run) => `  - ${agentLabel(run.role, run.run_id)}: ${run.status}`
+      );
+      return [head, ...children].join("\n");
+    })
     .join("\n");
 }
 
@@ -75,7 +94,7 @@ export class DiscordBot {
     if (i.commandName !== "factory") return;
     const sub = i.options.getSubcommand();
     if (sub === "status") {
-      const text = buildStatusText(store.all());
+      const text = buildStatusText(store.all(), store.activeRuns());
       await i.reply({ content: `**Factory status**\n\`\`\`${text}\`\`\`` });
     } else if (sub === "pause" || sub === "resume") {
       setPaused(sub === "pause");

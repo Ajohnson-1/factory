@@ -51,6 +51,8 @@ afterEach(() => {
 class FakeChild extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
+  /** A real ChildProcess always has it; the timeout path calls it. */
+  kill = vi.fn(() => true);
 }
 
 interface DriveClose {
@@ -246,7 +248,7 @@ describe("buildDockerArgs", () => {
   });
 
   it("spawns the docker binary with piped stdio, no shell", async () => {
-    await drive([], { dir: WT, prompt: PROMPT, gitDir: GIT_DIR });
+    await drive([], { dir: WT, prompt: PROMPT, gitDir: GIT_DIR, containerName: "factory-fixed" });
 
     const call = spawnMock.mock.calls[0];
     expect(call?.[0]).toBe("docker");
@@ -255,12 +257,64 @@ describe("buildDockerArgs", () => {
       buildDockerArgs(WT, PROMPT, {
         gitDir: GIT_DIR,
         user: hostUser(),
+        containerName: "factory-fixed",
         // the spawner fills these from config; spelled out here so the expected
         // argv is the whole argv, not a partial match that hides a missing flag
         memory: config.factory.agentMemory,
         cpus: config.factory.agentCpus,
+        modelsFile: config.factory.agentModelsFile,
       })
     );
+  });
+
+  // Every container must be killable by name: `docker run` without -it does not
+  // forward SIGTERM, so an unnamed container could not be stopped on timeout.
+  it("names the container, sanitising a caller-supplied name to docker's rules", async () => {
+    await drive([], { dir: WT, prompt: PROMPT, containerName: "card 1/c;rm -rf" });
+    let argv = spawnMock.mock.calls[0]?.[1] ?? [];
+    expect(argv[argv.indexOf("--name") + 1]).toBe("card-1-c-rm--rf");
+
+    await drive([], { dir: WT, prompt: PROMPT });
+    argv = spawnMock.mock.calls[1]?.[1] ?? [];
+    expect(argv[argv.indexOf("--name") + 1]).toMatch(/^factory-agent-\d+-\d+$/);
+  });
+
+  it("kills the named container and fails the run when the timeout expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild();
+      spawnMock.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+      const promise = runAgentInContainer({
+        dir: WT,
+        prompt: PROMPT,
+        containerName: "factory-timing-out",
+        timeoutMs: 1000,
+      });
+      await vi.advanceTimersByTimeAsync(1001);
+      const result = await promise;
+
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain("timed out after 1000ms");
+      // docker kill <name>, and the client itself is stopped too
+      const kills = spawnMock.mock.calls.filter((c) => c[1]?.[0] === "kill");
+      expect(kills[0]?.[1]).toEqual(["kill", "factory-timing-out"]);
+      expect(kills).toHaveLength(1);
+      // A second expiry must not double-kill or double-resolve.
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(spawnMock.mock.calls.filter((c) => c[1]?.[0] === "kill")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a fast run alone: no kill, no timeout text", async () => {
+    const { result } = await drive(
+      [json(assistantEnd("quick"))],
+      { dir: WT, prompt: PROMPT, timeoutMs: 60_000 }
+    );
+
+    expect(result).toEqual({ ok: true, text: "quick" });
+    expect(spawnMock.mock.calls.filter((c) => c[1]?.[0] === "kill")).toHaveLength(0);
   });
 });
 

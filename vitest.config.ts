@@ -24,6 +24,10 @@ export default defineConfig({
         "src/discord/**": { lines: 80 },
         // the secret boundary: assert-on-absence code, held to the highest bar
         "src/agent/**": { lines: 85 },
+        // 2.2: the spawn channel and the fan-out guardrails. Same bar as the
+        // secret boundary, because a token check and a budget check fail silently
+        // — the code looks fine, the model just gets more power than intended.
+        "src/agents/**": { lines: 85 },
         "src/worker/**": { lines: 70 },
       },
     },

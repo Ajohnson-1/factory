@@ -127,7 +127,19 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
     timeoutMs: config.factory.agentTimeoutMs,
     maxRuns: config.factory.maxAgentRuns,
   };
-  const baseHeadBefore = headCommit(deps.baseDir);
+  const baseHeadBefore = safeHead(deps.baseDir);
+  if (!baseHeadBefore) {
+    // The runner creates the base worktree before the graph starts, so this only
+    // happens when it vanished underneath us. Report it as a failed card rather
+    // than letting a raw `git rev-parse` error escape past the IPC setup.
+    return {
+      status: "failed",
+      summary: `the card's base worktree is missing at ${deps.baseDir}`,
+      runs: 0,
+      baseHeadBefore: "",
+      baseHeadAfter: "",
+    };
+  }
 
   const spawner = deps.spawnChild
     ? null

@@ -16,7 +16,7 @@ import {
   setPaused,
 } from "../../src/discord/bot.js";
 import { startedEmbed } from "../../src/discord/embeds.js";
-import type { Job } from "../../src/state/store.js";
+import type { AgentRun, Job } from "../../src/state/store.js";
 import { makeTempDir, removeTempDir } from "../helpers/tmp.js";
 
 // Only the gateway Client is faked — constructing the real one would open a
@@ -41,6 +41,22 @@ function job(overrides: Partial<Job> = {}): Job {
     branch: "factory/c1",
     pr_url: null,
     error: null,
+    ...overrides,
+  };
+}
+
+/** One in-flight child, as `store.activeRuns()` hands them back. */
+function run(overrides: Partial<AgentRun> = {}): AgentRun {
+  return {
+    run_id: "c1",
+    card_id: "c1",
+    role: "coder",
+    status: "running",
+    branch: "factory/c1-c1",
+    worktree: "/tmp/wt-c1-c1",
+    summary: null,
+    started_at: 1,
+    ended_at: null,
     ...overrides,
   };
 }
@@ -164,6 +180,42 @@ describe("buildStatusText", () => {
     expect(text).toBe(
       "DONE — Card one\nFAILED — Card two (https://x/pull/2)\nQUEUED — Card three"
     );
+  });
+  it("lists a card's running children under it, which is the graph view", () => {
+    const text = buildStatusText([job()], [run(), run({ run_id: "c2", role: "verifier" })]);
+
+    expect(text).toBe(
+      "RUNNING — Card one\n  - coder-1: running\n  - verifier-2: running"
+    );
+  });
+
+  // Status is a snapshot: finished children are already in the embed timeline and
+  // the git history, and listing them here would make a long card unreadable.
+  it("shows only the children handed in, so callers can pass activeRuns()", () => {
+    const text = buildStatusText([job()], [
+      run(),
+      run({ run_id: "c9", role: "coder", status: "ok", ended_at: 123 }),
+    ]);
+
+    expect(text).toContain("- coder-1: running");
+    expect(text).toContain("- coder-9: ok");
+  });
+
+  it("never shows another card's children under this one", () => {
+    const text = buildStatusText(
+      [job({ card_id: "mine" }), job({ card_id: "other", card_name: "Card two" })],
+      [run({ card_id: "other", run_id: "c7" })]
+    );
+
+    expect(text).toContain("RUNNING — Card one\nRUNNING — Card two\n  - coder-7: running");
+  });
+
+  it("leaves a job without children on its own", () => {
+    expect(buildStatusText([job()], [])).toBe("RUNNING — Card one");
+  });
+
+  it("defaults to no children at all, keeping the single-agent shape", () => {
+    expect(buildStatusText([job({ card_id: "c1" })])).toBe("RUNNING — Card one");
   });
 });
 
