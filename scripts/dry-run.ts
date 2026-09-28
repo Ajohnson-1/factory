@@ -5,6 +5,11 @@
  * This is the opt-in integration smoke test (`npm run test:integration`);
  * it calls a real model, so it is not part of `npm test` or CI.
  *
+ * Runtime covered: the in-process one (src/agent/in-process.ts), because that is
+ * what a laptop has without a built image. Production runs the container
+ * runtime; that path is covered by test/integration/container.test.ts
+ * (`TEST_DOCKER=1`) rather than here.
+ *
  * Usage: REPO_PATH=<tmp-repo> npx tsx scripts/dry-run.ts
  */
 import { execSync } from "node:child_process";
@@ -16,6 +21,7 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { commitWork } from "../src/worker/worktree.js";
 
 const CARD_ID = "dryrun-001";
 const CARD_NAME = "Add a greet function";
@@ -60,7 +66,10 @@ async function main(): Promise<void> {
     "Rules:",
     "- Work only in the current directory.",
     "- Make the smallest correct change.",
-    '- When done, commit all changes with a message starting "factory: ".',
+    // same contract as buildAgentPrompt(): .git is read-only for the agent and
+    // the host is what turns the working tree into a commit
+    "- Do not commit or push — git metadata is mounted read-only where you run.",
+    "  Leave the change in the working tree; the factory commits it.",
   ].join("\n");
 
   const { session } = await createAgentSession({
@@ -85,12 +94,16 @@ async function main(): Promise<void> {
   await session.prompt(prompt);
   session.dispose();
 
-  // 4. Verify
+  // 4. The host commits what the agent left behind, exactly like runCard does
+  const committed = commitWork(dir, `factory: ${CARD_NAME}`);
+  console.log(`[dryrun] host commit: ${committed ? "created" : "nothing to commit"}`);
+
+  // 5. Verify
   const log = execSync(`git -C ${dir} log --oneline -3`).toString();
   const file = fs.readFileSync(path.join(dir, "src", "index.js"), "utf8");
   console.log("\n[dryrun] git log:\n" + log);
   console.log("[dryrun] src/index.js:\n" + file);
-  const ok = file.includes("greet") && log.includes("factory:");
+  const ok = file.includes("greet") && committed && log.includes("factory:");
   console.log(ok ? "[dryrun] ✅ SUCCESS" : "[dryrun] ❌ agent did not complete task");
   process.exit(ok ? 0 : 1);
 }

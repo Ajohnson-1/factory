@@ -18,3 +18,25 @@ jobs:
       - run: npm run typecheck
       # same suite as `npm test`, plus the per-area coverage thresholds
       - run: npm run test:coverage
+
+  # Phase 2.1: agents run the pi baked into this image, so a Dockerfile or CLI
+  # change that breaks the container fails here instead of on the first card.
+  agent-image:
+    name: Agent container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: bash deploy/docker/build.sh
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run --rm factory-agent --version
+          # git + ripgrep are what the agent's own tools drive
+          docker run --rm --entrypoint sh factory-agent -c \
+            'git --version && rg --version | head -1'
+      # The exfiltration canary needs a real model, so it is not gated on CI.
+      # Run it locally / in a manual check: TEST_DOCKER=1 npx vitest run test/integration

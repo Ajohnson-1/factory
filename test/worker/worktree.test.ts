@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   branchFor,
+  commonGitDir,
+  commitWork,
   createWorktree,
   pushBranch,
   removeWorktree,
@@ -134,6 +136,79 @@ describe("pushBranch", () => {
     pushBranch(wt.dir, wt.branch);
 
     expect(remoteBranches(fixture)).toContain(`refs/heads/factory/${CARD}`);
+  });
+});
+
+describe("commonGitDir", () => {
+  it("resolves a linked worktree to the repo's shared .git", () => {
+    const wt = createWorktree(CARD, fixture.repoPath);
+
+    // absolute, and inside the repo — this is the path the agent container
+    // mounts read-only so `git log` works at all
+    const dir = commonGitDir(wt.dir);
+    expect(path.isAbsolute(dir)).toBe(true);
+    expect(fs.realpathSync(dir)).toBe(fs.realpathSync(path.join(fixture.repoPath, ".git")));
+  });
+
+  it("resolves the plain .git of the main clone itself", () => {
+    expect(fs.realpathSync(commonGitDir(fixture.repoPath))).toBe(
+      fs.realpathSync(path.join(fixture.repoPath, ".git"))
+    );
+  });
+});
+
+describe("commitWork", () => {
+  it("commits what the agent left in the working tree", () => {
+    const wt = createWorktree(CARD, fixture.repoPath);
+    fs.writeFileSync(path.join(wt.dir, "src", "greet.js"), "module.exports = () => 1;\n");
+    fs.appendFileSync(path.join(wt.dir, "README.md"), "\nchanged\n");
+
+    expect(commitWork(wt.dir, `factory: ${CARD}`)).toBe(true);
+
+    expect(gitOut(wt.dir, "log", "-1", "--pretty=%s")).toBe(`factory: ${CARD}`);
+    expect(gitOut(wt.dir, "status", "--porcelain")).toBe("");
+    expect(gitOut(wt.dir, "show", "--name-only", "--pretty=").split("\n").sort()).toEqual([
+      "README.md",
+      "src/greet.js",
+    ]);
+  });
+
+  it("reports nothing to ship when the agent changed nothing", () => {
+    const wt = createWorktree(CARD, fixture.repoPath);
+
+    expect(commitWork(wt.dir, "factory: nope")).toBe(false);
+    // still sitting on the untouched origin/main commit
+    expect(gitOut(wt.dir, "status", "--porcelain")).toBe("");
+  });
+
+  it("never stages a .env the agent created", () => {
+    const wt = createWorktree(CARD, fixture.repoPath);
+    fs.writeFileSync(path.join(wt.dir, "real.js"), "// work\n");
+    fs.writeFileSync(path.join(wt.dir, ".env"), "TRELLO_API_KEY=oops\n");
+    fs.writeFileSync(path.join(wt.dir, ".env.local"), "TOKEN=oops\n");
+
+    expect(commitWork(wt.dir, `factory: ${CARD}`)).toBe(true);
+
+    const files = gitOut(wt.dir, "show", "--name-only", "--pretty=");
+    expect(files).toContain("real.js");
+    expect(files).not.toContain(".env");
+    expect(gitOut(wt.dir, "ls-files")).not.toContain(".env");
+    expect(gitOut(wt.dir, "ls-files")).not.toContain(".env.local");
+    // and it is still on disk, just not in the commit
+    expect(fs.existsSync(path.join(wt.dir, ".env"))).toBe(true);
+  });
+
+  it("pushes what it committed, end to end", () => {
+    const wt = createWorktree(CARD, fixture.repoPath);
+    fs.writeFileSync(path.join(wt.dir, "feature.js"), "// feature\n");
+
+    commitWork(wt.dir, `factory: ${CARD}`);
+    pushBranch(wt.dir, wt.branch);
+
+    expect(remoteBranches(fixture)).toContain(`refs/heads/factory/${CARD}`);
+    expect(gitOut(fixture.originPath, "log", "-1", "--pretty=%s", `factory/${CARD}`)).toBe(
+      `factory: ${CARD}`
+    );
   });
 });
 

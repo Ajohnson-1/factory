@@ -10,39 +10,52 @@ import {
 import path from "node:path";
 import type { EmbedBuilder } from "discord.js";
 
-// The pi SDK must never be loaded for real: fake it at the module boundary so
-// importing runner.ts costs nothing and no model is ever contacted.
-const sdk = vi.hoisted(() => {
-  const session = {
-    prompt: vi.fn(async (_prompt: string): Promise<void> => {}),
-    subscribe: vi.fn(),
-    dispose: vi.fn(),
-  };
-  return {
-    session,
-    createRuntime: vi.fn(async (): Promise<{ id: string }> => ({ id: "runtime" })),
-    inMemory: vi.fn((_dir: string) => ({ id: "smgr" })),
-    createSession: vi.fn(
-      async (_opts: { cwd: string; modelRuntime: unknown; sessionManager: unknown }) => ({
-        session,
-      })
-    ),
-  };
-});
+// runner.ts imports both agent runtimes, so neither may load for real here: the
+// pi SDK is stubbed at the module boundary and the container module is mocked,
+// which also lets these tests assert exactly what the host handed the container.
+const container = vi.hoisted(() => ({
+  runAgentInContainer: vi.fn(
+    async (_opts: {
+      dir: string;
+      gitDir?: string;
+      prompt: string;
+      onTool?: (toolName: string) => void;
+      image?: string;
+    }): Promise<{ ok: boolean; text: string }> => ({
+      ok: true,
+      text: "agent finished",
+    })
+  ),
+}));
 
+vi.mock("../../src/agent/container.js", () => ({
+  runAgentInContainer: container.runAgentInContainer,
+}));
+
+// A working fake: the in-process runtime is exercised in test/agent/in-process.test.ts,
+// here it only has to not explode when AGENT_RUNTIME=process is selected.
 vi.mock("@earendil-works/pi-coding-agent", () => ({
-  ModelRuntime: { create: sdk.createRuntime },
-  SessionManager: { inMemory: sdk.inMemory },
-  createAgentSession: sdk.createSession,
+  ModelRuntime: { create: vi.fn(async () => ({ id: "runtime" })) },
+  SessionManager: { inMemory: vi.fn(() => ({ id: "smgr" })) },
+  createAgentSession: vi.fn(async () => ({
+    session: {
+      prompt: vi.fn(async (_prompt: string) => {}),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+    },
+  })),
 }));
 
 import {
   buildAgentPrompt,
+  runAgentContainer,
   runCard,
+  selectAgentRuntime,
   type AgentRunOptions,
   type RunCardDeps,
   type RunAgent,
 } from "../../src/worker/runner.js";
+import { runAgentProcess } from "../../src/agent/in-process.js";
 import { createStore, type Store } from "../../src/state/store.js";
 import type { DiscordBot } from "../../src/discord/bot.js";
 import type { TrelloCard } from "../../src/trello/client.js";
@@ -60,6 +73,7 @@ const REVIEW = "list-review";
 const DONE = "list-done";
 const PR_URL = "https://github.com/o/r/pull/7";
 const WT_DIR = "/tmp/wt-card-1";
+const GIT_DIR = "/tmp/repo/.git";
 const BRANCH = `factory/${CARD_ID}`;
 
 const CARD: TrelloCard = {
@@ -82,6 +96,7 @@ let worktree: NonNullable<RunCardDeps["worktree"]>;
 let runAgent: Mock<RunAgent>;
 let prompts: string[];
 let ciState: CiState;
+let committed: { dir: string; message: string }[];
 
 beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -127,20 +142,25 @@ beforeEach(() => {
     create: vi.fn((_cardId: string, _repoPath?: string) => ({ dir: WT_DIR, branch: BRANCH })),
     remove: vi.fn((_cardId: string, _repoPath?: string) => {}),
     push: vi.fn((_dir: string, _branch: string) => {}),
+    gitDir: vi.fn((_dir: string) => GIT_DIR),
+    commit: vi.fn((dir: string, message: string) => {
+      committed.push({ dir, message });
+      return true;
+    }),
   };
 
   prompts = [];
+  committed = [];
   runAgent = vi.fn(async (opts: AgentRunOptions): Promise<void> => {
     prompts.push(opts.prompt);
   });
 
-  // restoreMocks resets spies between tests; re-arm the hoisted SDK fakes too.
-  sdk.session.prompt.mockReset().mockResolvedValue(undefined);
-  sdk.session.subscribe.mockReset();
-  sdk.session.dispose.mockReset();
-  sdk.createRuntime.mockReset().mockResolvedValue({ id: "runtime" });
-  sdk.inMemory.mockReset().mockReturnValue({ id: "smgr" });
-  sdk.createSession.mockReset().mockResolvedValue({ session: sdk.session });
+  container.runAgentInContainer.mockReset().mockResolvedValue({
+    ok: true,
+    text: "agent finished",
+  });
+  vi.stubEnv("AGENT_RUNTIME", "container");
+  vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-key");
 });
 
 afterEach(() => {
@@ -181,8 +201,11 @@ describe("buildAgentPrompt", () => {
     expect(buildAgentPrompt({ name: CARD_NAME, desc: "" })).not.toContain("Details:");
   });
 
-  it("requires the factory commit message prefix", () => {
-    expect(buildAgentPrompt({ name: CARD_NAME, desc: "" })).toContain('"factory: "');
+  it("tells the agent not to commit — the host owns the commit", () => {
+    const prompt = buildAgentPrompt({ name: CARD_NAME, desc: "" });
+
+    expect(prompt).toContain("Do not commit or push");
+    expect(prompt).not.toContain("commit all changes");
   });
 });
 
@@ -209,8 +232,60 @@ describe("runCard", () => {
     await runCard(CARD_ID, bot, deps());
 
     expect(runAgent.mock.calls[0]?.[0].dir).toBe(WT_DIR);
+    expect(runAgent.mock.calls[0]?.[0].gitDir).toBe(GIT_DIR);
     expect(prompts[0]).toContain(CARD_NAME);
-    expect(prompts[0]).toContain('"factory: "');
+    expect(prompts[0]).toContain(CARD_DESC);
+  });
+
+  it("commits the agent's work on the host before pushing", async () => {
+    queueCard();
+
+    await runCard(CARD_ID, bot, deps());
+
+    expect(worktree.commit).toHaveBeenCalledWith(WT_DIR, `factory: ${CARD_NAME}`);
+    expect(committed).toHaveLength(1);
+  });
+
+  it("pushes only after the commit exists", async () => {
+    queueCard();
+    const order: string[] = [];
+    runAgent.mockImplementation(async () => {
+      order.push("agent");
+    });
+    vi.mocked(worktree.commit).mockImplementation(() => {
+      order.push("commit");
+      return true;
+    });
+    vi.mocked(worktree.push).mockImplementation(() => {
+      order.push("push");
+    });
+
+    await runCard(CARD_ID, bot, deps());
+
+    expect(order).toEqual(["agent", "commit", "push"]);
+  });
+
+  it("fails without pushing when the agent changed nothing", async () => {
+    queueCard();
+    vi.mocked(worktree.commit).mockReturnValue(false);
+
+    await runCard(CARD_ID, bot, deps());
+
+    expect(store.get(CARD_ID)).toMatchObject({
+      status: "failed",
+      error: "the agent left no changes to ship",
+    });
+    expect(worktree.push).not.toHaveBeenCalled();
+    expect(github.createPR).not.toHaveBeenCalled();
+  });
+
+  it("still removes the worktree when there was nothing to ship", async () => {
+    queueCard();
+    vi.mocked(worktree.commit).mockReturnValue(false);
+
+    await runCard(CARD_ID, bot, deps());
+
+    expect(worktree.remove).toHaveBeenCalledWith(CARD_ID);
   });
 
   it("pushes the worktree branch", async () => {
@@ -454,80 +529,124 @@ describe("runCard", () => {
   });
 });
 
-describe("runCard default agent (pi SDK seam)", () => {
-  it("prompts a pi session built in the worktree", async () => {
-    queueCard();
+describe("agent runtime selection", () => {
+  it("defaults to the container runtime", () => {
+    vi.stubEnv("AGENT_RUNTIME", "container");
 
-    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-
-    expect(sdk.createSession).toHaveBeenCalledTimes(1);
-    expect(sdk.createSession.mock.calls[0]?.[0]).toMatchObject({ cwd: WT_DIR });
+    expect(selectAgentRuntime()).toBe(runAgentContainer);
   });
 
-  it("sends the built prompt to the session", async () => {
-    queueCard();
-
-    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-
-    expect(sdk.session.prompt).toHaveBeenCalledTimes(1);
-    expect(sdk.session.prompt.mock.calls[0]?.[0]).toContain(CARD_NAME);
+  it("falls back to the container runtime for anything that is not `process`", () => {
+    for (const value of ["", "docker", "typo", "Process "]) {
+      vi.stubEnv("AGENT_RUNTIME", value);
+      expect(selectAgentRuntime(), `AGENT_RUNTIME=${value}`).toBe(runAgentContainer);
+    }
   });
 
-  it("uses an in-memory session manager", async () => {
-    queueCard();
+  it("uses the in-process runtime only when it is asked for", () => {
+    vi.stubEnv("AGENT_RUNTIME", "process");
 
-    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-
-    expect(sdk.inMemory).toHaveBeenCalledWith(WT_DIR);
+    expect(selectAgentRuntime()).toBe(runAgentProcess);
   });
 
-  it("forwards session tool events to Discord", async () => {
+  it("runs the container runtime when no agent is injected", async () => {
     queueCard();
-    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-    send.mockClear();
 
-    // the handler the runner registered on the session
-    const handler = sdk.session.subscribe.mock.calls[0]?.[0];
-    expect(typeof handler).toBe("function");
-    handler({ type: "tool_execution_start", toolName: "bash" });
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+
+    expect(container.runAgentInContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands the container the worktree, the shared .git and the built prompt", async () => {
+    queueCard();
+
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+
+    const opts = container.runAgentInContainer.mock.calls[0]?.[0];
+    expect(opts).toMatchObject({
+      dir: WT_DIR,
+      gitDir: GIT_DIR,
+      image: "factory-agent",
+    });
+    expect(opts?.prompt).toContain(CARD_NAME);
+    expect(typeof opts?.onTool).toBe("function");
+  });
+
+  it("takes the image name from config", async () => {
+    queueCard();
+    vi.stubEnv("AGENT_IMAGE", "registry/factory-agent:2.0.0");
+
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+
+    expect(container.runAgentInContainer.mock.calls[0]?.[0].image).toBe(
+      "registry/factory-agent:2.0.0"
+    );
+  });
+
+  it("maps container tool events onto Discord progress embeds", async () => {
+    queueCard();
+    container.runAgentInContainer.mockImplementation(async (o) => {
+      o.onTool?.("edit");
+      return { ok: true, text: "" };
+    });
+
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
 
     const index = embedTitles().indexOf("⚙️ In progress");
     expect(index).toBeGreaterThanOrEqual(0);
-    expect(fieldOf(index, "Activity")).toBe("tool: bash");
+    expect(fieldOf(index, "Activity")).toBe("tool: edit");
   });
 
-  it("ignores session events that are not tool starts", async () => {
+  it("fails the job when the container reports a failed run", async () => {
     queueCard();
-    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-    send.mockClear();
-
-    const handler = sdk.session.subscribe.mock.calls[0]?.[0];
-    handler({ type: "message_update" });
-    handler({ type: "tool_execution_end", toolName: "bash" });
-
-    expect(send).not.toHaveBeenCalled();
-  });
-
-  it("disposes the session after the run", async () => {
-    queueCard();
+    container.runAgentInContainer.mockResolvedValue({ ok: false, text: "429 rate limited" });
 
     await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
 
-    expect(sdk.session.dispose).toHaveBeenCalled();
+    expect(store.get(CARD_ID)).toMatchObject({
+      status: "failed",
+      error: "429 rate limited",
+    });
+    expect(embedTitles()).toContain("❌ Factory run failed");
+    expect(worktree.push).not.toHaveBeenCalled();
   });
 
-  // Last in the file: needs a pristine copy of the module so the memo starts
-  // empty. `modelRuntime` is module-level in runner.ts, so the count can only be
-  // asserted from a fresh import (vi.resetModules keeps the pi mock registered).
-  it("reuses one model runtime across two runs", async () => {
-    vi.resetModules();
-    const fresh = await import("../../src/worker/runner.js");
+  it("fails the job when pi exits 0 having produced nothing", async () => {
     queueCard();
+    container.runAgentInContainer.mockResolvedValue({ ok: false, text: "  " });
 
-    await fresh.runCard(CARD_ID, bot, deps({ runAgent: undefined }));
-    await fresh.runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
 
-    expect(sdk.createRuntime).toHaveBeenCalledTimes(1);
-    expect(sdk.createSession).toHaveBeenCalledTimes(2);
+    expect(store.get(CARD_ID)?.error).toBe("agent run failed");
+  });
+
+  it("removes the worktree when the container fails", async () => {
+    queueCard();
+    container.runAgentInContainer.mockResolvedValue({ ok: false, text: "docker gone" });
+
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+
+    expect(worktree.remove).toHaveBeenCalledWith(CARD_ID);
+  });
+
+  it("rejects from runAgentContainer so the caller sees a failure", async () => {
+    container.runAgentInContainer.mockResolvedValue({ ok: false, text: "boom" });
+
+    await expect(runAgentContainer({ dir: WT_DIR, prompt: "p" })).rejects.toThrow("boom");
+  });
+
+  it("resolves from runAgentContainer on a clean run", async () => {
+    await expect(
+      runAgentContainer({ dir: WT_DIR, gitDir: GIT_DIR, prompt: "p" })
+    ).resolves.toBeUndefined();
+  });
+
+  it("starts no container when AGENT_RUNTIME=process", async () => {
+    queueCard();
+    vi.stubEnv("AGENT_RUNTIME", "process");
+
+    await runCard(CARD_ID, bot, deps({ runAgent: undefined }));
+
+    expect(container.runAgentInContainer).not.toHaveBeenCalled();
   });
 });

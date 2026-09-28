@@ -65,6 +65,54 @@ export function removeWorktree(
   }
 }
 
+/**
+ * Absolute path of the shared `.git` a worktree links back to.
+ *
+ * A worktree directory holds a `.git` *file* that points into the main repo, so
+ * this is what has to accompany the worktree into the agent container — on its
+ * own, `git status` inside the container reports "not a git repository".
+ */
+export function commonGitDir(dir: string): string {
+  const out = execFileSync("git", ["-C", dir, "rev-parse", "--git-common-dir"], {
+    encoding: "utf8",
+  }).trim();
+  return path.isAbsolute(out) ? out : path.resolve(dir, out);
+}
+
+/**
+ * Commit everything the agent changed, from the host. The container mounts
+ * `.git` read-only, so committing there is not possible and never will be: the
+ * agent edits files, the factory turns that into a commit.
+ *
+ * `:(exclude)` keeps `.env` out even if a worktree somehow has one — an
+ * untracked secret must not ride into a public PR. Returns false when the agent
+ * changed nothing (an empty PR is not a result).
+ */
+export function commitWork(dir: string, message: string): boolean {
+  const status = execFileSync("git", ["-C", dir, "status", "--porcelain"], {
+    encoding: "utf8",
+  });
+  if (!status.trim()) return false;
+  execFileSync(
+    "git",
+    [
+      "-C",
+      dir,
+      "add",
+      "-A",
+      "--",
+      ".",
+      ":(exclude).env",
+      ":(exclude).env.*",
+    ],
+    { stdio: ["ignore", "ignore", "inherit"] }
+  );
+  execFileSync("git", ["-C", dir, "commit", "-m", message], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return true;
+}
+
 /** Push the card branch to origin from inside a worktree. */
 export function pushBranch(dir: string, branch: string): void {
   execFileSync("git", ["-C", dir, "push", "-u", "origin", branch], {

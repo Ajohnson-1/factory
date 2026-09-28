@@ -22,6 +22,8 @@ export default defineConfig({
         "src/trello/**": { lines: 80 },
         "src/github/**": { lines: 80 },
         "src/discord/**": { lines: 80 },
+        // the secret boundary: assert-on-absence code, held to the highest bar
+        "src/agent/**": { lines: 85 },
         "src/worker/**": { lines: 70 },
       },
     },

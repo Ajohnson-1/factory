@@ -1,9 +1,7 @@
-import {
-  createAgentSession,
-  ModelRuntime,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
 import { config } from "../config.js";
+import { runAgentInContainer } from "../agent/container.js";
+import { runAgentProcess } from "../agent/in-process.js";
+import type { AgentRunOptions, RunAgent } from "../agent/types.js";
 import { trello as defaultTrello } from "../trello/client.js";
 import { github as defaultGithub } from "../github/client.js";
 import {
@@ -18,24 +16,22 @@ import {
   createWorktree,
   removeWorktree,
   pushBranch,
+  commitWork,
+  commonGitDir,
   type Worktree,
 } from "./worktree.js";
 
-let modelRuntime: ModelRuntime | undefined;
-
-export interface AgentRunOptions {
-  dir: string;
-  prompt: string;
-  /** Called for every tool the agent starts, for Discord progress updates. */
-  onTool?: (toolName: string) => void;
-}
-
-export type RunAgent = (opts: AgentRunOptions) => Promise<void>;
+// Types live in src/agent/types.js so the runtimes do not import the worker.
+export type { AgentRunOptions, RunAgent } from "../agent/types.js";
 
 /** The git-side operations runCard needs. */
 export interface WorktreeOps {
   create(cardId: string, repoPath?: string): Worktree;
   remove(cardId: string, repoPath?: string): void;
+  /** Shared `.git` the worktree links back to; handed to the agent runtime. */
+  gitDir(dir: string): string;
+  /** Host-side commit of everything the agent changed. False if nothing changed. */
+  commit(dir: string, message: string): boolean;
   push(dir: string, branch: string): void;
 }
 
@@ -59,29 +55,38 @@ export function buildAgentPrompt(card: { name: string; desc: string }): string {
     `- Work only in the current directory.`,
     `- Make the smallest correct change that fulfills the task.`,
     `- Run the project's tests if they exist; fix failures you cause.`,
-    `- When done, commit all changes with a message starting "factory: ".`,
+    `- Do not commit or push — git metadata is mounted read-only where you run.`,
+    `  Leave the change in the working tree; the factory commits it and opens the PR.`,
   ].join("\n");
 }
 
-/** Default agent: one pi session per card, disposed after the prompt. */
-async function runAgent({ dir, prompt, onTool }: AgentRunOptions): Promise<void> {
-  if (!modelRuntime) modelRuntime = await ModelRuntime.create();
-
-  const { session } = await createAgentSession({
-    cwd: dir,
-    modelRuntime,
-    sessionManager: SessionManager.inMemory(dir),
+/**
+ * The default runtime: one throwaway container per run. Only the worktree (rw),
+ * the repo's shared `.git` (ro) and allowlisted provider keys cross into it, so
+ * a card that tells the agent to `printenv` or `cat <repo>/.env` finds neither.
+ */
+export const runAgentContainer: RunAgent = async ({
+  dir,
+  gitDir,
+  prompt,
+  onTool,
+}: AgentRunOptions): Promise<void> => {
+  const result = await runAgentInContainer({
+    dir,
+    gitDir,
+    prompt,
+    onTool,
+    image: config.factory.agentImage,
   });
+  if (!result.ok) throw new Error(result.text.trim() || "agent run failed");
+};
 
-  session.subscribe((event) => {
-    if (event.type === "tool_execution_start") onTool?.(event.toolName);
-  });
-
-  await session.prompt(prompt);
-  session.dispose();
+/** `AGENT_RUNTIME=process` is a dev escape hatch; container is the default. */
+export function selectAgentRuntime(): RunAgent {
+  return config.factory.agentRuntime === "process" ? runAgentProcess : runAgentContainer;
 }
 
-/** Run one card end-to-end: worktree → pi agent → push → PR → CI. */
+/** Run one card end-to-end: worktree → container agent → commit → push → PR → CI. */
 export async function runCard(
   cardId: string,
   bot: DiscordBot,
@@ -94,24 +99,34 @@ export async function runCard(
     create: createWorktree,
     remove: removeWorktree,
     push: pushBranch,
+    commit: commitWork,
+    gitDir: commonGitDir,
   };
-  const agent = deps.runAgent ?? runAgent;
+  const agent = deps.runAgent ?? selectAgentRuntime();
 
   const job = store.get(cardId);
   if (!job) return;
   const card = await trello.getCard(cardId);
   const { dir, branch } = worktree.create(cardId);
+  const gitDir = worktree.gitDir(dir);
   store.setRunning(cardId, branch);
   await bot.send(startedEmbed(card.name, branch));
 
   try {
     await agent({
       dir,
+      gitDir,
       prompt: buildAgentPrompt(card),
       onTool: (toolName) => {
         void bot.send(progressEmbed(card.name, `tool: ${toolName}`));
       },
     });
+
+    // Commit on the host: the agent's container has no writable .git and no
+    // push credentials, which is the point of the boundary.
+    if (!worktree.commit(dir, `factory: ${card.name}`)) {
+      throw new Error("the agent left no changes to ship");
+    }
 
     // Push branch and open PR
     worktree.push(dir, branch);

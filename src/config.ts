@@ -50,5 +50,18 @@ export const config = {
     get ciTimeoutMs(): number {
       return num("CI_TIMEOUT_MS", 15 * 60_000);
     },
+    /**
+     * Where agent sessions run. `container` (default) keeps every secret on the
+     * host; `process` runs pi inside this process and is dev-only.
+     */
+    get agentRuntime(): "container" | "process" {
+      return opt("AGENT_RUNTIME", "container").toLowerCase() === "process"
+        ? "process"
+        : "container";
+    },
+    /** Image the agent containers are started from. */
+    get agentImage(): string {
+      return opt("AGENT_IMAGE", "factory-agent");
+    },
   },
 };
