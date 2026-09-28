@@ -21,6 +21,11 @@ agents (pi); Discord is the command center.
   tool fans out spec-writer / researcher / coder / verifier in parallel worktrees.
 - [2.3 — PR reviewer](2.3-pr-reviewer.md) — reviewer agent pulls down factory PRs on
   create/update and posts PR comments (summary + line comments).
+- [Open issues](open-issues.md) — defects and operator-facing holes left by 2.1–2.2
+  (run budget that never resets, unbounded orchestrator wall clock, stale
+  `agent_runs`, undocumented deploy knobs, unmeasured token spend). Do before or
+  alongside 2.3: the reviewer writes `agent_runs` rows on every PR push and hits
+  several of these immediately.
 
 Order: 2.0 → 2.1 → 2.2 → 2.3 (each reuses the previous phase's seams).
 

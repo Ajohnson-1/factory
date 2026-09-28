@@ -1,226 +1,146 @@
-# Handoff — Phase 2.2 done; open issues and the 2.3 starting surface
+# Handoff — Phase 2.2 (agent graphs), carrying Phase 2.1's loose ends
 
-Work from the repo root. Read `plan/2.2-agent-graph.md` first — it is the spec,
-and it now carries the decision record and two spike sections that explain why
-the code looks nothing like step 4 originally sketched. This file is what 2.2
-learned about the ground underneath **2.3**, plus the loose ends 2.2 left.
+Work from the repo root. Read `plan/2.2-agent-graph.md` first — it is the spec; this file
+is what 2.1 learned about the ground underneath it.
 
 ## Repo state (verified, not assumed)
 
-- HEAD `57ca83d`. Working tree clean. Nine commits since `3b8bb3d` (2.1).
-- `npm test` → **413 passed, 3 skipped** (docker-gated integration tests).
-  `npm run build`, `npm run typecheck` (which now runs **two** configs:
-  `tsconfig.test.json` **and** `tsconfig.extension.json`) clean.
-- Coverage: 93.09% lines overall. `src/agents/**` **90.14%** against an 85% gate
-  added this phase (same bar as `src/agent/**`, for the same reason: token
-  checks and budget checks fail silently — the code looks fine, the model just
-  has more power than intended).
-- `factory-agent` image rebuilt with the extension baked in; CI's image job runs
-  `deploy/docker/build.sh`, so the Dockerfile's resolution guardrails are
-  exercised on every push. They have already caught one of my own bugs.
-- **The 2.2 definition of done is met.** `scripts/graph-smoke.ts` passed twice
-  against the real stack: `ok in 315s`, 3 runs (`coder:ok, coder:ok,
-  verifier:ok`), base `6339df9 -> ccdfa27`, two merge commits
-  `factory: merge coder c1/c2` from separate child branches, no leaked worktrees
-  or branches.
+- HEAD `3b8bb3d` = phase 2.1 (secret isolation). Working tree clean.
+- `npm test` → **251 passed, 3 skipped** (the skips are the docker-gated integration
+  tests). `npm run build` and `npm run typecheck` clean.
+- Coverage thresholds in `vitest.config.ts`: `src/agent/**` 85 lines (currently 99.2%),
+  `src/worker/**` 70 (currently 87.0). 2.2 adds `src/agents/**` — add a threshold for it.
+- `TEST_DOCKER=1 npx vitest run test/integration` → 3 pass against the real
+  `factory-agent` image (built locally, pi 0.84.4).
 
-## What 2.2 actually built (the seams 2.3 must use)
+## Seams 2.2 must build on
 
-| Seam | Where | Note for 2.3 |
+| Seam | Where | Note for 2.2 |
 |---|---|---|
-| `runAgentInContainer(opts)` | `src/agent/container.ts` | Options object, so 2.3 adds nothing structural: it already takes `systemPrompt`, `model`, `excludeTools`, `extraEnv`, `containerName`, `timeoutMs` (which **kills by name**), `modelsFile`, `settingsFile` |
-| `createAgentSpawner(deps).spawn(req)` | `src/agents/spawn.ts` | The reusable "run one role in one container, land its work" machine: semaphore, per-card merge lock, budget, timeout, `agent_runs` bookkeeping, summary text. A reviewer is **not** a merge-back role, so pass a role with `mergeBack: false, writesWork: false` |
-| `ROLES` / `getRole` / `spawnableRoleIds()` | `src/agents/roles.ts` | `reviewer` is already registered, with a charter and `excludeTools`, and deliberately excluded from `spawnableRoleIds()` — 2.3 drives it from GitHub events, not from a planner |
-| `createIpcServer({token, host, port, onSpawn})` | `src/agents/ipc.ts` | Generic JSONL/TCP request channel, LF-only framing, constant-time token compare, `close()` revokes. If a reviewer needs to ask the host for anything, this is the shape — do not invent a second protocol |
-| `runCardGraph(deps)` | `src/agents/graph.ts` | The pattern for "one containerized agent that owns a card": mint token → listen → run container with `-e` extension + `extraEnv` → settle → **close in `finally`** |
-| child worktrees + `mergeChildIntoBase` | `src/worker/worktree.ts` | `headCommit`, `changedFiles`, `diffStat`, `createChildWorktree`, `removeChildWorktree` — a reviewer's disposable checkout is `createChildWorktree(reviewId, "r1")` or a plain worktree; all git is `execFileSync`, never a shell |
-| `agent_runs` | `src/state/store.ts` | `addRun/setRunDone/runsFor/countRuns/activeRuns`. Add a `review` role row the same way |
-| `reportAgentEvent` + `agentStartedEmbed/agentDoneEmbed/agentLabel` | `src/worker/runner.ts`, `src/discord/embeds.ts` | `[coder-2] tool: edit`. Reuse for reviewer timeline |
-| `makeGitRepo()`, `makeTempDir()` | `test/helpers/` | Real git in temp dirs is the house style. `vi.stubEnv("REPO_PATH", fixture.repoPath)` because the worktree helpers default-arg it |
+| `runAgentInContainer(opts): Promise<AgentRunResult>` | `src/agent/container.ts` | Takes a single **options object**, so adding `systemPrompt` / `model` / `tools` per role is additive, not a signature break |
+| `AgentRunOptions`, `RunAgent`, `AgentRunResult` | `src/agent/types.ts` (re-exported from `runner.ts`) | Lives in `src/agent/` on purpose: runtimes must not import the worker |
+| `WorktreeOps {create, remove, gitDir, commit, push}` | `src/worker/runner.ts` | 2.2's detached child worktrees + `merge --no-ff` belong **here**, as new methods with real-git tests — do not call `execFileSync` from the runner or the spawn tool |
+| `createWorktree / worktreeDir / commonGitDir / commitWork / pushBranch` | `src/worker/worktree.ts` | All git is `execFileSync` (card ids are untrusted input; never interpolate into a shell string) |
+| `createStore(dbPath)` | `src/state/store.ts` | The module-level `store` singleton **opens SQLite at import time** (bottom of the file). Anything that must stay import-cheap cannot reach `runner.ts` |
+| `config.factory.*` | `src/config.ts` | Getters, not import-time snapshots, so `vi.stubEnv` works per test. Add `MAX_PARALLEL_AGENTS`, `AGENT_TIMEOUT_MS`, `MAX_AGENT_RUNS` the same way |
+| `makeGitRepo() / remoteBranches() / log()` , `makeTempDir()` | `test/helpers/git.ts`, `test/helpers/tmp.ts` | Real git in temp dirs is the house style for worktree/merge tests |
+| `vi.mock("node:child_process", …)` + a `PassThrough` fake child | `test/agent/container.test.ts` | Copy this pattern for `spawn.test.ts` / `graph-smoke`: it drives NDJSON, chunk splits, exit codes and spawn errors without Docker |
 
-**Graph vs single agent:** `runCard` branches on `deps.graph !== undefined ||
-(!deps.runAgent && config.factory.agentGraph)`. `AGENT_GRAPH=0` is the MVP path,
-and an injected `deps.runAgent` always wins. The push → PR → CI → Review tail is
-shared. 2.3 hooks the **GitHub webhook**, not `runCard`.
+## Facts about pi that cost real verification in 2.1 — do not re-derive
 
-## Facts about pi that cost real verification in 2.2 — do not re-derive
+1. **`pi --mode json` always exits 0**, even when the provider request failed. The
+   `stopReason` check in `runPrintMode` is inside `if (mode === "text")`. Failure is only
+   observable from `message_end` → `message.stopReason === "error" | "aborted"` +
+   `message.errorMessage`. 2.2's per-child status and the orchestrator's "child failed,
+   re-plan" signal must come from events, not the exit code.
+2. JSONL framing: **split on LF only, never `node:readline`** — U+2028/U+2029 are legal
+   inside JSON strings and readline splits on them (pi's own docs say this). Also handle a
+   final record with no trailing LF, and records split across read chunks.
+3. Tool flags (verified in `docs/cli.md`, 0.84.4): `-t/--tools` (allowlist),
+   `-xt/--exclude-tools`, `-nbt/--no-builtin-tools`, `-nt/--no-tools`. Built-ins are
+   `read, bash, edit, write, grep, find, ls`; **default enabled are `read, bash, edit,
+   write`** unless `defaultTools` changes them. 2.2 step 4 asks to "verify exact built-in
+   tool names" — done, use those.
+4. Also available for roles: `--system-prompt <text|path>`, `--append-system-prompt`
+   (repeatable), `--model <pattern>` / `--provider` / `--thinking`, `--no-session`,
+   `--session-dir`, `-nc/--no-context-files` (skips `AGENTS.md`/`CLAUDE.md` discovery),
+   `--offline`.
+5. `--` (end of pi options) exists only in **pi ≥ 0.84.3**; 0.84.2 rejects it with
+   `Error: Unknown option: --`. `deploy/docker/build.sh` therefore pins `PI_VERSION` from
+   `package-lock.json`, not the caret range. If 2.2 introduces new CLI flags, check the
+   minimum version the same way.
+6. **A git worktree is not a repository.** Its `.git` is a one-line `gitdir:` pointer into
+   the main clone, so an agent container needs `<repo>/.git` mounted **read-only at its
+   own absolute path** or `git log/status/diff` all die with "not a git repository". That
+   read-only mount is what makes commits impossible for the agent — which is why the
+   **host** commits (`commitWork`) and why 2.2's child branches must be created and merged
+   on the host, never inside the container.
+7. Env into a container comes from `buildAgentEnv()` in `src/agent/env.ts`: container-side
+   `PATH`/`HOME` + only provider keys that are set. OAuth state (`~/.pi/agent`) is never
+   mounted. A container with no provider key fails with "No API key found for the selected
+   model" (exit 1) — 2.2's parallel children multiply this cost, so keep the key set small
+   and note per-child token spend in `agent_runs`.
+8. `assertGitDirSafeToMount()` refuses to spawn when the mounted git config embeds
+   credentials (`https://user:token@…`, `http.extraHeader`). It runs **before** every
+   container. 2.2 spawns N containers per card — keep calling it, and don't cache a
+   positive result across a `git remote set-url`.
+9. Container network egress is **not** covered by the deploy script's nftables filter
+   (container traffic is forwarded through docker's bridge, not locally generated by uid
+   `pi`). Accepted risk; relevant if 2.2's `researcher` role gets web access.
 
-1. **`--tools` / `-t` is an allowlist that ALSO drops extension-registered custom
-   tools**, even when you name them in the list. Verified: `-t
-   read,grep,find,ls,spike_wait` → the model reported only
-   `read, grep, find, ls` and refused the call. So any role with a custom tool
-   cannot use `--tools`. The workaround is to ship the active set as data
-   (`FACTORY_ACTIVE_TOOLS`) and have the extension call `pi.setActiveTools()` at
-   `session_start` — verified to work, and it keeps custom tools.
-2. **`pi.setActiveTools()` is not callable during extension loading.** Doing it in
-   the factory aborts pi: `"Extension runtime not initialized. Action methods
-   cannot be called during extension loading."` It belongs in `session_start`.
-3. **`defineTool` is a no-op identity** (`dist/core/extensions/types.js:17-19`,
-   `return tool`). A plain object passed to `pi.registerTool()` is equivalent, so
-   an extension needs no runtime import of pi at all — only `Type` from
-   `@earendil-works/pi-ai`.
-4. **Extensions load in JSON mode, and `-e` is NOT blocked by `--no-approve`.**
-   `--no-approve` only sets `projectTrustOverride=false` (`dist/cli/args.js:218`),
-   which skips *project* `.pi/` files. Explicit command-line extensions load.
-5. **There is no tool-execution timeout in pi.** The only timeouts are provider
-   HTTP ones. A 25-second custom tool ran fine; sibling tool calls in one
-   assistant message run **concurrently** (two 3 s calls started 9 ms apart and
-   both ended ~3.02 s later).
-6. **`httpIdleTimeoutMs` defaults to 300000 and `retry.provider.timeoutMs`
-   inherits it.** A slow model is cut off inside pi long before
-   `AGENT_TIMEOUT_MS`, and it looks like a broken agent. There is **no CLI flag
-   and no env var** — `<agent-dir>/settings.json` is the only way in, hence
-   `FACTORY_AGENT_SETTINGS_FILE`.
-7. **A mounted extension cannot resolve pi's dependencies.** Imports resolve from
-   the extension's own directory upward, and `@earendil-works/pi-ai` is nested at
-   `$(npm root -g)/@earendil-works/pi-coding-agent/node_modules/@earendil-works/`,
-   not in the global root. From an arbitrary mount point: `ERR_MODULE_NOT_FOUND`.
-   Hence the image bakes `/opt/factory/node_modules` symlinks and copies the
-   extension in. Do not "simplify" this by mounting the extension file.
-8. **Never write to stdout from an extension in JSON mode** — stdout *is* the event
-   protocol. Diagnostics go to stderr (`createAgentEventCollector` ignores it).
-9. **A container reaches a host listener bound to `127.0.0.1` on Docker Desktop**
-   (verified), but on Linux `--add-host=host.docker.internal:host-gateway` arrives
-   at the **bridge** address. `FACTORY_IPC_BIND` defaults to loopback, so **a real
-   Linux deploy must widen it** — and then a per-run token is the only thing
-   gating an endpoint that can start containers. This is still untested on Linux.
-10. `pi --model` accepts `provider/id`, and ids containing `/` are fine
-    (`vmlx/pxleng/Swift-Qwen3.8-…`). Verified against the local vmlx box;
-    `models.json` is mounted per-agent, and a LAN base URL is reachable from the
-    container (bridge NAT, not the host netfilter — 2.1 note 9 still applies).
+## The one 2.2 design decision that needs a decision before code
 
-## The lesson of BUG-1 (read this before writing your next fake)
+2.2 specifies the **orchestrator agent runs in-process on the host**
+(`createAgentSession({ cwd: baseDir, customTools: [spawnAgentTool], excludeTools: [...] })`)
+justified by "it holds no write tools and never needs secrets". Phase 2.1's threat model
+does not support that: an in-process pi session inherits the full orchestrator
+`process.env` — the same thing 2.1 was built to prevent — and `excludeTools` only removes
+tools from the model's reach, not from the process. Two options, both viable, different
+work:
 
-`land()` measured a child with `git diff <base>...HEAD` **before** the host had
-committed anything. A child container's `.git` is read-only, so a finished
-child's work is *always* uncommitted, and its HEAD *is* its fork point — the
-range was always empty, every successful coder was reported "changed no files",
-and its work was discarded with zero merges.
+- **A. Orchestrator in a container too.** Needs custom tools to work across the JSON/RPC
+  boundary (pi's RPC mode or an extension), so children are spawned by the *host* on the
+  orchestrator's tool calls. More plumbing; keeps the boundary uniform.
+- **B. Accept an in-process orchestrator, and shrink what it can see.** Run the
+  orchestrator session in a child process with `buildAgentEnv()`-style scrubbed env (no
+  Trello/GitHub/Discord/webhook vars), `--no-approve`, and read-only tools. Keeps
+  `customTools` easy (in-process SDK), and the spawn tool becomes an IPC hop.
 
-**413 unit tests were green over this.** The reason was `committingFake`, which
-made its own commits so the host path was reachable at all — it modelled a child
-that cannot exist. A fake like that does not merely hide a bug; it converts
-passing tests into evidence the bug is absent. Fixed in `4200c29`; every fake now
-writes files and leaves them there, and two tests pin the regression.
+Ask the user which before implementing step 4. Do not assume "read-only tools" is a
+security boundary — that is exactly the claim 2.1 exists to disallow.
 
-**Consequence for 2.3:** the real-LLM smoke is not a nice-to-have, it is the only
-thing so far that has caught an integration-level lie. If you add a flow, add the
-smoke line for it.
+## What 2.2's `customTools` assumption actually checks out as
 
-## Open issues worth doing (2.2 leftovers, ranked)
+Verified against the installed package (0.84.4):
 
-1. **The run budget never resets, so a card can permanently lose its ability to
-   spawn.** `countRuns(cardId)` is `COUNT(*) WHERE card_id=?` over all history,
-   `agent_runs` has no attempt/generation column, and nothing anywhere issues a
-   `DELETE` on it (grepped). `enqueue` is `INSERT OR IGNORE`, so re-dragging a card
-   to Ready reuses the same row and the same count.
+- `customTools?: ToolDefinition[]` **is** on `AgentSessionConfig`
+  (`dist/core/agent-session.d.ts:122`) and on the SDK options (`dist/core/sdk.d.ts:47`);
+  `defineTool` is exported and documented (`docs/sdk.md:583-607`). So the **in-process**
+  orchestrator in 2.2 step 4 is real.
+- There is **no CLI flag** for custom tools (`grep custom-tool dist/cli/args.js` → nothing).
+  The only way to get a custom tool into `pi --mode json` is an **extension** loaded with
+  `-e <path>`, which registers it via `pi.registerTool()` (`docs/extensions.md:10`).
+  Extensions run *inside* the pi process — so option A means the orchestrator's
+  `spawn_agent` extension has to talk back out to the host (socket or an RPC-style file
+  handshake) to start sibling containers. That is the real cost of option A, and it is
+  worth knowing before committing to it.
 
-   **Reproduced, not inferred** — one attempt that spends all 12 runs, then a
-   re-trigger:
+Still unknown and worth a spike before implementing step 3: whether an extension's
+custom tool can run long-lived/parallel (the `spawn_agent` semaphore + 4 concurrent
+children) without tripping pi's tool timeout or serialising the session loop. Test it with
+a dummy 20-second tool before wiring roles to it.
 
-   ```
-   attempt 2, first spawn -> rejected
-     summary: run budget exhausted for this card (12). Summarise what has landed
-              and stop; do not spawn again.
-   countRuns(CARD) = 12 | activeRuns = 0
-   ```
+## Carry-over items from 2.1 (do these first, they're small)
 
-   The second attempt can never spawn a single child. Needs an attempt column on
-   `agent_runs` (budget counted per attempt) or a `resetRuns(cardId)` on the
-   queued→running transition. There is also **no `/factory retry` command** despite
-   PLAN.md listing one, so the webhook is currently the only re-trigger path — and
-   it walks straight into this. Worth a test that fails before the fix: "a card
-   re-queued after a failed attempt can spawn again".
-2. **A wedged orchestrator can hold the factory for hours.**
-   `orchestratorTimeoutMs = AGENT_TIMEOUT_MS * (maxAgentRuns + 1)` = 20 min × 13 =
-   **260 minutes** at defaults, and `queue.ts` gates on a *global*
-   `store.isRunning()`. One hung planner therefore blocks every other card for
-   4.3 hours. Either cap the orchestrator independently (`ORCHESTRATOR_TIMEOUT_MS`)
-   or make the worker gate per-card.
-3. **Nothing reaps stale `agent_runs`.** If the process dies mid-card, rows stay
-   `status='running'` forever: `/factory status` shows children that will never
-   finish, and it feeds problem 1's count. A startup sweep (any `running` row whose
-   card has no live job → mark `failed`) is small and removes a class of confusing
-   operator reports.
-4. **`deploy/setup-factory.sh` and `README.md` mention none of the 2.2 knobs**
-   (`AGENT_GRAPH`, `MAX_PARALLEL_AGENTS`, `AGENT_TIMEOUT_MS`, `MAX_AGENT_RUNS`,
-   `FACTORY_IPC_*`, `AGENT_MEMORY`, `AGENT_CPUS`, `FACTORY_AGENT_*_FILE`). Only
-   `.env.example` documents them. The Linux `FACTORY_IPC_BIND` requirement in
-   particular belongs in the deploy script, not just a comment.
-5. **2.1 carry-overs still open:** the exfiltration canary has never run with a
-   real provider key in the env (2 of 4 integration tests self-skip without one),
-   and the live VPS check (amd64 image build, `--user` + writable `~/.pi/agent`,
-   Discord embeds from a real container stream) has never been observed on a real
-   Linux host.
-6. **Unmeasured:** token spend per card, and whether the planner actually
-   serialises tasks that touch the same file — both smoke runs were given two
-   *independent* tasks, so the conflict-and-respawn path has unit coverage only.
-   A card that deliberately overlaps two tasks is the test for it.
+1. **Run the pi-prompt exfiltration canary.** `TEST_DOCKER=1 npx vitest run
+   test/integration` currently self-skips 2 of 4 tests because no provider API key is in
+   the env (this box uses `~/.pi/agent/auth.json` OAuth, which by design never reaches a
+   container). Needs one run with e.g. `ANTHROPIC_API_KEY` exported: it asserts the canary
+   never appears in the full NDJSON and that the run really happened
+   (`"type":"session"`, `tool_execution_start`, `agent_settled`). 2.1's Definition of Done
+   is not complete until that passes.
+2. **Live VPS check.** Run `deploy/setup-factory.sh` (installs `docker.io`, waits on
+   `/run/docker.sock` with a Proxmox `nesting=1` pointer, migrates `factory/.env` →
+   `/etc/factory/factory.env` 600 root, rebuilds the image on every deploy, installs the
+   rewritten unit) and drive one real card. Two things were reasoned about but not
+   observed on a real Docker/Linux host: (a) Discord still receives per-tool progress
+   embeds from the container stream; (b) the `--user <uid>:<gid>` + `chmod 0777
+   /home/agent` combination actually lets pi write `~/.pi/agent` as the factory user.
+   Also confirm the image builds on **linux/amd64** — it was built and probed on
+   linux/arm64.
+3. **Container resource limits** (`--memory`, `--cpus` from config) were deferred to 2.2
+   because parallel children are where pressure shows up. `buildDockerArgs` is the single
+   place to add them, plus a pure-args test.
 
-## The one 2.3 decision that needs a decision before code
+## Working rules that applied last phase
 
-2.3's reviewer is described as "containerized per 2.1, reviews the diff in a
-disposable worktree, posts PR comments". Two things that does not yet answer:
-
-- **Where do the comments get posted from?** Posting needs `GITHUB_TOKEN`, which
-  by 2.1's rule must never enter a container. So the reviewer either (a) emits a
-  structured report as text/JSON and the **host** parses and posts it — same shape
-  as the graph's `spawn_agent` round-trip, and the host already has an IPC server
-  to reuse — or (b) registers a `post_review` custom tool through the baked
-  extension and posts per-tool-call over IPC. (b) is nicer for the model (it can
-  post as it goes) and reuses `src/agents/ipc.ts` almost unchanged; (a) is less
-  machinery. Do not solve this with a token in the container.
-- **Triggering and de-duplication.** `opened` + `synchronized` on `factory/*`
-  means a PR pushed 5 times gets reviewed 5 times, each a fresh model spend.
-  Needs a decision: review every push, or coalesce (e.g. skip if a review for that
-  commit SHA exists — which argues for recording reviews in a table rather than
-  only in `agent_runs`).
-
-Ask the user which before implementing. Also confirm whether the reviewer runs
-through the graph (`spawn_agent` is closed to it by design) or standalone via the
-webhook — 2.2's `spawnableRoleIds()` deliberately excludes it, so the second is
-what the current code supports.
-
-## How to re-run the real smoke
-
-```
-TEST_LLM=1 AGENT_MODEL=vmlx/<provider-model-id> FACTORY_AGENT_MODELS_FILE=$PWD/models.json MAX_PARALLEL_AGENTS=3 MAX_AGENT_RUNS=4 AGENT_TIMEOUT_MS=900000 npm run test:graph-smoke
-```
-
-- **Skip trap:** `TEST_LLM=1 FOO=bar \` with a trailing space after the backslash
-  makes line 1 a bare, **unexported** assignment, so `npm` on line 2 never sees
-  `TEST_LLM` and the smoke self-skips with no error. Keep them on one line.
-- The smoke pre-flights the endpoint by reading the base URL out of the **same**
-  `models.json` the container mounts. A dead or glacial endpoint produced the same
-  all-red check list as a broken graph, which cost a debugging pass to separate.
-- `AGENT_TIMEOUT_MS` above 5 minutes makes it write a matching `settings.json`
-  itself (pi's 5-minute default would otherwise cut a slow model off mid-request).
-- The vmlx box has been intermittent (`500 Internal gateway error` on raw
-  `/v1/chat/completions`, port closed at times). Check it with a direct request
-  before blaming `src/agents/`.
-
-## Working rules that applied this phase
-
-- **Verify, don't assume — and verify the thing the plan asserts.** Two of 2.2's
-  three design changes came from testing a plan assumption rather than reading it:
-  `--tools` and custom tools (would have shipped a planner with no spawn tool),
-  and `factory/<card>/<run>` alongside `factory/<card>` (git refuses: refs are
-  files, both directions). The plan said "verify exact built-in tool names at
-  implementation time" and that one sentence led to the Option A tool model.
-- **A green suite is not proof.** See BUG-1. Prefer real git fixtures and
-  `stopReason`-accurate fakes over convenient ones, and when a fake has to do
-  something a real component cannot, say so in the comment.
-- When a plan step turns out wrong, implement the correction **and** write the
-  deviation into the plan file (`plan/2.2-agent-graph.md` has "Status —
-  implemented, with these deviations", eight numbered items, plus the two spike
-  sections; copy that shape for 2.3).
-- Keep `npm test` hermetic: no docker, no network, no real credentials. Anything
-  needing docker goes behind `TEST_DOCKER=1`; anything needing a model behind
-  `TEST_LLM=1`; both must report *why* they skipped.
-- Commit messages are imperative and scoped, and say what was verified:
-  `fix: commit a child's work on the host before measuring it`.
-- Subagents have no shell in this setup: a worker cannot run `vitest` or `git`.
-  Run their commands yourself, and be suspicious of a worker that reports success
-  without saying it could not execute anything. One worker this phase found the
-  git ref limitation on its own and flagged it rather than coding around it
-  silently — that report was worth more than the tests it wrote.
+- Verify, don't assume — 2.1's plan contained three blockers that only showed up by
+  running the real image and reading `dist/modes/print-mode.js`. Reproduce a failure in a
+  real container before designing around it.
+- When a plan step turns out to be wrong, implement the correction *and* write the
+  deviation into the plan file (`plan/2.1-secret-isolation.md` has a
+  "Deviations — what verifying instead of assuming changed" section to copy the shape of).
+- Keep tests hermetic: no Docker, no network, no real credentials in `npm test`.
+  Anything needing Docker goes behind `TEST_DOCKER=1` and reports why it skipped.
+- Commit messages in this repo are imperative and scoped:
+  `test: phase 2.0 — …`, `Secret isolation`, `factory init`.
