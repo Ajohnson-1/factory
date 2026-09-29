@@ -18,7 +18,7 @@ import type { DiscordBot } from "../../src/discord/bot.js";
 const fakeStore = {
   isRunning: vi.fn((): boolean => false),
   nextQueued: vi.fn((): { card_id: string; card_name: string } | undefined => undefined),
-  reapStale: vi.fn(() => ({ runs: [], jobs: [] })),
+  reapStale: vi.fn(() => ({ runs: [], jobs: [], reviews: [] })),
 };
 const runCard = vi.fn(async () => {});
 // `isPaused()` reads `data/paused` off the disk. Left real, this file would pass
@@ -54,6 +54,7 @@ describe("reapOrphans", () => {
           { run_id: "c1", card_id: "card-b", role: "coder" },
         ],
         jobs: [{ card_id: "card-a", card_name: "Card A" }],
+        reviews: [{ pr_number: 7, card_id: "card-a" }],
       }),
     } as unknown as Store;
     const lines: string[] = [];
@@ -61,15 +62,39 @@ describe("reapOrphans", () => {
     reapOrphans(store, (line) => lines.push(line));
 
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("reaped 3 stale agent run(s), 1 running job(s)");
+    expect(lines[0]).toContain("reaped 3 stale agent run(s), 1 running job(s), 1 stale review(s)");
     // Card ids, deduplicated: three dead children is one dead card's mess.
     expect(lines[0]).toContain("card-a, card-b");
+  });
+
+  /**
+   * The review half is not decoration. A `running` review row makes its head SHA
+   * permanently unreviewable, so a boot sweep that logs runs and jobs but not
+   * reviews would leave an operator looking at a card that silently never gets
+   * reviewed again.
+   */
+  it("reports a card whose only orphan was a review", async () => {
+    const { reapOrphans } = await import("../../src/worker/queue.js");
+    const store = {
+      reapStale: () => ({
+        runs: [],
+        jobs: [],
+        reviews: [{ pr_number: 7, card_id: "card-c" }],
+      }),
+    } as unknown as Store;
+    const lines: string[] = [];
+
+    reapOrphans(store, (line) => lines.push(line));
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("1 stale review(s)");
+    expect(lines[0]).toContain("card-c");
   });
 
   it("says nothing when nothing was mid-flight", async () => {
     const { reapOrphans } = await import("../../src/worker/queue.js");
     const store = {
-      reapStale: () => ({ runs: [], jobs: [] }),
+      reapStale: () => ({ runs: [], jobs: [], reviews: [] }),
     } as unknown as Store;
     const lines: string[] = [];
 
@@ -80,7 +105,7 @@ describe("reapOrphans", () => {
 
   it("reaps through the store, which is the only place that knows what is running", async () => {
     const { reapOrphans } = await import("../../src/worker/queue.js");
-    const reapStale = vi.fn(() => ({ runs: [], jobs: [] }));
+    const reapStale = vi.fn(() => ({ runs: [], jobs: [], reviews: [] }));
 
     reapOrphans({ reapStale } as unknown as Store, () => {});
 

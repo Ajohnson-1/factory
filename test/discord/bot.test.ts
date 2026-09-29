@@ -273,6 +273,48 @@ describe("buildStatusText", () => {
     expect(text).not.toContain("0 in / 0 out");
   });
 
+  /**
+   * Phase 2.3: the reviewer spends tokens on every push and appears nowhere in
+   * `runs`, so without this line its cost is invisible in exactly the view that
+   * exists to answer "what has this card cost".
+   */
+  it("adds a separate review line with its own count and spend", () => {
+    const text = buildStatusText([job()], [], [], [
+      { card_id: "c1", reviews: 3, reported: 3, input: 300, output: 30, cache_read: 3_000 },
+    ]);
+
+    expect(text).toContain("RUNNING — Card one");
+    expect(text).toContain("review spend: 300 in / 30 out / 3000 cache read (3 reviews)");
+    // Graph spend and review spend stay on separate lines, because they are two
+    // different limits an operator would be tuning.
+    expect(text).not.toMatch(/^  spend:/m);
+  });
+
+  it("says a card had reviews whose cost was never reported", () => {
+    const text = buildStatusText([job()], [], [], [
+      { card_id: "c1", reviews: 2, reported: 0, input: 0, output: 0, cache_read: 0 },
+    ]);
+
+    expect(text).toContain("review spend: not reported (2 reviews)");
+    expect(text).not.toContain("0 in / 0 out");
+  });
+
+  it("marks a review line partial when only some reviews reported", () => {
+    const text = buildStatusText([job()], [], [], [
+      { card_id: "c1", reviews: 4, reported: 1, input: 100, output: 10, cache_read: 0 },
+    ]);
+
+    expect(text).toContain(
+      "review spend: 100 in / 10 out / 0 cache read (1 of 4 reviews reported)"
+    );
+  });
+
+  it("leaves a card that has never been reviewed without a review line", () => {
+    const text = buildStatusText([job()], [], [], []);
+
+    expect(text).not.toMatch(/review spend:/);
+  });
+
   it("names the reporting subset when only some runs carried usage", () => {
     const text = buildStatusText([job()], [], [
       { card_id: "c1", runs: 4, reported: 3, input: 900, output: 30, cache_read: 0 },

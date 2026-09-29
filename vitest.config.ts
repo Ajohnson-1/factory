@@ -28,6 +28,10 @@ export default defineConfig({
         // secret boundary, because a token check and a budget check fail silently
         // — the code looks fine, the model just gets more power than intended.
         "src/agents/**": { lines: 85 },
+        // Phase 2.3's reviewer, at the same bar as the agent dirs and for the same
+        // reason: a de-duplication guard or a comment cap that stops working is
+        // silent — the code looks fine, the model just spends more than intended.
+        "src/reviewer/**": { lines: 85 },
         "src/worker/**": { lines: 70 },
       },
     },

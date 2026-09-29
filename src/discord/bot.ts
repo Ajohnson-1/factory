@@ -31,6 +31,16 @@ export function isPaused(dataDir: string = defaultDataDir()): boolean {
   return fs.existsSync(path.join(dataDir, "paused"));
 }
 
+/** Per-card review totals, as `Store.usageByReviewCard` returns them. */
+export interface CardReviewUsage {
+  card_id: string;
+  reviews: number;
+  reported: number;
+  input: number;
+  output: number;
+  cache_read: number;
+}
+
 /**
  * Per-card token totals, as `Store.usageByCard` returns them.
  *
@@ -58,11 +68,16 @@ export interface CardUsage {
  * `usage` is the per-card spend (phase 2.2 open issue #6). `MAX_AGENT_RUNS` caps
  * how many runs a card may have; only these numbers make it a *cost* limit
  * rather than a count.
+ *
+ * `reviewUsage` is the same for phase 2.3's reviewer, which is deliberately not
+ * part of `runs`: a card's graph budget and its review budget are two knobs an
+ * operator tunes separately, so the numbers stay on separate lines.
  */
 export function buildStatusText(
   jobs: Job[],
   runs: AgentRun[] = [],
-  usage: CardUsage[] = []
+  usage: CardUsage[] = [],
+  reviewUsage: CardReviewUsage[] = []
 ): string {
   if (jobs.length === 0) return "No jobs yet.";
 
@@ -74,6 +89,9 @@ export function buildStatusText(
   }
   const spend = new Map<string, CardUsage>(
     usage.map((u) => [u.card_id, u] as [string, CardUsage])
+  );
+  const reviewSpend = new Map<string, CardReviewUsage>(
+    reviewUsage.map((u) => [u.card_id, u] as [string, CardReviewUsage])
   );
 
   return jobs
@@ -98,7 +116,25 @@ export function buildStatusText(
             ? `  spend: usage not reported (${u.runs} run${u.runs === 1 ? "" : "s"})`
             : `  spend: ${u.input} in / ${u.output} out / ${u.cache_read} cache read ${scope}`;
       }
-      return [head, ...children, ...(total ? [total] : [])].join("\n");
+      const r = reviewSpend.get(j.card_id);
+      // Reviews are on a separate line rather than folded into the total above
+      // because they answer different questions: "is this card's graph getting
+      // expensive" is the operator's decision about MAX_AGENT_RUNS, and "is the
+      // reviewer spending more than the work" is a decision about REVIEW_MAX_RUNS_PER_CARD.
+      let reviewLine = "";
+      if (r) {
+        const scope =
+          r.reported === r.reviews
+            ? `(${r.reviews} review${r.reviews === 1 ? "" : "s"})`
+            : `(${r.reported} of ${r.reviews} review${r.reviews === 1 ? "" : "s"} reported)`;
+        reviewLine =
+          r.reported === 0
+            ? `  review spend: not reported (${r.reviews} review${r.reviews === 1 ? "" : "s"})`
+            : `  review spend: ${r.input} in / ${r.output} out / ${r.cache_read} cache read ${scope}`;
+      }
+      return [head, ...children, ...(total ? [total] : []), ...(reviewLine ? [reviewLine] : [])].join(
+        "\n"
+      );
     })
     .join("\n");
 }
@@ -187,7 +223,12 @@ export class DiscordBot {
     if (i.commandName !== "factory") return;
     const sub = i.options.getSubcommand();
     if (sub === "status") {
-      const text = buildStatusText(store.all(), store.activeRuns(), store.usageByCard());
+      const text = buildStatusText(
+        store.all(),
+        store.activeRuns(),
+        store.usageByCard(),
+        store.usageByReviewCard()
+      );
       await i.reply({ content: `**Factory status**\n\`\`\`${text}\`\`\`` });
     } else if (sub === "retry") {
       const cardId = i.options.getString("card", true);

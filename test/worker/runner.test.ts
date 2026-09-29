@@ -124,6 +124,20 @@ beforeEach(() => {
 
   ciState = "passed";
   github = {
+    // The reviewer's three methods are unused by `runCard`; the fake carries them
+    // only because `GithubClient` is `typeof github`, and widening that object is
+    // what lets the webhook share it. They throw rather than return a plausible
+    // value so a card that ever starts posting reviews fails loudly here instead
+    // of passing on a stub.
+    getPullRequest: vi.fn(async (): Promise<never> => {
+      throw new Error("runCard must not read a pull request");
+    }),
+    postLineComment: vi.fn(async (): Promise<never> => {
+      throw new Error("runCard must not post a review comment");
+    }),
+    postReview: vi.fn(async (): Promise<never> => {
+      throw new Error("runCard must not post a review");
+    }),
     createPR: vi.fn(
       async (_branch: string, _title: string, _body: string): Promise<string> => PR_URL
     ),

@@ -231,7 +231,7 @@ describe("reapStale — the boot sweep", () => {
     // The card finished cleanly, so nothing in here is mid-flight any more.
     store.setReview("c1", "https://x/pull/1");
 
-    expect(store.reapStale()).toEqual({ runs: [], jobs: [] });
+    expect(store.reapStale()).toEqual({ runs: [], jobs: [], reviews: [] });
     expect(store.runsFor("c1")[0].status).toBe("ok");
     expect(store.get("c1")?.status).toBe("review");
   });
@@ -244,7 +244,7 @@ describe("reapStale — the boot sweep", () => {
     store.reapStale();
     const second = store.reapStale();
 
-    expect(second).toEqual({ runs: [], jobs: [] });
+    expect(second).toEqual({ runs: [], jobs: [], reviews: [] });
   });
 
   /**

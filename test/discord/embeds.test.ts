@@ -5,6 +5,7 @@ import {
   failedEmbed,
   prReadyEmbed,
   progressEmbed,
+  reviewPostedEmbed,
   startedEmbed,
 } from "../../src/discord/embeds.js";
 
@@ -118,5 +119,34 @@ describe("doneEmbed", () => {
 
   it("shows the PR url in the PR field", () => {
     expect(field(doneEmbed("Card one", PR_URL), "PR")?.value).toBe(PR_URL);
+  });
+});
+
+describe("reviewPostedEmbed", () => {
+  const embed = () => reviewPostedEmbed("Card one", PR_URL, 3);
+
+  it("uses the review title", () => {
+    expect(embed().data.title).toBe("🔍 Review posted");
+  });
+
+  it("shows the card, the PR and how many findings landed", () => {
+    expect(field(embed(), "Card")?.value).toBe("Card one");
+    expect(field(embed(), "PR")?.value).toBe(PR_URL);
+    expect(field(embed(), "Comments")?.value).toBe("3");
+  });
+
+  /**
+   * A review that found nothing is a valid review (the charter says so), and this
+   * is where that shows: `0` has to render rather than disappear, or a clean review
+   * looks like the embed failed to build.
+   */
+  it("says zero rather than nothing when the review found no line to comment on", () => {
+    expect(field(reviewPostedEmbed("Card one", PR_URL, 0), "Comments")?.value).toBe("0");
+  });
+
+  it("is an info-coloured notice, not a success or a failure", () => {
+    // Review findings are not a completed card: green would read as "approved",
+    // which is a decision the factory explicitly does not make.
+    expect(embed().data.color).toBe(0x5865f2);
   });
 });

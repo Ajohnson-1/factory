@@ -215,6 +215,43 @@ export function diffStat(dir: string, baseRef: string): string {
   }).trim();
 }
 
+/**
+ * How many lines a file has *as of this worktree's HEAD*, or null when HEAD has no
+ * such file.
+ *
+ * This exists to answer one question about a review comment: can it go there? A
+ * line number past the end of the file, or a comment on a file the reviewed commit
+ * deleted, is accepted by GitHub's API and then points at nothing, permanently, in
+ * a bot's name — so the only check worth having is against the commit that is
+ * actually checked out. Reading it out of git rather than off the disk is what
+ * makes that the same content the reviewer saw, not whatever else is in the
+ * directory.
+ *
+ * A trailing newline is not its own line, and an empty file has no lines to point
+ * at; both are off-by-one errors a reader would find in the resulting comment.
+ */
+export function fileLineCount(dir: string, file: string): number | null {
+  let content: string;
+  try {
+    content = execFileSync("git", ["-C", dir, "show", `HEAD:${file}`], {
+      encoding: "utf8",
+      // A "not in this commit" answer is the expected result for a deleted file, and
+      // git prints one to stderr every time. Silencing it keeps a normal review from
+      // looking like a failing command in the orchestrator's log.
+      stdio: ["ignore", "pipe", "ignore"],
+      // A reviewed repo can hold a generated file; the cap is here so one cannot
+      // turn a review into an out-of-memory on the orchestrator.
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch {
+    // Not in the tree, or a path git will not resolve from inside the worktree.
+    return null;
+  }
+  if (content.length === 0) return 0;
+  const parts = content.split(/\r?\n/);
+  return content.endsWith("\n") ? parts.length - 1 : parts.length;
+}
+
 export type MergeResult =
   | { ok: true; commit: string }
   | { ok: false; conflict: true; files: string[]; output: string };
@@ -350,4 +387,122 @@ export function pushBranch(dir: string, branch: string): void {
   execFileSync("git", ["-C", dir, "push", "-u", "origin", branch], {
     stdio: "inherit",
   });
+}
+
+/* -------------------------------------------------------------------------- *
+ * Phase 2.3 — a detached checkout of a PR head, for the reviewer.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * A review checkout: a directory and the exact commit it is sitting on.
+ *
+ * Deliberately not a `Worktree`. That type's `branch` is a required string and a
+ * detached checkout has no branch; inventing a sentinel name for it would be a
+ * lie that something like `deleteBranch` could later act on. A review owns no
+ * ref: the reviewer cannot commit (`.git` is mounted read-only in its container),
+ * and nothing is ever merged from here.
+ */
+export interface ReviewWorktree {
+  dir: string;
+  head: string;
+}
+
+/** A PR head SHA is a sha, and it becomes a path segment, so nothing else will do. */
+const SHA = /^[0-9a-f]{7,40}$/i;
+
+/**
+ * Shorten a SHA for a name, defensively.
+ *
+ * Every caller checks the shape first, but this value arrives from a webhook
+ * payload and ends up inside a directory name, and a `..` there is not a failure
+ * mode worth discovering in production.
+ */
+function shortSha(headSha: string): string {
+  if (!SHA.test(headSha)) throw new Error(`not a commit sha: ${headSha}`);
+  return headSha.slice(0, 7);
+}
+
+/** Worktree id for a review — `wt-<card>-r<sha7>`, the `r` marking what it is. */
+export function reviewWorktreeId(cardId: string, headSha: string): string {
+  return `${cardId}-r${shortSha(headSha)}`;
+}
+
+/** Is this commit already in the object store? */
+function hasCommit(repoPath: string, sha: string): boolean {
+  try {
+    execFileSync("git", ["-C", repoPath, "cat-file", "-e", `${sha}^{commit}`], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check a PR head out, detached, at exactly `headSha`.
+ *
+ * The SHA is the one the webhook named and the one the dedupe row is keyed on, so
+ * this checks out *that commit* rather than "the PR": an author can push again
+ * between the event and the container starting, and a review posted against lines
+ * nobody reviewed is worse than no review.
+ *
+ * `refs/pull/<n>/head` is how a PR head comes in from the base repo even after the
+ * head branch is deleted or force-pushed — GitHub advertises it for every PR. A
+ * fixture repo has no such ref, so a SHA that is already local (every test, and a
+ * re-review of a head) skips the fetch. If the commit is neither local nor
+ * fetchable this throws: the alternative is checking out something *near* the
+ * requested SHA and labelling the review with a commit it never saw.
+ */
+export function createReviewWorktree(
+  cardId: string,
+  prNumber: number,
+  headSha: string,
+  repoPath: string = config.factory.repoPath()
+): ReviewWorktree {
+  shortSha(headSha); // validate before any of it reaches a path or an argv
+  const dir = worktreeDir(reviewWorktreeId(cardId, headSha), repoPath);
+
+  if (!hasCommit(repoPath, headSha)) {
+    try {
+      git(repoPath, ["fetch", "origin", `refs/pull/${prNumber}/head`]);
+    } catch {
+      // A fetch can fail for reasons nothing here can act on; the check below
+      // turns it into the precise complaint, so nothing is silently swallowed.
+    }
+  }
+  if (!hasCommit(repoPath, headSha)) {
+    throw new Error(
+      `commit ${headSha} is not available locally and did not arrive with PR #${prNumber}'s head`
+    );
+  }
+
+  reclaimWorktree(repoPath, dir);
+  git(repoPath, ["worktree", "add", "--detach", dir, headSha]);
+  return { dir, head: headSha };
+}
+
+/**
+ * Drop a review worktree. No branch to delete and nothing to merge: this is the
+ * cleanup half of a disposable checkout, and it runs from a `finally`.
+ */
+export function removeReviewWorktree(
+  cardId: string,
+  headSha: string,
+  repoPath: string = config.factory.repoPath()
+): void {
+  const dir = worktreeDir(reviewWorktreeId(cardId, headSha), repoPath);
+  try {
+    git(repoPath, ["worktree", "remove", "--force", dir]);
+  } catch {
+    // Same best-effort rule as `removeChildWorktree` — a review that failed must
+    // not fail a second time on cleanup — but the directory is still removed,
+    // because a leaked checkout under the repo root is what an operator trips on.
+    fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      git(repoPath, ["worktree", "prune"]);
+    } catch {
+      // best effort
+    }
+  }
 }

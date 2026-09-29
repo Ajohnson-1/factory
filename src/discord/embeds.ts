@@ -91,3 +91,25 @@ export function doneEmbed(cardName: string, prUrl: string): EmbedBuilder {
       { name: "PR", value: prUrl }
     );
 }
+
+/**
+ * A review landed on a pull request (phase 2.3).
+ *
+ * The count is line comments only, not the summary: "1 review posted" next to a PR
+ * with eight findings on it is the number an operator actually wants, and a review
+ * that found nothing reads as a bare 0 rather than as a failure to report.
+ */
+export function reviewPostedEmbed(
+  cardName: string,
+  prUrl: string,
+  commentCount: number
+): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle("🔍 Review posted")
+    .addFields(
+      { name: "Card", value: cardName, inline: true },
+      { name: "Comments", value: String(commentCount), inline: true },
+      { name: "PR", value: prUrl }
+    );
+}

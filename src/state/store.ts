@@ -44,6 +44,32 @@ export interface Job {
   error: string | null;
 }
 
+/**
+ * One review of one PR head.
+ *
+ * `running` is written before the container starts, not after it posts, because
+ * 2.3's reviewer posts as it works: a duplicate that arrives mid-run has already
+ * put comments on the PR by the time a `posted` row would have existed.
+ */
+export type ReviewStatus = "running" | "posted" | "skipped" | "failed";
+
+export interface Review {
+  pr_number: number;
+  card_id: string;
+  head_sha: string;
+  status: ReviewStatus;
+  /** Line comments this review has posted. */
+  comments: number;
+  /** 0/1 — the summary may only be posted once, and this is what makes it atomic. */
+  summary_posted: number;
+  error: string | null;
+  usage_in: number | null;
+  usage_out: number | null;
+  usage_cache_read: number | null;
+  started_at: number;
+  posted_at: number | null;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
   card_id TEXT PRIMARY KEY,
@@ -77,6 +103,26 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 
 CREATE INDEX IF NOT EXISTS agent_runs_card_id ON agent_runs(card_id);
+
+CREATE TABLE IF NOT EXISTS reviews (
+  pr_number INTEGER NOT NULL,
+  card_id   TEXT NOT NULL,
+  head_sha  TEXT NOT NULL,
+  status    TEXT NOT NULL DEFAULT 'running',
+  comments  INTEGER NOT NULL DEFAULT 0,
+  summary_posted INTEGER NOT NULL DEFAULT 0,
+  error     TEXT,
+  usage_in  INTEGER,
+  usage_out INTEGER,
+  usage_cache_read INTEGER,
+  started_at INTEGER NOT NULL,
+  posted_at  INTEGER,
+  -- (pr_number, head_sha) is the de-duplication key, and it has to be a primary
+  -- key rather than a checked-then-inserted convention: "has this exact head
+  -- been reviewed" is the only guard against a redelivered opened-webhook, and
+  -- two deliveries that both read "no" before either writes would both run.
+  PRIMARY KEY (pr_number, head_sha)
+);
 `;
 
 /**
@@ -87,6 +133,16 @@ CREATE INDEX IF NOT EXISTS agent_runs_card_id ON agent_runs(card_id);
 const RUN_INDEXES = `
 CREATE INDEX IF NOT EXISTS agent_runs_card_id ON agent_runs(card_id);
 CREATE INDEX IF NOT EXISTS agent_runs_card_attempt ON agent_runs(card_id, attempt);
+`;
+
+/**
+ * Review lookups that are not the primary key: the budget counts a card's
+ * reviews, and a redelivered webhook knows only a head SHA, not which PR it was
+ * opened against.
+ */
+const REVIEW_INDEXES = `
+CREATE INDEX IF NOT EXISTS reviews_card_id ON reviews(card_id);
+CREATE INDEX IF NOT EXISTS reviews_head_sha ON reviews(head_sha);
 `;
 
 /**
@@ -200,6 +256,7 @@ export function createStore(dbPath: string) {
   applyAddColumns(db);
   if (keyedOnRunIdAlone(db)) rebuildRunKey(db);
   db.exec(RUN_INDEXES);
+  db.exec(REVIEW_INDEXES);
 
   return {
     /**
@@ -412,6 +469,163 @@ export function createStore(dbPath: string) {
         )
         .all() as never;
     },
+    /**
+     * Claim the right to review one head SHA, or refuse it.
+     *
+     * Both refusals are ordinary traffic rather than faults, so this returns a
+     * reason instead of throwing: `duplicate` is a redelivered webhook or a push
+     * that raced us, `budget` is `REVIEW_MAX_RUNS_PER_CARD`. The row is written
+     * here, before the container starts and before anything is posted, because
+     * the reviewer posts findings as it works — a check that ran after the first
+     * comment would be a check that arrives after the money is spent.
+     *
+     * `skipped` and `failed` rows are re-claimable. That SHA was never reviewed
+     * successfully, and a review that died part-way may have posted some comments,
+     * which is something an operator can read off the row rather than a reason to
+     * refuse the head forever.
+     */
+    startReview(opts: {
+      prNumber: number;
+      cardId: string;
+      headSha: string;
+      maxPerCard: number;
+    }): { begin: boolean; reason?: "duplicate" | "budget" } {
+      return db.transaction(() => {
+        const existing = db
+          .prepare(`SELECT status FROM reviews WHERE pr_number=? AND head_sha=?`)
+          .get(opts.prNumber, opts.headSha) as { status: ReviewStatus } | undefined;
+        if (existing && (existing.status === "running" || existing.status === "posted")) {
+          return { begin: false, reason: "duplicate" as const };
+        }
+        // One row per distinct head SHA, and a re-claim does not add one, so the
+        // row count is the number of model runs this card has asked for. This is
+        // deliberately not `countRuns`: reviews are not graph children, and
+        // counting them there would let a PR push eat a coder's budget.
+        const used = (
+          db.prepare(`SELECT COUNT(*) AS n FROM reviews WHERE card_id=?`).get(opts.cardId) as {
+            n: number;
+          }
+        ).n;
+        if (used >= opts.maxPerCard) return { begin: false, reason: "budget" as const };
+
+        const now = Date.now();
+        if (existing) {
+          db.prepare(
+            `UPDATE reviews SET card_id=?, status='running', error=NULL, comments=0,
+                    summary_posted=0, started_at=?, posted_at=NULL
+               WHERE pr_number=? AND head_sha=?`
+          ).run(opts.cardId, now, opts.prNumber, opts.headSha);
+          return { begin: true };
+        }
+        db.prepare(
+          `INSERT INTO reviews (pr_number, card_id, head_sha, status, started_at)
+           VALUES (?, ?, ?, 'running', ?)`
+        ).run(opts.prNumber, opts.cardId, opts.headSha, now);
+        return { begin: true };
+      })();
+    },
+    reviewFor(prNumber: number, headSha: string): Review | undefined {
+      return db
+        .prepare(`SELECT * FROM reviews WHERE pr_number=? AND head_sha=?`)
+        .get(prNumber, headSha) as Review | undefined;
+    },
+    /**
+     * How many reviews a card has had, across every PR and every head.
+     *
+     * `startReview` enforces the cap inside its own transaction; this is the number
+     * for the log line, where an operator wants to see *what the limit is* rather
+     * than only that something refused.
+     */
+    countReviews(cardId: string): number {
+      const row = db
+        .prepare(`SELECT COUNT(*) AS n FROM reviews WHERE card_id=?`)
+        .get(cardId) as { n: number };
+      return row.n;
+    },
+    /**
+     * Count a posted line comment against its review.
+     *
+     * Called *after* the post succeeded. The alternative — reserve a slot, then
+     * post — would let a flaky API call spend the cap without anything appearing
+     * on the PR, which is the worse way to be wrong about money.
+     */
+    bumpReviewComment(prNumber: number, headSha: string): number {
+      db.prepare(`UPDATE reviews SET comments=comments+1 WHERE pr_number=? AND head_sha=?`).run(
+        prNumber,
+        headSha
+      );
+      const row = db
+        .prepare(`SELECT comments AS n FROM reviews WHERE pr_number=? AND head_sha=?`)
+        .get(prNumber, headSha) as { n: number } | undefined;
+      return row?.n ?? 0;
+    },
+    /**
+     * Take the right to post the review summary. Exactly one caller can win, and
+     * a second `post_review` with no path gets `false` rather than a second
+     * review on the PR.
+     */
+    claimReviewSummary(prNumber: number, headSha: string): boolean {
+      const info = db
+        .prepare(
+          `UPDATE reviews SET summary_posted=1 WHERE pr_number=? AND head_sha=? AND summary_posted=0`
+        )
+        .run(prNumber, headSha);
+      return info.changes === 1;
+    },
+    /** Close out a review. `usage` stays NULL for a run that reported none. */
+    markReview(
+      prNumber: number,
+      headSha: string,
+      status: ReviewStatus,
+      opts: { error?: string; usage?: RunUsage } = {}
+    ): void {
+      const now = Date.now();
+      if (opts.usage) {
+        db.prepare(
+          `UPDATE reviews SET status=?, error=?, posted_at=?,
+                  usage_in=?, usage_out=?, usage_cache_read=?
+             WHERE pr_number=? AND head_sha=?`
+        ).run(
+          status,
+          opts.error ?? null,
+          now,
+          opts.usage.input,
+          opts.usage.output,
+          opts.usage.cacheRead,
+          prNumber,
+          headSha
+        );
+        return;
+      }
+      db.prepare(`UPDATE reviews SET status=?, error=?, posted_at=? WHERE pr_number=? AND head_sha=?`).run(
+        status,
+        opts.error ?? null,
+        now,
+        prNumber,
+        headSha
+      );
+    },
+    /** Per-card review spend, so a reviewer's tokens are not invisible. */
+    usageByReviewCard(): {
+      card_id: string;
+      reviews: number;
+      reported: number;
+      input: number;
+      output: number;
+      cache_read: number;
+    }[] {
+      return db
+        .prepare(
+          `SELECT card_id,
+                  COUNT(*) AS reviews,
+                  COUNT(usage_in) AS reported,
+                  COALESCE(SUM(usage_in), 0) AS input,
+                  COALESCE(SUM(usage_out), 0) AS output,
+                  COALESCE(SUM(usage_cache_read), 0) AS cache_read
+             FROM reviews GROUP BY card_id ORDER BY card_id`
+        )
+        .all() as never;
+    },
     /** Runs still mid-flight: all cards when `cardId` is omitted. */
     activeRuns(cardId?: string): AgentRun[] {
       if (cardId === undefined) {
@@ -446,8 +660,13 @@ export function createStore(dbPath: string) {
      */
     reapStale(
       runSummary = "reaped: orchestrator restarted mid-run",
-      jobError = "reaped: the factory restarted while this card was running"
-    ): { runs: { run_id: string; card_id: string; role: string }[]; jobs: { card_id: string; card_name: string }[] } {
+      jobError = "reaped: the factory restarted while this card was running",
+      reviewError = "reaped: the factory restarted while this review was running"
+    ): {
+      runs: { run_id: string; card_id: string; role: string }[];
+      jobs: { card_id: string; card_name: string }[];
+      reviews: { pr_number: number; card_id: string }[];
+    } {
       const runs = db
         .prepare(
           `SELECT run_id, card_id, role FROM agent_runs WHERE status='running'
@@ -459,6 +678,16 @@ export function createStore(dbPath: string) {
           `SELECT card_id, card_name FROM jobs WHERE status='running' ORDER BY created_at, card_id`
         )
         .all() as { card_id: string; card_name: string }[];
+      // Reviews are swept too, and this one is load-bearing rather than tidying:
+      // a `running` review row is a head SHA that `startReview` will refuse
+      // forever, so a process killed mid-review would silently make that push
+      // unreviewable, and the operator would have to know to delete a row.
+      const reviews = db
+        .prepare(
+          `SELECT pr_number, card_id FROM reviews WHERE status='running'
+             ORDER BY started_at ASC, pr_number ASC`
+        )
+        .all() as { pr_number: number; card_id: string }[];
 
       db.transaction(() => {
         if (runs.length) {
@@ -473,9 +702,14 @@ export function createStore(dbPath: string) {
                WHERE status='running'`
           ).run(jobError);
         }
+        if (reviews.length) {
+          db.prepare(
+            `UPDATE reviews SET status='failed', error=?, posted_at=? WHERE status='running'`
+          ).run(reviewError, Date.now());
+        }
       })();
 
-      return { runs, jobs };
+      return { runs, jobs, reviews };
     },
     close(): void {
       db.close();
