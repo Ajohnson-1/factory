@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ROLES,
+  POST_REVIEW_TOOL,
   SPAWN_AGENT_TOOL,
   getRole,
   roleCatalogue,
@@ -150,11 +151,48 @@ describe("tool policy", () => {
     expect(role("orchestrator").customTools).toContain(SPAWN_AGENT_TOOL);
   });
 
-  it("uses plain --exclude-tools for the roles that have no custom tool", () => {
-    for (const id of roleIds().filter((r) => r !== "orchestrator")) {
-      expect(role(id).tools, id).toBeUndefined();
-      expect(role(id).customTools, id).toBeUndefined();
+  /**
+   * The rule the whole tool model rests on, asserted across the registry rather
+   * than per role: a custom tool and an allowlist do not mix, because `--tools`
+   * drops extension-registered tools even when they are named in it. 2.3's
+   * reviewer is the second role to discover that, which is why this checks the
+   * invariant instead of listing role ids — a third one cannot slip past it.
+   */
+  it("never pairs a custom tool with a --tools allowlist, and always sends its set as data", () => {
+    for (const id of roleIds()) {
+      const role = ROLES[id];
+      if (role.customTools?.length) {
+        expect(role.tools, `${id} has a custom tool and so must not use --tools`).toBeUndefined();
+        expect(
+          role.activeTools,
+          `${id} must carry its tool set for FACTORY_ACTIVE_TOOLS`
+        )?.toEqual(expect.arrayContaining(role.customTools));
+      } else {
+        // No custom tool means the simple path is still available: a denylist
+        // through argv, applied by pi before any extension loads.
+        expect(role.activeTools, id).toBeUndefined();
+      }
     }
+  });
+
+  /**
+   * The reviewer is spawnable by nothing and posts through one tool, so both
+   * halves have to hold at once: excluded writes, allowed to speak.
+   */
+  it("gives the reviewer post_review and takes edit and write away from it", () => {
+    expect(role("reviewer").customTools).toEqual([POST_REVIEW_TOOL]);
+    expect(role("reviewer").excludeTools).toEqual(["edit", "write"]);
+    expect(role("reviewer").activeTools).toEqual([
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "bash",
+      POST_REVIEW_TOOL,
+    ]);
+    expect(role("reviewer").systemPrompt).toContain(POST_REVIEW_TOOL);
+    expect(role("reviewer").writesWork).toBe(false);
+    expect(role("reviewer").mergeBack).toBe(false);
   });
 
   it("gives the coder pi's full default tool set", () => {

@@ -55,7 +55,11 @@ RUN set -eux; \
     node --input-type=module -e "import('@earendil-works/pi-ai').then((m) => process.exit(m.Type ? 0 : 1)).catch(() => process.exit(1))"; \
     node --input-type=module -e "import('@earendil-works/pi-coding-agent').then((m) => process.exit(m.defineTool ? 0 : 1)).catch(() => process.exit(1))"
 
-COPY extensions/spawn-agent.ts /opt/factory/extensions/spawn-agent.ts
+# Both extensions, baked together. Copying the directory rather than naming each
+# file means a third role with a custom tool cannot ship a source file the image
+# quietly leaves out — the failure it prevents is a container that starts, loads no
+# tool, and reports a model that refused to use it.
+COPY extensions/ /opt/factory/extensions/
 
 # The only repository in sight is the one the orchestrator mounted on purpose,
 # and its owner uid will not match ours, so git's "dubious ownership" check has

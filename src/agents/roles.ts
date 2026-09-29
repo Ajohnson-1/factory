@@ -79,6 +79,19 @@ export interface AgentRole {
 export const SPAWN_AGENT_TOOL = "spawn_agent";
 
 /**
+ * The pi custom tool the reviewer posts with (phase 2.3).
+ *
+ * The reviewer needs a tool rather than a text contract for one reason: GITHUB_TOKEN
+ * cannot enter a container (phase 2.1's rule), so every comment has to be posted by
+ * the host on the reviewer's behalf. Asking for a fenced JSON block at the end of the
+ * run and parsing it ships all-or-nothing — a reviewer that runs out of time or dies
+ * mid-message has reviewed the whole diff and posted none of it. A tool call gets
+ * each finding onto the PR the moment it is made, and the host can refuse or correct
+ * one call without losing the rest.
+ */
+export const POST_REVIEW_TOOL = "post_review";
+
+/**
  * Registry order is the order roles are presented to the orchestrator, so it
  * runs cheap shared-worktree roles before the expensive parallel ones.
  */
@@ -317,28 +330,35 @@ const reviewer: AgentRole = {
   label: "review",
   charter: "Reviews a landed diff and posts findings; driven by GitHub events, not by the orchestrator.",
   worktree: "detached",
-  // Not spawnable in 2.2 (see NOT_SPAWNABLE) — this shape is here so 2.3 wires
-  // a role, not a new interface. `edit`/`write` stay off: a reviewer's output
-  // is a comment, posted by the host from its report.
+  // Not spawnable (see NOT_SPAWNABLE): the reviewer is driven by GitHub events, so
+  // a planner cannot spend a run on it. `edit`/`write` stay off twice over —
+  // `--exclude-tools` from the moment pi starts, and `activeTools` from
+  // `session_start` — because a reviewer's only output is a comment.
   excludeTools: ["edit", "write"],
+  customTools: [POST_REVIEW_TOOL],
+  // An allowlist, so this travels as data (`FACTORY_ACTIVE_TOOLS`) and the
+  // in-container extension applies it — `--tools` would take `post_review` away
+  // with it (plan/2.2-agent-graph.md "Spike 2"), which is the whole role.
+  // `bash` is here for one command: `git diff origin/main...HEAD`. The checkout is
+  // detached at the reviewed commit and `.git` is mounted read-only, so it can read
+  // history and nothing else.
+  activeTools: ["read", "grep", "find", "ls", "bash", POST_REVIEW_TOOL],
   // No `maxTurns` yet: 2.3 decides the cap when it knows how large a reviewed
   // diff typically is.
   writesWork: false,
   mergeBack: false,
-  systemPrompt: `You are the reviewer for a software factory. A pull request
-opened by the factory is on screen; read the diff and report what a human
-maintainer would want to know before approving it.
+  systemPrompt: `You are the reviewer for a software factory. A pull request the
+factory opened is checked out in front of you at the exact commit under review.
+Read the diff and report what a human maintainer would want to know before
+approving it.
 
-Your tool contract: you have \`read\`, \`grep\`, \`find\`, \`ls\` and \`bash\`.
-You do NOT have \`edit\` or \`write\`. You review; you never fix.
+Your tool contract: you have \`read\`, \`grep\`, \`find\`, \`ls\`, \`bash\` and
+\`${POST_REVIEW_TOOL}\`. You do NOT have \`edit\` or \`write\`. You review; you never
+fix, and you never say you fixed something.
 
-Report correctness first (behaviour that is wrong, including at boundaries and
-in error paths), then missing tests for new behaviour, then clarity. Quote file
-paths and line numbers. Say plainly when a diff looks correct — a review with
-no findings is a valid review. Do not invent problems to look thorough, and do
-not report style opinions the project's own code does not already follow.
-
-${COMMON_RULES}`,
+Start with the diff:\n\n    git diff origin/main...HEAD --stat\n    git diff origin/main...HEAD\n\nThen read the whole file behind any hunk you intend to comment on — a
+diff alone hides the bug that only shows at the call site.
+\nYou post findings with \`${POST_REVIEW_TOOL}\`, and the host puts them on the pull\nrequest. It takes two shapes:\n\n- One finding: \`${POST_REVIEW_TOOL}({ path, line, body })\`. \`path\` is the file\n  exactly as the diff names it. \`line\` is a line number in the NEW version of\n  that file — the version you are reading — not a diff position and not a line\n  you removed. \`body\` is the finding: what is wrong, what happens because of it,\n  and what would fix it. Say something concrete or post nothing.\n- The closing summary: \`${POST_REVIEW_TOOL}({ body })\` with no path and no line.\n  Post it once, at the end, and make it readable on its own: what the diff does,\n  what you checked, what you concluded. If you found nothing, say that and say\n  what you looked at — a review with no findings is a valid review.\n\nRules the host enforces, so do not fight them:\n- Only files in the diff take a line comment, and only at lines that exist in\n  that file's new version. A finding outside those bounds comes back as a refusal;\n  drop it or move it into the summary.\n- There is a fixed budget of line comments per review. Spend it on correctness —\n  behaviour that is wrong, including at boundaries and in error paths — then on\n  missing tests for new behaviour, then on clarity. Style opinions the project's\n  own code does not already follow are not findings; neither are problems you\n  invented to look thorough.\n- You cannot approve, request changes, or merge. Everything you post is a comment.\n\n${COMMON_RULES}`,
 };
 
 /**
