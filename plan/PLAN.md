@@ -21,13 +21,27 @@ agents (pi); Discord is the command center.
   tool fans out spec-writer / researcher / coder / verifier in parallel worktrees.
 - [2.3 — PR reviewer](2.3-pr-reviewer.md) — reviewer agent pulls down factory PRs on
   create/update and posts PR comments (summary + line comments).
+- [2.4 — Trello trigger](2.4-trello-trigger.md) — **a card moved to Ready does not
+  start work today.** Trello's real webhook payload is not the shape
+  `src/trello/webhook.ts` parses, the server has no `HEAD` route so Trello refuses
+  to create the webhook, and the one auth header on that route is one Trello cannot
+  send. Recommends polling the Ready list over fixing all three. Do this before
+  anything that depends on the trigger firing.
+- [2.5 — Multiple repositories](2.5-multi-repo.md) — N repos, one Trello board and
+  one Discord channel each. Maps the ten single-repo assumptions that block it —
+  two of which are live cross-repo bugs rather than gaps: worktree directories
+  shared by sibling clones, and a `reviews` primary key built on a per-repo PR
+  number — plus the seams that are *already* multi-tenant and must not be redone.
+  Needs 2.4 first.
 - [Open issues](open-issues.md) — defects and operator-facing holes left by 2.1–2.2
   (run budget that never resets, unbounded orchestrator wall clock, stale
   `agent_runs`, undocumented deploy knobs, unmeasured token spend). Do before or
   alongside 2.3: the reviewer writes `agent_runs` rows on every PR push and hits
   several of these immediately.
 
-Order: 2.0 → 2.1 → 2.2 → 2.3 (each reuses the previous phase's seams).
+Order: 2.0 → 2.1 → 2.2 → 2.3 → 2.4 → 2.5 (each reuses the previous phase's seams).
+2.4 is a defect fix rather than a phase, but it gates 2.5 and is the only way a
+card enters the queue, so it outranks any new feature.
 
 ## Decisions (2.x, confirmed)
 
