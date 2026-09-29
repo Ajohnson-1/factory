@@ -125,6 +125,15 @@ if [[ -f /home/pi/factory/.env ]]; then
   log "removing the leftover in-repo env file (secrets live in $ENV_FILE now)"
   rm -f /home/pi/factory/.env
 fi
+
+# On a Linux host the spawn channel's default bind (127.0.0.1) is unreachable
+# from inside an agent container, which is the difference between a graph that
+# works and an orchestrator whose every spawn_agent call fails. Written here, at
+# install time, because the container that would discover the problem cannot fix
+# it. deploy/configure-env.sh explains the exposure this accepts.
+source /home/pi/factory/deploy/configure-env.sh
+configure_factory_env "$ENV_FILE" "$(uname -s)" | while IFS= read -r line; do log "$line"; done
+
 log "env file: $ENV_FILE ($(grep -cvE '^\s*(#|$)' "$ENV_FILE") values set)"
 
 # ------------------------------------------------------------- agent image

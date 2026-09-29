@@ -46,6 +46,24 @@ function note(message: string): void {
   process.stderr.write(`[spawn-agent] ${message}\n`);
 }
 
+/**
+ * The hint that turns "cannot reach the host" into something an operator can fix.
+ *
+ * This is the failure mode a real Linux VPS hits first: the host listener defaults
+ * to 127.0.0.1, which works on Docker Desktop but not on a Linux bridge, so every
+ * single `spawn_agent` call fails and the orchestrator — which is told nothing
+ * about how the channel works — just sees an error. Naming `FACTORY_IPC_BIND` in
+ * the message is what makes that self-diagnosing instead of a mystery.
+ */
+const BIND_HINT =
+  "is the host's FACTORY_IPC_BIND reachable from a container? On a Linux host " +
+  "--add-host=host.docker.internal:host-gateway arrives at the bridge address, so " +
+  "the 127.0.0.1 default never gets here (deploy/setup-factory.sh sets it).";
+
+function channelFault(cause: string): Error {
+  return new Error(`spawn channel failed: ${cause} \u2014 ${BIND_HINT}`);
+}
+
 interface HostReply {
   v?: number;
   ok?: boolean;
@@ -74,11 +92,11 @@ function askHost(payload: Record<string, unknown>, timeoutMs: number): Promise<H
 
     const timer = setTimeout(() => {
       socket.destroy();
-      done(() => reject(new Error(`the factory host did not answer within ${timeoutMs}ms`)));
+      done(() => reject(channelFault(`the factory host did not answer within ${timeoutMs}ms`)));
     }, timeoutMs);
 
     socket.on("error", (err: Error) => {
-      done(() => reject(new Error(`spawn channel failed: ${err.message}`)));
+      done(() => reject(channelFault(err.message)));
     });
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ ...payload, v: PROTOCOL_VERSION })}\n`);

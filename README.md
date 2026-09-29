@@ -140,6 +140,60 @@ image, and applies:
 Docker inside an LXC needs `nesting=1`; the script stops with the Proxmox
 pointer if `/run/docker.sock` never appears.
 
+### Agent graphs (phase 2.2)
+
+By default a card is not run by one agent. It is run by an **orchestrator**: a
+read-only pi session whose only way to change anything is a `spawn_agent` tool.
+It plans the card, asks the host for children — `spec-writer`, `researcher`,
+`coder`, `verifier` — and each child gets its own container in its own worktree.
+Independent tasks run at once; the host commits each child's work and merges it
+back **one at a time**, because two concurrent merges into one worktree can leave
+a half-merged tree. A child that clashes comes back named, with the conflicting
+files, so the orchestrator re-spawns that task with the conflict in its context.
+
+Everything with authority — starting containers, git, pushing — stays on the
+host. The orchestrator container holds no credentials, and the channel it calls
+home on is gated by a token minted for one run and revoked when that run ends.
+
+**One card at a time.** The worker gate is global (`store.isRunning()`), so a
+hung orchestrator delays every other card. Its wall clock is therefore capped:
+`AGENT_TIMEOUT_MS × (MAX_AGENT_RUNS + 1)` — 260 minutes at the defaults — cut off
+at `ORCHESTRATOR_TIMEOUT_MS` (45 minutes), never below a single child timeout.
+
+**The bind address is a deployment decision, and `setup-factory.sh` makes it for
+you.** On a Linux host `--add-host=host.docker.internal:host-gateway` arrives at
+the docker bridge, not the host's loopback, so the default
+`FACTORY_IPC_BIND=127.0.0.1` means no container can ever reach the spawn channel:
+every `spawn_agent` fails. The installer writes `FACTORY_IPC_BIND=0.0.0.0` into
+`/etc/factory/factory.env` on Linux (`deploy/configure-env.sh`). If you took the
+Manual path below, set it yourself. The widened port can start containers, so
+keep it off any public interface at the firewall — the per-run token is what
+gates it, not the address.
+
+| Knob | Default | What it decides |
+| --- | --- | --- |
+| `AGENT_GRAPH` | `1` | `0` runs the MVP's one-agent-per-card path instead |
+| `MAX_PARALLEL_AGENTS` | `4` | child containers at once per card; the rest queue |
+| `AGENT_TIMEOUT_MS` | `1200000` | wall clock per child; on expiry the container is killed |
+| `ORCHESTRATOR_TIMEOUT_MS` | `2700000` | ceiling on the planner's wall clock |
+| `MAX_AGENT_RUNS` | `12` | child runs per card, **per attempt** — see below |
+| `AGENT_MODEL` / `ORCHESTRATOR_MODEL` | pi's default | model per child / for the long-lived planner |
+| `AGENT_MEMORY` / `AGENT_CPUS` | `2g` / `1` | caps on **each** container |
+| `FACTORY_IPC_BIND` / `_PORT` | `127.0.0.1` / `0` | where the host listens for spawn requests |
+| `FACTORY_IPC_SLACK_MS` | `60000` | how much longer the in-container tool waits than the host |
+| `FACTORY_AGENT_MODELS_FILE` / `_SETTINGS_FILE` | unset | mount a `models.json` / `settings.json` into agent containers |
+
+`MAX_AGENT_RUNS` is counted per **attempt**, and an attempt is one trip through
+the queue: a re-drag to Ready, or `/factory retry`, re-queues the card at
+`generation + 1` with a fresh budget. A card that spent 12 runs failing yesterday
+is entitled to 12 today — which is the only reason a failed card is recoverable
+without deleting the database.
+
+Cost is recorded, not just counted: every run's `usage` lands in `agent_runs`
+(`usage_in`, `usage_out`, `usage_cache_read`) and `/factory status` prints a
+per-card total. Rows left `running` by a process that died mid-card are swept at
+boot and marked `reaped`, so the status view cannot lie about what is in flight.
+
 ### Manual (any VPS)
 
 ```bash
@@ -222,8 +276,11 @@ prompts also need a provider API key set.
 
 ## Discord commands
 
-- `/factory status` — list all jobs
+- `/factory status` — list all jobs, their in-flight children, and each card's
+  token spend
 - `/factory pause` — stop accepting new cards
+- `/factory retry card:<id>` — re-queue a card that finished (failed, review or
+  done) with a fresh run budget; refuses one that is still running
 - `/factory resume` — resume
 
 ## Notes / MVP limitations

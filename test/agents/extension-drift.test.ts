@@ -71,4 +71,21 @@ describe("spawn-agent extension", () => {
   it("is registered through pi.registerTool", () => {
     expect(source).toContain("pi.registerTool(");
   });
+
+  /**
+   * open-issues #4: on a Linux host the default bind makes this channel
+   * unreachable, so the container's failure message has to name the variable the
+   * operator can actually change. Asserted against the source because the
+   * extension resolves pi's imports from inside the image and cannot be imported
+   * here — the same reason the rest of this file reads the file as text.
+   */
+  it("routes both channel failures through the message that names FACTORY_IPC_BIND", () => {
+    const faults = source.match(/channelFault\(/g) ?? [];
+
+    // The definition plus both reachability paths: refused, and never answered.
+    expect(faults).toHaveLength(3);
+    expect(source).toContain("FACTORY_IPC_BIND");
+    expect(source).not.toMatch(/reject\(new Error\(`the factory host did not answer/);
+    expect(source).not.toMatch(/reject\(new Error\(`spawn channel failed/);
+  });
 });
