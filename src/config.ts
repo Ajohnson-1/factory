@@ -87,6 +87,18 @@ export const config = {
       return num("AGENT_TIMEOUT_MS", 20 * 60_000);
     },
     /**
+     * Ceiling on the orchestrator's own wall clock, whatever the per-child
+     * budget would imply.
+     *
+     * The planner's timeout is derived as `AGENT_TIMEOUT_MS × (MAX_AGENT_RUNS +
+     * 1)` — 260 minutes at defaults — and the worker runs one card at a time,
+     * so without a cap a single hung planner delays every other card by hours.
+     * Floored at one child timeout inside `orchestratorTimeoutMs`.
+     */
+    get orchestratorTimeoutMs(): number {
+      return num("ORCHESTRATOR_TIMEOUT_MS", 45 * 60_000);
+    },
+    /**
      * Hard budget of agent runs per card, so an orchestrator that loops cannot
      * spend unbounded tokens. Told to the orchestrator in its system prompt and
      * enforced on the host, which is the only place that can actually refuse.

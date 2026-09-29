@@ -123,6 +123,12 @@ export interface SpawnLimits {
 export interface SpawnDeps {
   store: Store;
   cardId: string;
+  /**
+   * Which attempt of the card this spawner is serving. The run budget is
+   * counted against it, not against the card's whole history — see
+   * `Store.countRuns`.
+   */
+  attempt?: number;
   /** The card's base worktree: the orchestrator and shared roles work in it. */
   baseDir: string;
   /** The shared `.git` every child container needs mounted read-only. */
@@ -269,11 +275,21 @@ export function looksLikeTimeout(text: string): boolean {
 
 export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
   const limits = limitsOf(deps.limits);
+  const attempt = deps.attempt ?? 1;
   const worktree = deps.worktree ?? defaultWorktreeOps;
   const readContextFile = deps.readContextFile ?? readBaseFile;
   const semaphore = createSemaphore(limits.maxParallel);
   const merges = createSerialLock();
-  let sequence = 0;
+  /**
+   * Seeded from the card's own history rather than from 0. A run id is unique
+   * per card, so a re-triggered attempt that restarted its counter at `c1` would
+   * collide with attempt 1's `c1` in `agent_runs` — the child would throw on the
+   * way in, and the card that #1 exists to rescue would fail anyway.
+   *
+   * Continuing the numbering is also the readable choice: `coder-7` on a second
+   * attempt tells an operator this card has burned seven children.
+   */
+  let sequence = deps.store.countRuns(deps.cardId);
   let started = 0;
 
   const rejected = (message: string): SpawnOutcome => ({ status: "rejected", summary: message });
@@ -297,15 +313,22 @@ export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
           summary = `could not create a worktree for ${role.id}: ${
             err instanceof Error ? err.message : String(err)
           }`;
-          deps.store.addRun({ runId, cardId: deps.cardId, role: role.id });
-          deps.store.setRunDone(runId, "failed", summary);
+          deps.store.addRun({ runId, cardId: deps.cardId, role: role.id, attempt });
+          deps.store.setRunDone(deps.cardId, runId, "failed", summary);
           return { status, summary };
         }
       }
 
       const dir = child ? child.dir : deps.baseDir;
       const branch = detached ? childBranchFor(deps.cardId, runId) : undefined;
-      deps.store.addRun({ runId, cardId: deps.cardId, role: role.id, branch, worktree: dir });
+      deps.store.addRun({
+        runId,
+        cardId: deps.cardId,
+        role: role.id,
+        attempt,
+        branch,
+        worktree: dir,
+      });
       started += 1;
       deps.onEvent?.({ kind: "started", role: role.id, runId, task: request.task });
 
@@ -326,7 +349,7 @@ export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
       const landed = await land({ role, runId, dir, baseHead, result, detached });
       status = landed.status;
       summary = landed.summary;
-      deps.store.setRunDone(runId, toRunStatus(status), summary);
+      deps.store.setRunDone(deps.cardId, runId, toRunStatus(status), summary, result.usage);
       return { status, summary, runId, branch, diff: landed.diff };
     } catch (err) {
       // A throw here is the container boundary itself failing (docker missing,
@@ -336,7 +359,7 @@ export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
       summary = `${role.id} ${runId} could not run: ${
         err instanceof Error ? err.message : String(err)
       }`;
-      deps.store.setRunDone(runId, "failed", summary);
+      deps.store.setRunDone(deps.cardId, runId, "failed", summary);
       return { status, summary, runId };
     } finally {
       release();
@@ -456,10 +479,10 @@ export function createAgentSpawner(deps: SpawnDeps): AgentSpawner {
       if (!request.task?.trim()) {
         return rejected("task must be a non-empty description of one scoped job");
       }
-      if (deps.store.countRuns(deps.cardId) >= limits.maxRuns) {
+      if (deps.store.countRuns(deps.cardId, attempt) >= limits.maxRuns) {
         return rejected(
-          `run budget exhausted for this card (${limits.maxRuns}). Summarise what has ` +
-            `landed and stop; do not spawn again.`
+          `run budget exhausted for this card (${limits.maxRuns} runs, attempt ` +
+            `${attempt}). Summarise what has landed and stop; do not spawn again.`
         );
       }
       return runChild(role, request);

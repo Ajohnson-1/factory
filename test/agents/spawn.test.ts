@@ -17,14 +17,17 @@
  * `baseHead`, so the range was always empty and every successful child was
  * reported as "changed no files" and thrown away.
  *
- * The unit suite stayed green through all of that because `committingFake`
- * committed half of its own work to make the host path reachable, which modelled
- * a child that cannot exist. Worth remembering as the shape of a bad fake: it did
- * not just hide the bug, it made the green tests evidence that the bug was absent.
+ * The unit suite stayed green through all of that because the old
+ * `committingFake` committed half of its own work to make the host path
+ * reachable, which modelled a child that cannot exist. Worth remembering as the
+ * shape of a bad fake: it did not just hide the bug, it made the green tests
+ * evidence that the bug was absent.
  *
  * `land()` now commits on the host before measuring, so every fake here writes
  * files and leaves them uncommitted — the only thing a real child can do. The
- * two tests at the end of "detached coder" pin the regression directly.
+ * alias is deleted rather than kept as a harmless rename, because a name that
+ * promises commits and delivers none is how this bug survived 413 tests. The two
+ * tests at the end of "detached coder" pin the regression directly.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -121,19 +124,6 @@ function writeOnlyFake(files: Record<string, string>, text = "implemented"): Run
     writeFiles(options.dir, files);
     return { ok: true, text };
   };
-}
-
-/**
- * A fake that leaves its work uncommitted, exactly like a real child.
- *
- * This used to make its own commit, because `changedFiles` only saw commits and
- * an uncommitted child was wrongly reported as "changed no files" — so the fake
- * had to work around the ordering bug for the host path to be reachable at all.
- * `land()` now commits on the host before measuring, which is what
- * scripts/graph-smoke.ts proved was needed against a real model.
- */
-function committingFake(files: Record<string, string>, text = "implemented"): RunChild {
-  return writeOnlyFake(files, text);
 }
 
 /**
@@ -257,7 +247,7 @@ describe("run budget", () => {
     const { spawner, calls } = unusedRunner();
     for (const [index, status] of ["ok", "failed", "ok", "timeout"].entries()) {
       store.addRun({ runId: `seed-${index}`, cardId: CARD, role: "coder" });
-      store.setRunDone(`seed-${index}`, status as "ok" | "failed" | "timeout", "seeded");
+      store.setRunDone(CARD, `seed-${index}`, status as "ok" | "failed" | "timeout", "seeded");
     }
     expect(store.countRuns(CARD)).toBe(4);
 
@@ -265,41 +255,63 @@ describe("run budget", () => {
 
     expect(outcome.status).toBe("rejected");
     expect(outcome.summary).toContain("run budget exhausted");
-    expect(outcome.summary).toContain("(4)");
+    expect(outcome.summary).toContain("(4 runs, attempt 1)");
     expect(calls).toEqual([]);
     expect(spawner.started()).toBe(0);
   });
 
-  it("reads the budget from the store, so a fresh spawner for the same card cannot exceed it", async () => {
+  /**
+   * open-issues #1, the regression this whole change exists for.
+   *
+   * The budget is per attempt: a fresh spawner over the *same* attempt still
+   * refuses (the budget is card state, not object memory), but once the card is
+   * re-queued it gets a whole new one. Before the fix, the `countRuns(CARD)`
+   * underneath was unscoped, so the last assertion below was the bug — a card
+   * that had failed once could never work again.
+   */
+  it("scopes the budget to the attempt, so a re-queued card can spawn again", async () => {
+    store.enqueue(CARD, "Card one");
     const limits = { maxParallel: 2, maxRuns: 2, timeoutMs: 1_000 };
-    const first = createAgentSpawner({
-      store,
-      cardId: CARD,
-      baseDir,
-      gitDir,
-      runChild: sequentialFileFake(),
-      limits,
-    });
+    // One fake, shared by all three spawners: it writes a distinct file per call,
+    // and a second child that wrote byte-identical content would land nothing.
+    const runChild = sequentialFileFake();
+    const spawnerForAttempt = (): AgentSpawner =>
+      createAgentSpawner({
+        store,
+        cardId: CARD,
+        attempt: store.attemptFor(CARD),
+        baseDir,
+        gitDir,
+        runChild,
+        limits,
+      });
 
+    const first = spawnerForAttempt();
     expect((await first.spawn({ role: "coder", task: "greet" })).status).toBe("ok");
     expect((await first.spawn({ role: "coder", task: "farewell" })).status).toBe("ok");
-    expect(first.started()).toBe(2);
-    expect(store.countRuns(CARD)).toBe(2);
+    expect(store.countRuns(CARD, 1)).toBe(2);
 
-    // A second orchestrator session gets a brand new spawner object over the
-    // same card: the budget is card state, not per-object memory.
-    const { spawner: second, calls } = unusedRunner({
-      maxParallel: 2,
-      maxRuns: 2,
-      timeoutMs: 1_000,
-    });
-    const outcome = await second.spawn({ role: "coder", task: "one more thing" });
+    const blocked = await spawnerForAttempt().spawn({ role: "coder", task: "one more thing" });
+    expect(blocked.status).toBe("rejected");
+    expect(blocked.summary).toContain("run budget exhausted");
+    expect(blocked.summary).toContain("attempt 1");
 
-    expect(outcome.status).toBe("rejected");
-    expect(outcome.summary).toContain("run budget exhausted");
-    expect(calls).toEqual([]);
-    expect(second.started()).toBe(0);
-    expect(store.countRuns(CARD)).toBe(2);
+    // The card fails, the operator drags it back to Ready, and the webhook
+    // re-enqueues it — the same path `/factory retry` uses.
+    store.setRunning(CARD, `factory/${CARD}`);
+    store.setFailed(CARD, "run budget exhausted");
+    store.enqueue(CARD, "Card one");
+    expect(store.attemptFor(CARD)).toBe(2);
+
+    const retried = await spawnerForAttempt().spawn({ role: "coder", task: "try again" });
+
+    expect(retried.status).toBe("ok");
+    // Numbering continues across the attempt: `run_id` is unique per card, so a
+    // retried `c1` would have thrown on the way into `agent_runs`.
+    expect(retried.runId).toBe("c3");
+    expect(store.countRuns(CARD, 2)).toBe(1);
+    expect(store.countRuns(CARD, 1)).toBe(2);
+    expect(store.countRuns(CARD)).toBe(3);
   });
 });
 
@@ -313,7 +325,7 @@ describe("detached coder", () => {
       gitDir,
       runChild: async (options) => {
         calls.push(options);
-        return committingFake({ "src/greet.js": "export const greet = () => 'hi';\n" })(
+        return writeOnlyFake({ "src/greet.js": "export const greet = () => 'hi';\n" })(
           options
         );
       },
@@ -383,8 +395,8 @@ describe("detached coder", () => {
       runChild: async (options) => {
         call += 1;
         return call === 1
-          ? committingFake({ "src/greet.js": "greet\n" })(options)
-          : committingFake({ "src/bye.js": "bye\n" })(options);
+          ? writeOnlyFake({ "src/greet.js": "greet\n" })(options)
+          : writeOnlyFake({ "src/bye.js": "bye\n" })(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -431,8 +443,8 @@ describe("detached coder", () => {
       runChild: async (options) => {
         call += 1;
         return call === 1
-          ? committingFake({ "src/greet.js": "greet\n" })(options)
-          : committingFake({ "src/bye.js": "bye\n" })(options);
+          ? writeOnlyFake({ "src/greet.js": "greet\n" })(options)
+          : writeOnlyFake({ "src/bye.js": "bye\n" })(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -512,7 +524,7 @@ describe("merge conflicts", () => {
       // Both children hold their container open at once, so both forked from the
       // same base HEAD and both add x.md: the plan's conflict case.
       await held.promise;
-      return committingFake({ "x.md": first ? "# child one" : "# child two" })(options);
+      return writeOnlyFake({ "x.md": first ? "# child one" : "# child two" })(options);
     };
     const spawner = createAgentSpawner({
       store,
@@ -622,7 +634,7 @@ describe("failure classification", () => {
       runChild: async (options) => {
         calls += 1;
         if (calls === 1) throw new Error("docker: command not found");
-        return committingFake({ "src/after.js": "after\n" })(options);
+        return writeOnlyFake({ "src/after.js": "after\n" })(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -657,7 +669,7 @@ describe("shared-worktree roles", () => {
       gitDir,
       runChild: async (options) => {
         calls.push(options);
-        return committingFake({ "factory-spec.md": "# goal\n" }, "spec written")(options);
+        return writeOnlyFake({ "factory-spec.md": "# goal\n" }, "spec written")(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -705,7 +717,7 @@ describe("detached but not merged: the verifier", () => {
       gitDir,
       runChild: async (options) => {
         calls.push(options);
-        return committingFake({ "test-report.txt": "suite: green\n" }, "tests passed")(options);
+        return writeOnlyFake({ "test-report.txt": "suite: green\n" }, "tests passed")(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -799,7 +811,7 @@ describe("events", () => {
       cardId: CARD,
       baseDir,
       gitDir,
-      runChild: committingFake({ "src/greet.js": "greet\n" }),
+      runChild: writeOnlyFake({ "src/greet.js": "greet\n" }),
       onEvent: (event) => events.push(event),
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });
@@ -826,7 +838,7 @@ describe("events", () => {
       runChild: async (options) => {
         options.onTool?.("read");
         options.onTool?.("edit");
-        return committingFake({ "src/greet.js": "greet\n" })(options);
+        return writeOnlyFake({ "src/greet.js": "greet\n" })(options);
       },
       onEvent: (event) => events.push(event),
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
@@ -843,6 +855,89 @@ describe("events", () => {
   });
 });
 
+/**
+ * open-issues #6's last link, and the one this file did not cover until now.
+ *
+ * `container.ts` accumulates `usage` from pi's `message_end` events and
+ * `store.setRunDone` writes it, but neither of those is the feature — the
+ * feature is a number in `agent_runs` that `/factory status` can add up. A
+ * `runChild` whose `usage` never reaches the row still leaves every other test
+ * green: `MAX_AGENT_RUNS` keeps counting runs, it just never costs anything. One
+ * renamed field is all it would take to ship that, which is exactly the shape of
+ * #6's complaint.
+ */
+describe("token usage reaches agent_runs", () => {
+  const spawnerWith = (runChild: RunChild): AgentSpawner =>
+    createAgentSpawner({
+      store,
+      cardId: CARD,
+      baseDir,
+      gitDir,
+      runChild,
+      limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
+    });
+
+  it("records what a child reported, on the row and in the card total", async () => {
+    const spawner = spawnerWith(async (options) => ({
+      ...(await writeOnlyFake({ "src/greet.js": "greet\n" })(options)),
+      usage: { input: 4200, output: 310, cacheRead: 88_000 },
+    }));
+
+    await spawner.spawn({ role: "coder", task: "implement greet()" });
+
+    expect(store.runsFor(CARD)[0]).toMatchObject({
+      usage_in: 4200,
+      usage_out: 310,
+      usage_cache_read: 88_000,
+    });
+    expect(store.usageByCard()).toEqual([
+      {
+        card_id: CARD,
+        runs: 1,
+        reported: 1,
+        input: 4200,
+        output: 310,
+        cache_read: 88_000,
+      },
+    ]);
+  });
+
+  it("keeps the usage a run burned before it died", async () => {
+    // `container.ts` hands back whatever it had accumulated when the process
+    // went away, and `setRunDone` is called with it even on a failed status: a
+    // child that spent 40k tokens and landed nothing is the expensive kind, and
+    // dropping its numbers is how a budget looks cheaper than it was.
+    const spawner = spawnerWith(async (options) => ({
+      ...(await writeOnlyFake({ "src/greet.js": "greet\n" })(options)),
+      ok: false,
+      text: "agent process exited with code 137",
+      usage: { input: 40_000, output: 1_000, cacheRead: 0 },
+    }));
+
+    const outcome = await spawner.spawn({ role: "coder", task: "implement greet()" });
+
+    expect(outcome.status).toBe("failed");
+    expect(store.runsFor(CARD)[0]).toMatchObject({
+      status: "failed",
+      usage_in: 40_000,
+      usage_out: 1_000,
+    });
+  });
+
+  it("leaves usage NULL when the runtime reported none, so 0 keeps meaning zero", async () => {
+    const spawner = spawnerWith(writeOnlyFake({ "src/greet.js": "greet\n" }));
+
+    await spawner.spawn({ role: "coder", task: "implement greet()" });
+
+    expect(store.runsFor(CARD)[0]).toMatchObject({
+      usage_in: null,
+      usage_out: null,
+      usage_cache_read: null,
+    });
+    expect(store.usageByCard()[0]).toMatchObject({ runs: 1, reported: 0 });
+  });
+});
+
 describe("security: the orchestrator's IPC env never reaches a child", () => {
   it("hands runChild no extraEnv and no spawn token", async () => {
     vi.stubEnv("FACTORY_IPC_TOKEN", "spawn-token-must-not-leak");
@@ -855,7 +950,7 @@ describe("security: the orchestrator's IPC env never reaches a child", () => {
       gitDir,
       runChild: async (options) => {
         calls.push(options);
-        return committingFake({ "src/greet.js": "greet\n" })(options);
+        return writeOnlyFake({ "src/greet.js": "greet\n" })(options);
       },
       limits: { maxParallel: 2, maxRuns: 4, timeoutMs: 1_000 },
     });

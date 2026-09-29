@@ -6,9 +6,22 @@ export type JobStatus = "queued" | "running" | "review" | "done" | "failed";
 
 export type AgentRunStatus = "running" | "ok" | "failed" | "timeout";
 
+/** Token counts pi reports on `message_end.usage`, summed over one run. */
+export interface RunUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+}
+
 export interface AgentRun {
   run_id: string;
   card_id: string;
+  /**
+   * Which attempt of the card this run belongs to (`jobs.generation` at the time
+   * it was started). The `MAX_AGENT_RUNS` budget is counted per attempt, so a
+   * card that exhausted its budget once can still be re-triggered.
+   */
+  attempt: number;
   role: string;
   status: AgentRunStatus;
   branch: string | null;
@@ -16,6 +29,10 @@ export interface AgentRun {
   summary: string | null;
   started_at: number;
   ended_at: number | null;
+  /** Null until the run closes, and stays null for a runtime that reports none. */
+  usage_in: number | null;
+  usage_out: number | null;
+  usage_cache_read: number | null;
 }
 
 export interface Job {
@@ -32,6 +49,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   card_id TEXT PRIMARY KEY,
   card_name TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
+  generation INTEGER NOT NULL DEFAULT 1,
   branch TEXT,
   pr_url TEXT,
   error TEXT,
@@ -40,19 +58,126 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE TABLE IF NOT EXISTS agent_runs (
-  run_id     TEXT PRIMARY KEY,
+  run_id     TEXT NOT NULL,
   card_id    TEXT NOT NULL,
+  attempt    INTEGER NOT NULL DEFAULT 1,
   role       TEXT NOT NULL,
   status     TEXT NOT NULL,
   branch     TEXT,
   worktree   TEXT,
   summary    TEXT,
   started_at INTEGER NOT NULL,
-  ended_at   INTEGER
+  ended_at   INTEGER,
+  usage_in   INTEGER,
+  usage_out  INTEGER,
+  usage_cache_read INTEGER,
+  -- Keyed on (card_id, run_id), not run_id alone: a spawner numbers its children
+  -- c1, c2, … from its own counter, so a run id is unique inside one card only.
+  PRIMARY KEY (card_id, run_id)
 );
 
 CREATE INDEX IF NOT EXISTS agent_runs_card_id ON agent_runs(card_id);
 `;
+
+/**
+ * Both indexes, after the columns exist: `agent_runs_card_attempt` names
+ * `attempt`, which on a pre-#1 database only arrives via `ALTER TABLE` — and
+ * after a key rebuild, which drops the table's originals with it.
+ */
+const RUN_INDEXES = `
+CREATE INDEX IF NOT EXISTS agent_runs_card_id ON agent_runs(card_id);
+CREATE INDEX IF NOT EXISTS agent_runs_card_attempt ON agent_runs(card_id, attempt);
+`;
+
+/**
+ * Columns that `SCHEMA` only ever applies to a *new* database.
+ *
+ * Every statement above is `CREATE TABLE IF NOT EXISTS`, which against a live
+ * `/var/lib/factory/factory.db` is a no-op: the table exists, so the new column
+ * in the text is simply never applied. Without this list the first run after a
+ * deploy writes to a column that is not there.
+ */
+const ADD_COLUMNS: { table: string; column: string; ddl: string }[] = [
+  { table: "jobs", column: "generation", ddl: "INTEGER NOT NULL DEFAULT 1" },
+  { table: "agent_runs", column: "attempt", ddl: "INTEGER NOT NULL DEFAULT 1" },
+  { table: "agent_runs", column: "usage_in", ddl: "INTEGER" },
+  { table: "agent_runs", column: "usage_out", ddl: "INTEGER" },
+  { table: "agent_runs", column: "usage_cache_read", ddl: "INTEGER" },
+];
+
+/**
+ * The shape `SCHEMA` gives a new table, used again by the rebuild below.
+ *
+ * `run_id` is the whole primary key in the pre-#1 table, while every spawner
+ * numbers its children from `c1`: the second card the factory ever processed
+ * threw `UNIQUE constraint failed` on its first child, and so would a
+ * re-triggered attempt — which is what open-issues #1 exists to enable.
+ */
+const AGENT_RUNS_COLUMNS = `
+  run_id     TEXT NOT NULL,
+  card_id    TEXT NOT NULL,
+  attempt    INTEGER NOT NULL DEFAULT 1,
+  role       TEXT NOT NULL,
+  status     TEXT NOT NULL,
+  branch     TEXT,
+  worktree   TEXT,
+  summary    TEXT,
+  started_at INTEGER NOT NULL,
+  ended_at   INTEGER,
+  usage_in   INTEGER,
+  usage_out  INTEGER,
+  usage_cache_read INTEGER,
+  PRIMARY KEY (card_id, run_id)
+`;
+
+/** True only for the pre-#1 table, which was keyed on `run_id` alone. */
+function keyedOnRunIdAlone(db: Database.Database): boolean {
+  const pk = (db.prepare(`PRAGMA table_info(agent_runs)`).all() as { name: string; pk: number }[])
+    .filter((c) => c.pk > 0)
+    .map((c) => c.name)
+    .sort();
+  return pk.length === 1 && pk[0] === "run_id";
+}
+
+/**
+ * Re-key an existing `agent_runs` on `(card_id, run_id)`.
+ *
+ * SQLite cannot alter a primary key, so this is the copy-and-swap: build the
+ * table with the right key, move every row across, drop the old one. A rebuild
+ * rather than a name change, because the collision is in the constraint and a
+ * second card has to be able to record `c1` too.
+ */
+function rebuildRunKey(db: Database.Database): void {
+  const columnList = `run_id, card_id, attempt, role, status, branch, worktree, summary,
+                      started_at, ended_at, usage_in, usage_out, usage_cache_read`;
+  db.transaction(() => {
+    db.exec(`CREATE TABLE agent_runs_new (${AGENT_RUNS_COLUMNS});`);
+    db.exec(
+      `INSERT INTO agent_runs_new (${columnList})
+         SELECT ${columnList} FROM agent_runs;`
+    );
+    db.exec(`DROP TABLE agent_runs;`);
+    db.exec(`ALTER TABLE agent_runs_new RENAME TO agent_runs;`);
+  })();
+}
+
+/**
+ * Add every missing column, returning what was added.
+ *
+ * `ALTER TABLE … ADD COLUMN` with a `NOT NULL DEFAULT` backfills existing rows,
+ * which is what makes an old run read back as `attempt = 1` — the first attempt
+ * of that card, and the only interpretation that is not a lie.
+ */
+function applyAddColumns(db: Database.Database): string[] {
+  const added: string[] = [];
+  for (const { table, column, ddl } of ADD_COLUMNS) {
+    const existing = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (existing.some((c) => c.name === column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    added.push(`${table}.${column}`);
+  }
+  return added;
+}
 
 /** Where the default store lives: `FACTORY_DB_PATH`, else `./data/factory.db`. */
 export function defaultDbPath(): string {
@@ -70,12 +195,62 @@ export function createStore(dbPath: string) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
   db.exec(SCHEMA);
+  // Order matters: the copy below reads `attempt`, which only exists after the
+  // columns have been added to a pre-#1 table.
+  applyAddColumns(db);
+  if (keyedOnRunIdAlone(db)) rebuildRunKey(db);
+  db.exec(RUN_INDEXES);
 
   return {
-    enqueue(cardId: string, cardName: string): void {
+    /**
+     * Put a card in the queue — the one re-trigger path, used by the Trello
+     * webhook and by `/factory retry` alike.
+     *
+     * A card seen for the first time is queued at generation 1. A card that has
+     * *finished* (failed, review, done) is queued again and its generation goes
+     * up, so the next attempt gets a fresh run budget instead of inheriting the
+     * one it already spent. A card that is `running` or already `queued` is left
+     * exactly as it is: re-dragging it must not start a second graph over the
+     * first one.
+     */
+    enqueue(
+      cardId: string,
+      cardName: string
+    ): { queued: boolean; requeued: boolean; generation: number } {
+      const existing = db
+        .prepare(`SELECT status, generation FROM jobs WHERE card_id=?`)
+        .get(cardId) as { status: JobStatus; generation: number } | undefined;
+
+      if (!existing) {
+        db.prepare(`INSERT INTO jobs (card_id, card_name) VALUES (?, ?)`).run(
+          cardId,
+          cardName
+        );
+        return { queued: true, requeued: false, generation: 1 };
+      }
+      if (existing.status === "running" || existing.status === "queued") {
+        return { queued: false, requeued: false, generation: existing.generation };
+      }
       db.prepare(
-        `INSERT OR IGNORE INTO jobs (card_id, card_name) VALUES (?, ?)`
-      ).run(cardId, cardName);
+        `UPDATE jobs SET status='queued', card_name=?, error=NULL,
+                generation=generation+1, updated_at=datetime('now') WHERE card_id=?`
+      ).run(cardName, cardId);
+      return {
+        queued: true,
+        requeued: true,
+        generation: existing.generation + 1,
+      };
+    },
+    /**
+     * The attempt number children of this card are recorded under. 1 for a card
+     * with no row yet, so a caller that never went through `enqueue` (a test,
+     * `graph-smoke`) still gets a usable budget.
+     */
+    attemptFor(cardId: string): number {
+      const row = db
+        .prepare(`SELECT generation FROM jobs WHERE card_id=?`)
+        .get(cardId) as { generation: number } | undefined;
+      return row?.generation ?? 1;
     },
     setRunning(cardId: string, branch: string): void {
       db.prepare(
@@ -111,24 +286,29 @@ export function createStore(dbPath: string) {
       ).get() as Job | undefined;
     },
     /**
-     * Record a new agent run as mid-flight. Throws on a duplicate `runId`:
-     * the run id is the primary key and a repeat is a caller bug, not an
-     * update to fold in.
+     * Record a new agent run as mid-flight. Throws when the same card records
+     * the same `runId` twice — a run id is a spawner's counter, so a repeat is a
+     * caller bug, not an update to fold in. A *different* card may use the same
+     * id, and does, constantly: that is why the key is `(card_id, run_id)`.
      */
     addRun(run: {
       runId: string;
       cardId: string;
       role: string;
+      /** Attempt this run belongs to; see `attemptFor`. Defaults to 1. */
+      attempt?: number;
       branch?: string;
       worktree?: string;
     }): void {
       db.prepare(
         `INSERT INTO agent_runs
-           (run_id, card_id, role, status, branch, worktree, summary, started_at, ended_at)
-         VALUES (?, ?, ?, 'running', ?, ?, NULL, ?, NULL)`
+           (run_id, card_id, attempt, role, status, branch, worktree, summary,
+            started_at, ended_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, ?, NULL)`
       ).run(
         run.runId,
         run.cardId,
+        run.attempt ?? 1,
         run.role,
         run.branch ?? null,
         run.worktree ?? null,
@@ -136,39 +316,101 @@ export function createStore(dbPath: string) {
       );
     },
     /**
-     * Close out a run: status, optional summary, and `ended_at`. An existing
-     * summary is kept when `summary` is omitted. An unknown `runId` updates
-     * nothing (and creates nothing) — use `activeRuns` to see what is
-     * still mid-flight.
+     * Close out one run of one card: status, optional summary, optional token
+     * usage, and `ended_at`. An existing summary is kept when `summary` is
+     * omitted. An unknown `runId` updates nothing (and creates nothing) — use
+     * `activeRuns` to see what is still mid-flight.
+     *
+     * `cardId` is part of the address, not decoration: two cards both have a
+     * `c1`, and closing one must never close the other.
      */
     setRunDone(
+      cardId: string,
       runId: string,
       status: AgentRunStatus,
-      summary?: string
+      summary?: string,
+      usage?: RunUsage
     ): void {
-      if (summary === undefined) {
-        db.prepare(
-          `UPDATE agent_runs SET status=?, ended_at=? WHERE run_id=?`
-        ).run(status, Date.now(), runId);
-        return;
+      const sets = [`status=?`, `ended_at=?`];
+      const values: (string | number | null)[] = [status, Date.now()];
+      if (summary !== undefined) {
+        sets.push(`summary=?`);
+        values.push(summary);
       }
+      if (usage) {
+        sets.push(`usage_in=?`, `usage_out=?`, `usage_cache_read=?`);
+        values.push(usage.input, usage.output, usage.cacheRead);
+      }
+      values.push(cardId, runId);
       db.prepare(
-        `UPDATE agent_runs SET status=?, summary=?, ended_at=? WHERE run_id=?`
-      ).run(status, summary, Date.now(), runId);
+        `UPDATE agent_runs SET ${sets.join(", ")} WHERE card_id=? AND run_id=?`
+      ).run(...values);
     },
-    runsFor(cardId: string): AgentRun[] {
+    /** Runs for a card — one attempt when `attempt` is given, else all history. */
+    runsFor(cardId: string, attempt?: number): AgentRun[] {
+      if (attempt === undefined) {
+        return db
+          .prepare(
+            `SELECT * FROM agent_runs WHERE card_id=? ORDER BY started_at ASC, run_id ASC`
+          )
+          .all(cardId) as AgentRun[];
+      }
       return db
         .prepare(
-          `SELECT * FROM agent_runs WHERE card_id=? ORDER BY started_at ASC, run_id ASC`
+          `SELECT * FROM agent_runs WHERE card_id=? AND attempt=?
+             ORDER BY started_at ASC, run_id ASC`
         )
-        .all(cardId) as AgentRun[];
+        .all(cardId, attempt) as AgentRun[];
     },
-    /** Total runs recorded for a card — the `MAX_AGENT_RUNS` budget check. */
-    countRuns(cardId: string): number {
-      const row = db
-        .prepare(`SELECT COUNT(*) AS n FROM agent_runs WHERE card_id=?`)
-        .get(cardId) as { n: number };
+    /**
+     * Runs recorded for a card — the `MAX_AGENT_RUNS` budget check.
+     *
+     * `attempt` scopes it to one run of the card. Omit it and you get every
+     * attempt ever, which is what a cost question wants and what a budget
+     * question must never use: a card that spent 12 runs failing yesterday is
+     * entitled to 12 today.
+     */
+    countRuns(cardId: string, attempt?: number): number {
+      const row = (attempt === undefined
+        ? db
+            .prepare(`SELECT COUNT(*) AS n FROM agent_runs WHERE card_id=?`)
+            .get(cardId)
+        : db
+            .prepare(`SELECT COUNT(*) AS n FROM agent_runs WHERE card_id=? AND attempt=?`)
+            .get(cardId, attempt)) as { n: number };
       return row.n;
+    },
+    /**
+     * Token totals per card over all attempts — the money view, not the budget
+     * view. `MAX_AGENT_RUNS` only becomes a cost guardrail once there is a cost
+     * number next to it.
+     *
+     * `reported` is how many of those runs actually carried a `usage` event.
+     * `COALESCE(SUM(...), 0)` makes "nothing reported" and "cost nothing" the
+     * same number, which is a lie we already refused in `setRunDone` (NULL, not
+     * 0), so the count travels with the totals and the view can say which one
+     * it is looking at. A card that ran on the `process` runtime reports no
+     * usage at all and must not read as a free card.
+     */
+    usageByCard(): {
+      card_id: string;
+      runs: number;
+      reported: number;
+      input: number;
+      output: number;
+      cache_read: number;
+    }[] {
+      return db
+        .prepare(
+          `SELECT card_id,
+                  COUNT(*) AS runs,
+                  COUNT(usage_in) AS reported,
+                  COALESCE(SUM(usage_in), 0) AS input,
+                  COALESCE(SUM(usage_out), 0) AS output,
+                  COALESCE(SUM(usage_cache_read), 0) AS cache_read
+             FROM agent_runs GROUP BY card_id ORDER BY card_id`
+        )
+        .all() as never;
     },
     /** Runs still mid-flight: all cards when `cardId` is omitted. */
     activeRuns(cardId?: string): AgentRun[] {
@@ -190,6 +432,50 @@ export function createStore(dbPath: string) {
         `SELECT COUNT(*) AS n FROM jobs WHERE status='running'`
       ).get() as { n: number };
       return row.n > 0;
+    },
+    /**
+     * Mark everything this process inherited as mid-flight as failed.
+     *
+     * A kill mid-card leaves `agent_runs.status='running'` rows that will never
+     * be closed: `/factory status` lists children that no longer exist, and they
+     * count against the budget forever. Only a boot-time sweep can tell a stale
+     * row from a live one, because at boot nothing is live — which is why
+     * `startWorker` calls this before its first tick and never on a timer.
+     *
+     * Idempotent: a second call finds nothing `running` and reaps nothing.
+     */
+    reapStale(
+      runSummary = "reaped: orchestrator restarted mid-run",
+      jobError = "reaped: the factory restarted while this card was running"
+    ): { runs: { run_id: string; card_id: string; role: string }[]; jobs: { card_id: string; card_name: string }[] } {
+      const runs = db
+        .prepare(
+          `SELECT run_id, card_id, role FROM agent_runs WHERE status='running'
+             ORDER BY started_at ASC, run_id ASC`
+        )
+        .all() as { run_id: string; card_id: string; role: string }[];
+      const jobs = db
+        .prepare(
+          `SELECT card_id, card_name FROM jobs WHERE status='running' ORDER BY created_at, card_id`
+        )
+        .all() as { card_id: string; card_name: string }[];
+
+      db.transaction(() => {
+        if (runs.length) {
+          db.prepare(
+            `UPDATE agent_runs SET status='failed', summary=?, ended_at=?
+               WHERE status='running'`
+          ).run(runSummary, Date.now());
+        }
+        if (jobs.length) {
+          db.prepare(
+            `UPDATE jobs SET status='failed', error=?, updated_at=datetime('now')
+               WHERE status='running'`
+          ).run(jobError);
+        }
+      })();
+
+      return { runs, jobs };
     },
     close(): void {
       db.close();

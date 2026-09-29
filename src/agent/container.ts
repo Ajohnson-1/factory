@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { AGENT_CONTAINER_HOME, buildAgentEnv, FACTORY_SECRET_ENV_KEYS } from "./env.js";
-import type { AgentRunResult } from "./types.js";
+import type { AgentRunResult, AgentTokenUsage } from "./types.js";
 
 export const AGENT_IMAGE = "factory-agent";
 /** Where the worktree lands inside the container. */
@@ -313,6 +313,24 @@ function assistantText(content: unknown): string {
 }
 
 /**
+ * Fold pi's `usage` into one run's totals. An all-zero record is treated as "the
+ * provider reported nothing" — a run must not look like it was free.
+ */
+function readUsage(value: unknown): AgentTokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  const number = (key: string): number =>
+    typeof value[key] === "number" && Number.isFinite(value[key]) ? (value[key] as number) : 0;
+  const usage = {
+    input: number("input"),
+    output: number("output"),
+    cacheRead: number("cacheRead"),
+  };
+  return usage.input === 0 && usage.output === 0 && usage.cacheRead === 0
+    ? undefined
+    : usage;
+}
+
+/**
  * Fold JSON-mode session events into a run result.
  *
  * `message_end` is the authoritative final message; `text_delta` is only a live
@@ -328,6 +346,7 @@ export function createAgentEventCollector(onTool?: (toolName: string) => void): 
   let finalText = "";
   let sawFinalMessage = false;
   let failure: string | undefined;
+  let usage: AgentTokenUsage | undefined;
 
   const fail = (message: unknown, fallback: string): void => {
     failure ??= typeof message === "string" && message ? message : fallback;
@@ -356,6 +375,18 @@ export function createAgentEventCollector(onTool?: (toolName: string) => void): 
           if (!isRecord(message) || message.role !== "assistant") break;
           finalText = assistantText(message.content);
           sawFinalMessage = true;
+          // One run is many turns: the request that made the tool call and the
+          // request that answered it both bill, so the run's cost is their sum.
+          const tokens = readUsage(message.usage);
+          if (tokens) {
+            usage = usage
+              ? {
+                  input: usage.input + tokens.input,
+                  output: usage.output + tokens.output,
+                  cacheRead: usage.cacheRead + tokens.cacheRead,
+                }
+              : tokens;
+          }
           if (message.stopReason === "error" || message.stopReason === "aborted") {
             fail(message.errorMessage, `request ${message.stopReason}`);
           }
@@ -365,8 +396,9 @@ export function createAgentEventCollector(onTool?: (toolName: string) => void): 
     },
     result(): AgentRunResult {
       const body = sawFinalMessage ? finalText : streamed;
-      if (!failure) return { ok: true, text: body };
-      return { ok: false, text: body ? `${failure}\n---\n${body}` : failure };
+      const spend = usage ? { usage } : {};
+      if (!failure) return { ok: true, text: body, ...spend };
+      return { ok: false, text: body ? `${failure}\n---\n${body}` : failure, ...spend };
     },
   };
 }
@@ -487,6 +519,9 @@ export function runAgentInContainer(
       resolve({
         ok: result.ok && !extra,
         text: extra ? `${result.text}\n${extra}`.trim() : result.text,
+        // Keep the spend even when the run failed: a timeout that burned 40k
+        // input tokens before dying is not a free run.
+        ...(result.usage ? { usage: result.usage } : {}),
       });
     };
 

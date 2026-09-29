@@ -164,6 +164,25 @@ describe("runCard on the graph path", () => {
     expect(given?.gitDir).toBe(GIT_DIR);
     expect(given?.card).toMatchObject({ name: CARD_NAME, desc: CARD.desc });
     expect(given?.store).toBe(store);
+    // A card that has never been re-triggered is on its first attempt.
+    expect(given?.attempt).toBe(1);
+  });
+
+  /**
+   * open-issues #1, the other half: the graph can only budget per attempt if the
+   * runner tells it which attempt this is. The generation lives on the job row,
+   * which is the one place that knows it.
+   */
+  it("hands the graph the card's current attempt after a re-trigger", async () => {
+    queueCard();
+    store.setRunning(CARD_ID, BRANCH);
+    store.setFailed(CARD_ID, "run budget exhausted");
+    store.enqueue(CARD_ID, CARD_NAME);
+    const { graph, seen } = fakeGraph(graphResult());
+
+    await runCard(CARD_ID, bot, deps({ graph }));
+
+    expect(seen()?.attempt).toBe(2);
   });
 
   it("does not run a single agent once a graph is driving the card", async () => {
@@ -230,6 +249,9 @@ describe("runCard on the graph path", () => {
     expect(titles()).toContain("❌ Factory run failed");
   });
 
+  // The invariant behind #2: the worker's gate is `store.isRunning()`, which is
+  // global. A hung orchestrator is only survivable because its capped wall clock
+  // ends the run and this path always marks the job failed, releasing the gate.
   it("treats an orchestrator that merely timed out as a failed card", async () => {
     queueCard();
     const { graph } = fakeGraph(graphResult({ status: "timeout", summary: "timed out" }));
@@ -237,7 +259,11 @@ describe("runCard on the graph path", () => {
     await runCard(CARD_ID, bot, deps({ graph }));
 
     expect(job()?.status).toBe("failed");
+    expect(job()?.error).toContain("timed out");
     expect(worktree.remove).toHaveBeenCalledWith(CARD_ID);
+    // The gate every other card is waiting on is open again.
+    expect(store.isRunning()).toBe(false);
+    expect(store.activeRuns(CARD_ID)).toEqual([]);
   });
 
   it("ships an ok graph whose summary happens to be empty", async () => {

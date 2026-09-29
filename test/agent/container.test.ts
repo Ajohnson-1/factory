@@ -586,7 +586,109 @@ describe("createAgentEventCollector", () => {
   });
 });
 
+/**
+ * An assistant `message_end` carrying pi's `usage`, which is where a run's cost
+ * is knowable at all (open-issues #6). `assistantEnd()` above deliberately has no
+ * usage, because that is what a runtime that reports nothing looks like.
+ */
+function endWithUsage(
+  text: string,
+  usage: Record<string, number>,
+  stopReason = "stop"
+): unknown {
+  return {
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text }], stopReason, usage },
+  };
+}
+
+describe("createAgentEventCollector — token usage", () => {
+  it("sums every assistant message in the run, not just the last", () => {
+    const c = createAgentEventCollector();
+
+    // One run is many billed requests: the turn that made the tool call and the
+    // turn that answered it are separate `message_end`s.
+    c.handle(endWithUsage("planning", { input: 1_000, output: 40, cacheRead: 900 }));
+    c.handle(endWithUsage("done", { input: 1_000, output: 60, cacheRead: 900 }));
+
+    expect(c.result().usage).toEqual({ input: 2_000, output: 100, cacheRead: 1_800 });
+  });
+
+  it("leaves usage out entirely when nothing was reported", () => {
+    const c = createAgentEventCollector();
+
+    c.handle(delta("working "));
+    c.handle(assistantEnd("final"));
+
+    // `usage: undefined` would still fail this, and it matters: NULL and 0 are
+    // different claims about a card's cost.
+    expect(c.result()).toEqual({ ok: true, text: "final" });
+  });
+
+  it("treats an all-zero usage record as nothing reported", () => {
+    const c = createAgentEventCollector();
+
+    c.handle(endWithUsage("final", { input: 0, output: 0, cacheRead: 0 }));
+
+    expect(c.result()).toEqual({ ok: true, text: "final" });
+  });
+
+  it("keeps the spend of a run that failed, because it still cost tokens", () => {
+    const c = createAgentEventCollector();
+
+    c.handle(endWithUsage("halfway", { input: 400, output: 10, cacheRead: 0 }, "error"));
+
+    const result = c.result();
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("request error");
+    expect(result.usage).toEqual({ input: 400, output: 10, cacheRead: 0 });
+  });
+
+  it("ignores usage on a message that is not the assistant's", () => {
+    const c = createAgentEventCollector();
+
+    c.handle({
+      type: "message_end",
+      message: { role: "user", content: PROMPT, usage: { input: 5, output: 5, cacheRead: 5 } },
+    });
+
+    expect(c.result().usage).toBeUndefined();
+  });
+});
+
 describe("runAgentInContainer (fake docker)", () => {
+  it("carries the run's usage out of the container", async () => {
+    const { result } = await drive(
+      [
+        json(endWithUsage("planning", { input: 10, output: 1, cacheRead: 2 })),
+        json(endWithUsage("done", { input: 10, output: 2, cacheRead: 0 })),
+      ],
+      { dir: WT, prompt: PROMPT, gitDir: GIT_DIR }
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      text: "done",
+      usage: { input: 20, output: 3, cacheRead: 2 },
+    });
+  });
+
+  /**
+   * The card is billed for the tokens a killed run burned, so the operator who
+   * sees `timeout` in `/factory status` can also see what it cost to find out.
+   */
+  it("keeps the usage of a container that was killed mid-run", async () => {
+    const { result } = await drive(
+      [json(endWithUsage("mid-flight", { input: 300, output: 20, cacheRead: 1_000 }))],
+      { dir: WT, prompt: PROMPT, gitDir: GIT_DIR },
+      { code: null, signal: "SIGKILL" }
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("terminated by signal");
+    expect(result.usage).toEqual({ input: 300, output: 20, cacheRead: 1_000 });
+  });
+
   it("assembles a successful run and forwards tool events", async () => {
     const { result, tools } = await drive(
       [

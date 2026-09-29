@@ -147,6 +147,10 @@ export async function runCard(
 
   const job = store.get(cardId);
   if (!job) return;
+  // Read after `enqueue` wrote the row, so a re-trigger carries its generation:
+  // the graph budgets children per attempt, and this is where the attempt is
+  // actually known.
+  const attempt = store.attemptFor(cardId);
   const card = await trello.getCard(cardId);
   const { dir, branch } = worktree.create(cardId);
   const gitDir = worktree.gitDir(dir);
@@ -159,6 +163,7 @@ export async function runCard(
       const outcome = await graph({
         store,
         cardId,
+        attempt,
         baseDir: dir,
         gitDir,
         card,
@@ -175,6 +180,16 @@ export async function runCard(
       // Anything still uncommitted (a shared-role file the spawner could not
       // commit) is taken here.
       worktree.commit(dir, `factory: ${card.name}`);
+      if (outcome.usage) {
+        // The planner is not an `agent_runs` row (it would eat its own budget),
+        // so its spend only exists in this line. Children's totals are in
+        // `/factory status`.
+        console.log(
+          `[runner] card ${cardId} attempt ${attempt}: orchestrator ` +
+            `${outcome.usage.input}in/${outcome.usage.output}out ` +
+            `(${outcome.usage.cacheRead} cache read)`
+        );
+      }
     } else {
       await agent({
         dir,

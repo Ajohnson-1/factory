@@ -24,6 +24,7 @@ import {
   type SpawnStatus,
 } from "./spawn.js";
 import { headCommit, worktreeDir } from "../worker/worktree.js";
+import type { AgentTokenUsage } from "../agent/types.js";
 import type { Store } from "../state/store.js";
 
 /** A child's report, capped before it goes back into the orchestrator's context. */
@@ -34,6 +35,13 @@ export interface GraphResult {
   summary: string;
   /** Children this graph started, whether or not they landed. */
   runs: number;
+  /**
+   * The planner's own spend. Children are recorded as `agent_runs` rows; the
+   * orchestrator is not, because a row for it would count against the very
+   * budget it exists to be held to. It is reported here instead so the card's
+   * total cost is at least visible in the log.
+   */
+  usage?: AgentTokenUsage;
   /** Base commit when the graph started / when it ended. */
   baseHeadBefore: string;
   baseHeadAfter: string;
@@ -46,6 +54,11 @@ export interface GraphDeps {
   baseDir: string;
   gitDir: string;
   card: { name: string; desc: string };
+  /**
+   * Attempt of the card this graph is, from `jobs.generation`. Children are
+   * budgeted against it, so a re-triggered card gets a fresh `MAX_AGENT_RUNS`.
+   */
+  attempt?: number;
   /** Streams child activity outward (Discord). Must never throw. */
   onEvent?: (event: AgentEvent) => void;
   /** Overridable so a test can drive a whole graph without docker. */
@@ -95,9 +108,21 @@ export function buildOrchestratorPrompt(card: {
  * per-child timeout, so the planner gets the budget of every run it is allowed
  * to ask for plus one turn of its own — otherwise a card with four slow children
  * would be killed by a timeout meant for one.
+ *
+ * `capMs` is the honest half of that arithmetic. At the defaults the product is
+ * 20 min × 13 = 260 min, and the worker gate is global, so one planner hung on a
+ * provider stall holds every other card for four hours and change. The cap is
+ * still floored at one child timeout: an orchestrator that cannot outlive its own
+ * slowest child would be killed while doing legitimate work, which is a worse bug
+ * than the one being capped.
  */
-export function orchestratorTimeoutMs(childTimeoutMs: number, maxRuns: number): number {
-  return childTimeoutMs * (maxRuns + 1);
+export function orchestratorTimeoutMs(
+  childTimeoutMs: number,
+  maxRuns: number,
+  capMs = Number.POSITIVE_INFINITY
+): number {
+  const full = childTimeoutMs * (maxRuns + 1);
+  return Math.max(childTimeoutMs, Math.min(full, capMs));
 }
 
 /** Env that turns the baked-in extension into a client of *this* run's channel. */
@@ -127,6 +152,7 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
     timeoutMs: config.factory.agentTimeoutMs,
     maxRuns: config.factory.maxAgentRuns,
   };
+  const attempt = deps.attempt ?? 1;
   const baseHeadBefore = safeHead(deps.baseDir);
   if (!baseHeadBefore) {
     // The runner creates the base worktree before the graph starts, so this only
@@ -146,6 +172,7 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
     : createAgentSpawner({
         store: deps.store,
         cardId: deps.cardId,
+        attempt,
         baseDir: deps.baseDir,
         gitDir: deps.gitDir,
         runChild: (options) => runContainer(options),
@@ -180,9 +207,17 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
       },
     });
   } catch (err) {
+    // A listener that cannot be opened is a bind-address problem, and the bind
+    // is the one knob on a Linux host that decides whether any container can
+    // reach this channel at all — so say which variable to look at rather than
+    // leaving a raw EADDRNOTAVAIL in the card's summary.
+    const message = err instanceof Error ? err.message : String(err);
     return {
       status: "failed",
-      summary: `could not open the spawn channel: ${err instanceof Error ? err.message : String(err)}`,
+      summary:
+        `could not open the spawn channel on ${config.factory.ipcBind}: ${message}. ` +
+        `Check FACTORY_IPC_BIND (127.0.0.1 is unreachable from a container on a ` +
+        `Linux bridge).`,
       runs: 0,
       baseHeadBefore,
       baseHeadAfter: baseHeadBefore,
@@ -210,7 +245,11 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
         activeTools: ROLES.orchestrator.activeTools,
       }),
       containerName: `factory-${deps.cardId}-orch`,
-      timeoutMs: orchestratorTimeoutMs(limits.timeoutMs, limits.maxRuns),
+      timeoutMs: orchestratorTimeoutMs(
+        limits.timeoutMs,
+        limits.maxRuns,
+        config.factory.orchestratorTimeoutMs
+      ),
       onTool: (toolName) => {
         deps.onEvent?.({ kind: "tool", role: "orchestrator", runId: "orch", toolName });
       },
@@ -234,6 +273,7 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
           ? result.text
           : `the orchestrator finished without landing anything on ${deps.cardId}`,
       runs: childRuns,
+      ...(result.usage ? { usage: result.usage } : {}),
       baseHeadBefore,
       baseHeadAfter,
     };

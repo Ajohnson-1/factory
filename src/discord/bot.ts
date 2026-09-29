@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { store } from "../state/store.js";
-import type { AgentRun } from "../state/store.js";
+import type { AgentRun, Store } from "../state/store.js";
 import { agentLabel } from "./embeds.js";
 import type { Job } from "../state/store.js";
 
@@ -32,13 +32,38 @@ export function isPaused(dataDir: string = defaultDataDir()): boolean {
 }
 
 /**
+ * Per-card token totals, as `Store.usageByCard` returns them.
+ *
+ * `reported` is the runs that carried a `usage` event. The totals of a run that
+ * reported nothing are NULL, and SQL sums them to 0 — so without this count a
+ * card whose runtime never reported usage would read as a card that cost
+ * nothing, which is the distinction `setRunDone` deliberately keeps.
+ */
+export interface CardUsage {
+  card_id: string;
+  runs: number;
+  reported: number;
+  input: number;
+  output: number;
+  cache_read: number;
+}
+
+/**
  * Plain-text body of `/factory status`.
  *
  * `runs` are the card's in-flight `agent_runs` (phase 2.2): a card being driven
  * by a graph is otherwise indistinguishable from a single-agent card, which
  * makes a stalled fan-out invisible to whoever is watching the channel.
+ *
+ * `usage` is the per-card spend (phase 2.2 open issue #6). `MAX_AGENT_RUNS` caps
+ * how many runs a card may have; only these numbers make it a *cost* limit
+ * rather than a count.
  */
-export function buildStatusText(jobs: Job[], runs: AgentRun[] = []): string {
+export function buildStatusText(
+  jobs: Job[],
+  runs: AgentRun[] = [],
+  usage: CardUsage[] = []
+): string {
   if (jobs.length === 0) return "No jobs yet.";
 
   const byCard = new Map<string, AgentRun[]>();
@@ -47,6 +72,9 @@ export function buildStatusText(jobs: Job[], runs: AgentRun[] = []): string {
     if (list) list.push(run);
     else byCard.set(run.card_id, [run]);
   }
+  const spend = new Map<string, CardUsage>(
+    usage.map((u) => [u.card_id, u] as [string, CardUsage])
+  );
 
   return jobs
     .map((j) => {
@@ -54,9 +82,61 @@ export function buildStatusText(jobs: Job[], runs: AgentRun[] = []): string {
       const children = (byCard.get(j.card_id) ?? []).map(
         (run) => `  - ${agentLabel(run.role, run.run_id)}: ${run.status}`
       );
-      return [head, ...children].join("\n");
+      const u = spend.get(j.card_id);
+      // Only cards that have run rows get a spend line: `0 in / 0 out` next to a
+      // card that has never spent anything is noise that reads like a bug.
+      // A card whose runs all failed before reporting is not free, it is
+      // unknown, and the line has to be able to say so.
+      let total = "";
+      if (u) {
+        const scope =
+          u.reported === u.runs
+            ? `(${u.runs} run${u.runs === 1 ? "" : "s"})`
+            : `(${u.reported} of ${u.runs} run${u.runs === 1 ? "" : "s"} reported)`;
+        total =
+          u.reported === 0
+            ? `  spend: usage not reported (${u.runs} run${u.runs === 1 ? "" : "s"})`
+            : `  spend: ${u.input} in / ${u.output} out / ${u.cache_read} cache read ${scope}`;
+      }
+      return [head, ...children, ...(total ? [total] : [])].join("\n");
     })
     .join("\n");
+}
+
+/**
+ * Re-queue a card — the one re-trigger path, shared by `/factory retry` and
+ * (through `Store.enqueue`) the Trello webhook.
+ *
+ * Refuses a card that is already running: a second graph over the first would
+ * fight it for the same worktree and double the spend.
+ */
+export function requeueCard(
+  store: Store,
+  cardId: string
+): { ok: boolean; message: string } {
+  const job = store.get(cardId);
+  if (!job) {
+    return {
+      ok: false,
+      message: `No job for card ${cardId} — it has never been picked up.`,
+    };
+  }
+  const result = store.enqueue(cardId, job.card_name);
+  if (result.queued) {
+    return {
+      ok: true,
+      message: result.requeued
+        ? `Re-queued "${job.card_name}" as attempt ${result.generation}.`
+        : `Queued "${job.card_name}".`,
+    };
+  }
+  return {
+    ok: false,
+    message:
+      job.status === "running"
+        ? `"${job.card_name}" is running — not starting a second graph over it.`
+        : `"${job.card_name}" is already queued (attempt ${result.generation}).`,
+  };
 }
 
 export class DiscordBot {
@@ -78,6 +158,19 @@ export class DiscordBot {
           { name: "status", type: 1, description: "Show all jobs" },
           { name: "pause", type: 1, description: "Stop accepting new cards" },
           { name: "resume", type: 1, description: "Resume accepting cards" },
+          {
+            name: "retry",
+            type: 1,
+            description: "Re-queue a finished card with a fresh run budget",
+            options: [
+              {
+                name: "card",
+                type: 3,
+                description: "Trello card id",
+                required: true,
+              },
+            ],
+          },
         ],
       },
     ];
@@ -94,8 +187,12 @@ export class DiscordBot {
     if (i.commandName !== "factory") return;
     const sub = i.options.getSubcommand();
     if (sub === "status") {
-      const text = buildStatusText(store.all(), store.activeRuns());
+      const text = buildStatusText(store.all(), store.activeRuns(), store.usageByCard());
       await i.reply({ content: `**Factory status**\n\`\`\`${text}\`\`\`` });
+    } else if (sub === "retry") {
+      const cardId = i.options.getString("card", true);
+      const result = requeueCard(store, cardId);
+      await i.reply({ content: result.message });
     } else if (sub === "pause" || sub === "resume") {
       setPaused(sub === "pause");
       await i.reply(`Factory ${sub === "pause" ? "paused" : "resumed"}.`);

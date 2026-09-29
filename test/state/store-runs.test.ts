@@ -51,7 +51,7 @@ describe("agent runs", () => {
 
   it("setRunDone writes status, summary and ended_at", () => {
     store.addRun({ runId: "r1", cardId: "c1", role: "implementer" });
-    store.setRunDone("r1", "ok", "opened PR 12");
+    store.setRunDone("c1", "r1", "ok", "opened PR 12");
 
     const run = store.runsFor("c1")[0];
     expect(run.status).toBe("ok");
@@ -62,8 +62,8 @@ describe("agent runs", () => {
 
   it("preserves an existing summary when called without one", () => {
     store.addRun({ runId: "r1", cardId: "c1", role: "implementer" });
-    store.setRunDone("r1", "failed", "CI timed out");
-    store.setRunDone("r1", "timeout");
+    store.setRunDone("c1", "r1", "failed", "CI timed out");
+    store.setRunDone("c1", "r1", "timeout");
 
     expect(store.runsFor("c1")[0]).toMatchObject({
       status: "timeout",
@@ -99,7 +99,7 @@ describe("agent runs", () => {
     store.addRun({ runId: "r2", cardId: "c1", role: "reviewer" });
     expect(store.countRuns("c1")).toBe(2);
 
-    store.setRunDone("r1", "ok", "done");
+    store.setRunDone("c1", "r1", "ok", "done");
     // the budget counts history, not just live runs
     expect(store.countRuns("c1")).toBe(2);
   });
@@ -120,7 +120,7 @@ describe("agent runs", () => {
       "r3",
     ]);
 
-    store.setRunDone("r2", "ok", "done");
+    store.setRunDone("c1", "r2", "ok", "done");
     expect(store.activeRuns("c1").map((r) => r.run_id)).toEqual(["r1"]);
     expect(store.activeRuns().map((r) => r.run_id).sort()).toEqual([
       "r1",
@@ -128,7 +128,14 @@ describe("agent runs", () => {
     ]);
   });
 
-  it("throws on a duplicate run_id", () => {
+  /**
+   * A spawner numbers its children from its own counter, so every card has a
+   * `c1`. When `run_id` was the whole primary key, the *second card the factory
+   * ever processed* threw on its first child — and so would any re-triggered
+   * attempt. The key is `(card_id, run_id)` now, and this is the pair of
+   * assertions that says which.
+   */
+  it("throws on a duplicate run id within one card, and lets another card use the same id", () => {
     store.addRun({ runId: "r1", cardId: "c1", role: "implementer" });
 
     expect(() =>
@@ -137,10 +144,27 @@ describe("agent runs", () => {
     // the original row is untouched, not upserted
     expect(store.runsFor("c1")[0].role).toBe("implementer");
     expect(store.countRuns("c1")).toBe(1);
+
+    expect(() => store.addRun({ runId: "r1", cardId: "c2", role: "implementer" })).not.toThrow();
+    expect(store.countRuns("c2")).toBe(1);
+    expect(store.runsFor("c2")[0].status).toBe("running");
+    expect(store.runsFor("c1")[0].status).toBe("running");
+  });
+
+  /** The other half: closing one card's `c1` must not close another's. */
+  it("closes a run only within the card named", () => {
+    store.addRun({ runId: "r1", cardId: "c1", role: "implementer" });
+    store.addRun({ runId: "r1", cardId: "c2", role: "implementer" });
+
+    store.setRunDone("c1", "r1", "ok", "done");
+
+    expect(store.runsFor("c1")[0].status).toBe("ok");
+    expect(store.runsFor("c2")[0].status).toBe("running");
+    expect(store.activeRuns("c2").map((r) => r.card_id)).toEqual(["c2"]);
   });
 
   it("setRunDone on an unknown run is a harmless no-op", () => {
-    expect(() => store.setRunDone("nope", "ok", "nothing")).not.toThrow();
+    expect(() => store.setRunDone("c1", "nope", "ok", "nothing")).not.toThrow();
 
     expect(store.runsFor("c1")).toEqual([]);
     expect(store.countRuns("c1")).toBe(0);
@@ -156,7 +180,7 @@ describe("agent runs", () => {
     expect(store.countRuns("cardA")).toBe(1);
     expect(store.countRuns("cardB")).toBe(1);
 
-    store.setRunDone("a1", "ok", "done");
+    store.setRunDone("cardA", "a1", "ok", "done");
     expect(store.runsFor("cardB")[0].status).toBe("running");
   });
 

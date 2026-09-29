@@ -170,6 +170,29 @@ function ensureSettingsForSlowModel(): void {
 
 await preflight();
 ensureSettingsForSlowModel();
+raiseOrchestratorCeiling();
+
+/**
+ * The same trap as `httpIdleTimeoutMs`, one level up (plan/open-issues #2).
+ *
+ * The orchestrator's wall clock now has a ceiling, so a smoke run that raised
+ * `AGENT_TIMEOUT_MS` to give a slow local model room would still be cut off at
+ * 45 minutes — and would look like a broken graph rather than a patient one.
+ * Raise the ceiling to the derived budget unless the operator set it explicitly,
+ * which is also how you test the cap itself.
+ */
+function raiseOrchestratorCeiling(): void {
+  if (process.env.ORCHESTRATOR_TIMEOUT_MS) return;
+  const child = Number(process.env.AGENT_TIMEOUT_MS ?? "0");
+  if (!Number.isFinite(child) || child <= 0) return;
+  const runs = Number(process.env.MAX_AGENT_RUNS ?? "12");
+  const ceiling = Math.max(45 * 60_000, child * (runs + 1));
+  process.env.ORCHESTRATOR_TIMEOUT_MS = String(ceiling);
+  console.log(
+    `[pre-flight] ORCHESTRATOR_TIMEOUT_MS=${ceiling} so the new cap does not cut off a slow run ` +
+      `(set it yourself to exercise the cap)`
+  );
+}
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -255,6 +278,23 @@ try {
   );
   console.log(`[smoke] merges    ${merges.length}: ${merges.join(" | ") || "(none)"}`);
   console.log(`[smoke] runs      ${JSON.stringify(runs.map((r) => `${r.role}:${r.status}`))}`);
+  // The point of the usage columns: a card's cost should be readable without a
+  // provider bill. NULL usage (a runtime that reported nothing) sums to 0 here,
+  // which is why the run count travels with it.
+  const spend = store.usageByCard().find((u) => u.card_id === CARD_ID);
+  const spendText = spend
+    ? [
+        `${spend.input} in`,
+        `${spend.output} out`,
+        `${spend.cache_read} cache read`,
+        `over ${spend.runs} runs`,
+      ].join(" / ")
+    : "(nothing recorded)";
+  // The planner is not an `agent_runs` row, so its own spend is not in that sum.
+  const orchestratorText = result.usage
+    ? ` + orchestrator ${result.usage.input} in / ${result.usage.output} out`
+    : "";
+  console.log(`[smoke] spend     ${spendText}${orchestratorText}`);
   console.log(`[smoke] timeline  ${timeline.length} events`);
   console.log(`[smoke] report    ${result.summary.slice(0, 700)}`);
 

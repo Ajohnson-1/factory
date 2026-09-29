@@ -13,10 +13,11 @@ import {
   DiscordBot,
   buildStatusText,
   isPaused,
+  requeueCard,
   setPaused,
 } from "../../src/discord/bot.js";
 import { startedEmbed } from "../../src/discord/embeds.js";
-import type { AgentRun, Job } from "../../src/state/store.js";
+import { createStore, type AgentRun, type Job, type Store } from "../../src/state/store.js";
 import { makeTempDir, removeTempDir } from "../helpers/tmp.js";
 
 // Only the gateway Client is faked — constructing the real one would open a
@@ -50,6 +51,7 @@ function run(overrides: Partial<AgentRun> = {}): AgentRun {
   return {
     run_id: "c1",
     card_id: "c1",
+    attempt: 1,
     role: "coder",
     status: "running",
     branch: "factory/c1-c1",
@@ -57,6 +59,9 @@ function run(overrides: Partial<AgentRun> = {}): AgentRun {
     summary: null,
     started_at: 1,
     ended_at: null,
+    usage_in: null,
+    usage_out: null,
+    usage_cache_read: null,
     ...overrides,
   };
 }
@@ -217,6 +222,124 @@ describe("buildStatusText", () => {
   it("defaults to no children at all, keeping the single-agent shape", () => {
     expect(buildStatusText([job({ card_id: "c1" })])).toBe("RUNNING — Card one");
   });
+
+  /**
+   * open-issues #6: `MAX_AGENT_RUNS` was only ever a count. With a spend line
+   * next to it, "this card has used 9 of 12 runs" also answers "what has it
+   * cost", which is the question that actually decides whether to re-trigger.
+   */
+  it("adds a per-card spend line when the card has run rows", () => {
+    const text = buildStatusText([job()], [], [
+      { card_id: "c1", runs: 3, reported: 3, input: 12_000, output: 800, cache_read: 40_000 },
+    ]);
+
+    expect(text).toBe(
+      "RUNNING — Card one\n  spend: 12000 in / 800 out / 40000 cache read (3 runs)"
+    );
+  });
+
+  it("says run, not runs, for a single-run card", () => {
+    const text = buildStatusText([job()], [], [
+      { card_id: "c1", runs: 1, reported: 1, input: 5, output: 6, cache_read: 7 },
+    ]);
+
+    expect(text).toContain("(1 run)");
+  });
+
+  it("leaves a card that has never spent anything without a spend line", () => {
+    const text = buildStatusText(
+      [job({ card_id: "c1" }), job({ card_id: "other", card_name: "Card two" })],
+      [],
+      [{ card_id: "other", runs: 2, reported: 2, input: 1, output: 1, cache_read: 0 }]
+    );
+
+    expect(text.split("\n")).toHaveLength(3);
+    expect(text).not.toMatch(/Card one\n  spend/);
+    expect(text).toContain("Card two\n  spend: 1 in");
+  });
+
+  /**
+   * `usageByCard` COALESCEs a NULL sum to 0, so a card whose runs all died
+   * before reporting looks identical to a card that cost nothing. This line is
+   * the only place an operator sees the number, so it is where the two have to
+   * come apart.
+   */
+  it("says usage not reported rather than 0 in / 0 out when no run reported", () => {
+    const text = buildStatusText([job()], [], [
+      { card_id: "c1", runs: 2, reported: 0, input: 0, output: 0, cache_read: 0 },
+    ]);
+
+    expect(text).toContain("spend: usage not reported (2 runs)");
+    expect(text).not.toContain("0 in / 0 out");
+  });
+
+  it("names the reporting subset when only some runs carried usage", () => {
+    const text = buildStatusText([job()], [], [
+      { card_id: "c1", runs: 4, reported: 3, input: 900, output: 30, cache_read: 0 },
+    ]);
+
+    expect(text).toContain("spend: 900 in / 30 out / 0 cache read (3 of 4 runs reported)");
+  });
+});
+
+describe("requeueCard", () => {
+  let dbDir: string;
+  let cards: Store;
+
+  beforeEach(() => {
+    dbDir = makeDir();
+    cards = createStore(path.join(dbDir, "retry.db"));
+  });
+
+  afterEach(() => {
+    cards.close();
+    removeTempDir(dbDir);
+  });
+
+  it("re-queues a failed card with a fresh attempt", () => {
+    cards.enqueue("c1", "Card one");
+    cards.setRunning("c1", "factory/c1");
+    cards.setFailed("c1", "run budget exhausted");
+
+    const result = requeueCard(cards, "c1");
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("attempt 2");
+    expect(cards.get("c1")?.status).toBe("queued");
+    // The point of the whole exercise: the next graph budgets against attempt 2,
+    // so the 12 runs attempt 1 spent are not on the new attempt's bill.
+    expect(cards.attemptFor("c1")).toBe(2);
+    expect(cards.countRuns("c1", 2)).toBe(0);
+  });
+
+  it("refuses a card that is running, rather than starting a second graph over it", () => {
+    cards.enqueue("c1", "Card one");
+    cards.setRunning("c1", "factory/c1");
+
+    const result = requeueCard(cards, "c1");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("is running");
+    expect(cards.get("c1")?.status).toBe("running");
+    expect(cards.attemptFor("c1")).toBe(1);
+  });
+
+  it("says a card that is already queued is already queued", () => {
+    cards.enqueue("c1", "Card one");
+
+    const result = requeueCard(cards, "c1");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("already queued");
+  });
+
+  it("refuses a card the factory has never picked up", () => {
+    const result = requeueCard(cards, "nope");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("No job for card nope");
+    expect(cards.get("nope")).toBeUndefined();
+  });
 });
 
 describe("DiscordBot.onInteraction", () => {
@@ -240,6 +363,23 @@ describe("DiscordBot.onInteraction", () => {
     await bot.onInteraction(i);
 
     expect(reply).not.toHaveBeenCalled();
+  });
+
+  it("replies with the outcome of a retry, asking for the card by id", async () => {
+    const getString = vi.fn(() => "card-9");
+    const { i, reply } = interaction({
+      options: { getSubcommand: () => "retry", getString },
+    });
+
+    await bot.onInteraction(i);
+
+    expect(getString).toHaveBeenCalledWith("card", true);
+    expect(reply).toHaveBeenCalledTimes(1);
+    const body = reply.mock.calls[0][0] as { content: string };
+    // The default store has never seen `card-9`, so the honest answer is the
+    // refusal — which is also the only thing this test can assert without
+    // reaching into the module-level store.
+    expect(body.content).toContain("No job for card card-9");
   });
 
   it("replies with a fenced status block for the status subcommand", async () => {
