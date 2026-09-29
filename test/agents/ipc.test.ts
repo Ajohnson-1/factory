@@ -3,7 +3,9 @@ import net from "node:net";
 import {
   IPC_PROTOCOL_VERSION,
   MAX_FRAME_BYTES,
+  MAX_REVIEW_BODY_CHARS,
   createIpcServer,
+  parseFrame,
   createIpcToken,
   encodeFrame,
   parseRequest,
@@ -304,5 +306,244 @@ describe("createIpcServer", () => {
     socket.destroy();
 
     expect(refused).toBe(true);
+  });
+});
+
+/**
+ * Phase 2.3 — the review request type on the same channel.
+ *
+ * The reviewer posts findings over this socket, so everything the spawn path
+ * refuses by construction has to hold here too: same framing, same token check,
+ * same reply shape, and a handler that is simply absent for the role that must not
+ * use it.
+ */
+function reviewFrame(overrides: Record<string, unknown> = {}): string {
+  return encodeFrame({
+    v: IPC_PROTOCOL_VERSION,
+    t: "review",
+    token: TOKEN,
+    body: "name is never validated",
+    path: "src/greet.js",
+    line: 12,
+    ...overrides,
+  });
+}
+
+describe("parseFrame", () => {
+  it("routes a review frame to the review shape and keeps its fields", () => {
+    const parsed = parseFrame(reviewFrame(), TOKEN);
+
+    expect("request" in parsed).toBe(true);
+    if ("request" in parsed) {
+      expect(parsed.request).toEqual({
+        v: IPC_PROTOCOL_VERSION,
+        t: "review",
+        token: TOKEN,
+        body: "name is never validated",
+        path: "src/greet.js",
+        line: 12,
+      });
+    }
+  });
+
+  it("routes a spawn frame to the spawn shape, which is what keeps 2.2 working", () => {
+    const parsed = parseFrame(request(), TOKEN);
+
+    expect("request" in parsed && parsed.request.t).toBe("spawn");
+  });
+
+  it("refuses a body of any shape that is not a non-empty string", () => {
+    for (const [label, frame] of [
+      ["missing body", encodeFrame({ v: 1, t: "review", token: TOKEN })],
+      ["empty body", reviewFrame({ body: "" })],
+      ["whitespace body", reviewFrame({ body: "   " })],
+      ["number body", reviewFrame({ body: 42 })],
+      ["object body", reviewFrame({ body: { a: 1 } })],
+    ] as Array<[string, string]>) {
+      expect("error" in parseFrame(frame, TOKEN), label).toBe(true);
+    }
+  });
+
+  /**
+   * A finding has to say both where and when. Half of that is how a comment ends up
+   * attached to the wrong line of the wrong file with a confident body, which is
+   * worse on a public PR than no comment at all.
+   */
+  it("refuses a path without a line, and a line without a path", () => {
+    expect("error" in parseFrame(reviewFrame({ line: undefined }), TOKEN)).toBe(true);
+    expect("error" in parseFrame(reviewFrame({ path: undefined }), TOKEN)).toBe(true);
+    expect("error" in parseFrame(reviewFrame({ line: "12" }), TOKEN)).toBe(true);
+    expect("error" in parseFrame(reviewFrame({ path: "  " }), TOKEN)).toBe(true);
+  });
+
+  /**
+   * JSON numbers are doubles. `line: 12.5` and `line: 1e99` are both valid JSON and
+   * both nonsense as a line number, and GitHub's API would take the frame and fail
+   * the post — the model then sees a tool error rather than the correction.
+   */
+  it("refuses a line that is not a positive integer", () => {
+    for (const line of [0, -1, 12.5, Number.NaN, 1e99, "12"]) {
+      expect("error" in parseFrame(reviewFrame({ line }), TOKEN), String(line)).toBe(true);
+    }
+    expect("error" in parseFrame(reviewFrame({ line: 1 }), TOKEN)).toBe(false);
+  });
+
+  it("refuses a body GitHub would reject anyway, rather than eating a 422 later", () => {
+    expect("error" in parseFrame(reviewFrame({ body: "x".repeat(MAX_REVIEW_BODY_CHARS + 1) }), TOKEN)).toBe(
+      true
+    );
+    expect("error" in parseFrame(reviewFrame({ body: "x".repeat(MAX_REVIEW_BODY_CHARS) }), TOKEN)).toBe(
+      false
+    );
+  });
+
+  it("refuses a wrong token on a review frame exactly as it does on a spawn one", () => {
+    for (const frame of [reviewFrame({ token: "wrong" }), reviewFrame({ token: "" })]) {
+      const parsed = parseFrame(frame, TOKEN);
+      expect("error" in parsed && parsed.error).toBe("invalid token");
+    }
+  });
+
+  it("refuses an unknown request type without naming the types it does know", () => {
+    const parsed = parseFrame(encodeFrame({ v: 1, t: "exec", token: TOKEN }), TOKEN);
+
+    expect("error" in parsed && parsed.error).toBe("unknown request type");
+  });
+
+  it("never throws on anything a container could send", () => {
+    for (const junk of ["", "\n", "{}", encodeFrame(null), "[]", "  ", "{\"t\":", "0\n"]) {
+      expect(() => parseFrame(junk, TOKEN), junk).not.toThrow();
+    }
+  });
+});
+
+describe("createIpcServer with a review handler", () => {
+  async function withReviewServer(
+    onReview: NonNullable<Parameters<typeof createIpcServer>[0]["onReview"]>,
+    extra: { onSpawn?: Parameters<typeof createIpcServer>[0]["onSpawn"] } = {}
+  ): Promise<{ port: number; close: () => Promise<void>; calls: unknown[] }> {
+    const calls: unknown[] = [];
+    const server = await createIpcServer({
+      token: TOKEN,
+      host: "127.0.0.1",
+      port: 0,
+      ...extra,
+      onReview: async (req) => {
+        calls.push(req);
+        return onReview(req);
+      },
+    });
+    return { port: server.port, close: () => server.close(), calls };
+  }
+
+  const ok = async (): Promise<{ status: string; summary: string }> => ({
+    status: "ok",
+    summary: "posted",
+  });
+
+  it("hands the handler a parsed review and returns posted/remaining to the container", async () => {
+    const { port, close } = await withReviewServer(async () => ({
+      status: "ok",
+      summary: "posted on src/greet.js:12",
+      posted: 3,
+      remaining: 17,
+    }));
+
+    const reply = await talk(port, reviewFrame());
+
+    expect(reply).toMatchObject({
+      v: IPC_PROTOCOL_VERSION,
+      ok: true,
+      status: "ok",
+      summary: "posted on src/greet.js:12",
+      posted: 3,
+      remaining: 17,
+    });
+    await close();
+  });
+
+  it("passes a summary frame through with no path and no line invented for it", async () => {
+    const { port, close, calls } = await withReviewServer(ok);
+
+    await talk(port, reviewFrame({ path: undefined, line: undefined }));
+
+    expect(calls).toEqual([{ body: "name is never validated" }]);
+    await close();
+  });
+
+  /**
+   * The role separation, enforced by the server rather than by trust. A reviewer
+   * holds a valid token for the duration of its run; that token must buy it the
+   * ability to post and nothing else — not a child container, not a merge.
+   */
+  it("refuses a spawn request on a channel with no spawn handler", async () => {
+    const { port, close } = await withReviewServer(ok);
+
+    const reply = await talk(port, request());
+
+    expect(reply.ok).toBe(false);
+    // The same words an unknown type gets, so the reply cannot be used to probe
+    // which handlers this run happens to have.
+    expect(reply.error).toBe("unknown request type");
+    await close();
+  });
+
+  it("refuses a review request on an orchestrator's channel", async () => {
+    const server = await createIpcServer({
+      token: TOKEN,
+      host: "127.0.0.1",
+      port: 0,
+      onSpawn: async () => ({ status: "ok", summary: "child done" }),
+    });
+
+    const reply = await talk(server.port, reviewFrame());
+
+    expect(reply.error).toBe("unknown request type");
+    await server.close();
+  });
+
+  it("keeps the frame-size cap in front of the review handler", async () => {
+    const { port, close, calls } = await withReviewServer(ok);
+
+    const reply = await talk(port, reviewFrame({ body: "x".repeat(MAX_FRAME_BYTES + 10) }));
+
+    expect(reply.error).toBe("frame too large");
+    expect(calls).toEqual([]);
+    await close();
+  });
+
+  it("reports a handler that throws as a failed reply rather than dropping the socket", async () => {
+    const { port, close } = await withReviewServer(async () => {
+      throw new Error("GitHub said no");
+    });
+
+    const reply = await talk(port, reviewFrame());
+
+    expect(reply).toMatchObject({ ok: false, status: "failed", error: "GitHub said no" });
+    await close();
+  });
+
+  it("counts a review request in flight the same way a spawn is", async () => {
+    let release!: () => void;
+    const inside = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const server = await createIpcServer({
+      token: TOKEN,
+      host: "127.0.0.1",
+      port: 0,
+      onReview: async () => {
+        await inside;
+        return { status: "ok", summary: "posted" };
+      },
+    });
+
+    const inflight = talk(server.port, reviewFrame());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(server.inFlight()).toBe(1);
+    release();
+    expect((await inflight).ok).toBe(true);
+    expect(server.inFlight()).toBe(0);
+    await server.close();
   });
 });

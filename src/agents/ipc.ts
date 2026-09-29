@@ -33,13 +33,43 @@ export interface SpawnRequest {
   context?: string;
 }
 
+/**
+ * One review finding, sent by the reviewer container's `post_review` tool.
+ *
+ * There is deliberately no PR number, no owner/repo and no head SHA on the wire.
+ * The host already knows which pull request this container was started for, and
+ * letting the request name one would hand a credential-free container the ability
+ * to comment on any PR the orchestrator's token can reach. Same reasoning as
+ * 2.2's spawn channel, where a child cannot pick its own base branch.
+ *
+ * `path` + `line` together mean a line comment on the new version of that file;
+ * neither means the review summary.
+ */
+export interface ReviewRequest {
+  v: number;
+  t: "review";
+  token: string;
+  body: string;
+  path?: string;
+  line?: number;
+}
+
+export type IpcRequest = SpawnRequest | ReviewRequest;
+
+/** Beyond this, GitHub rejects the body outright (its limit is 65536 chars). */
+export const MAX_REVIEW_BODY_CHARS = 60_000;
+
 export interface IpcReply {
   v: number;
   ok: boolean;
-  /** Mirrors the spawn outcome: "ok" | "failed" | "timeout" | "rejected". */
+  /** Mirrors the outcome: "ok" | "failed" | "timeout" | "rejected". */
   status?: string;
   summary?: string;
   error?: string;
+  /** Review only: findings the host has posted for this run so far. */
+  posted?: number;
+  /** Review only: how many line comments this review may still post. */
+  remaining?: number;
 }
 
 export function encodeFrame(value: unknown): string {
@@ -71,7 +101,14 @@ export function parseRequest(
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { error: "request is not an object" };
   }
-  const record = raw as Record<string, unknown>;
+  return validateSpawn(raw as Record<string, unknown>, expectedToken);
+}
+
+/** The spawn checks over an already-parsed frame, so `parseFrame` never re-parses. */
+function validateSpawn(
+  record: Record<string, unknown>,
+  expectedToken: string
+): { request: SpawnRequest } | { error: string } {
   if (record.v !== IPC_PROTOCOL_VERSION) {
     return { error: `unsupported protocol version ${String(record.v)}` };
   }
@@ -100,22 +137,118 @@ export function parseRequest(
   };
 }
 
+/**
+ * Validate a `review` request. Same checks in the same order as `parseRequest`,
+ * so a bad token is never distinguishable from a bad shape by timing or message.
+ */
+export function parseReviewRequest(
+  raw: Record<string, unknown>,
+  expectedToken: string
+): { request: ReviewRequest } | { error: string } {
+  if (raw.v !== IPC_PROTOCOL_VERSION) {
+    return { error: `unsupported protocol version ${String(raw.v)}` };
+  }
+  if (typeof raw.token !== "string" || !tokenMatches(raw.token, expectedToken)) {
+    return { error: "invalid token" };
+  }
+  if (typeof raw.body !== "string" || !raw.body.trim()) {
+    return { error: "body must be a non-empty string" };
+  }
+  if (raw.body.length > MAX_REVIEW_BODY_CHARS) {
+    return { error: `body exceeds ${MAX_REVIEW_BODY_CHARS} characters` };
+  }
+  const hasPath = raw.path !== undefined;
+  const hasLine = raw.line !== undefined;
+  if (!hasPath && !hasLine) {
+    return { request: { v: IPC_PROTOCOL_VERSION, t: "review", token: raw.token, body: raw.body } };
+  }
+  // A finding has to say both where and when: GitHub takes a line number only
+  // alongside a path, and half of that would post something misleading.
+  if (!hasPath || !hasLine) {
+    return { error: "a line comment needs both a path and a line" };
+  }
+  if (typeof raw.path !== "string" || !raw.path.trim()) {
+    return { error: "path must be a non-empty string" };
+  }
+  // JSON numbers are doubles, so an agent can send 12.5, or 1e99, which is an
+  // *integer* in floating point and passes `isInteger`. A line number that cannot
+  // survive arithmetic exactly is not one to put on a public pull request.
+  if (typeof raw.line !== "number" || !Number.isSafeInteger(raw.line) || raw.line < 1) {
+    return { error: "line must be a positive integer" };
+  }
+  return {
+    request: {
+      v: IPC_PROTOCOL_VERSION,
+      t: "review",
+      token: raw.token,
+      body: raw.body,
+      path: raw.path,
+      line: raw.line,
+    },
+  };
+}
+
+/**
+ * Validate a request line of either kind, dispatching on its `t`.
+ *
+ * One function rather than a second server: the framing, the token check and the
+ * reply shape are the same for both, and a reviewer that opened its own channel
+ * would be a second protocol by another name.
+ */
+export function parseFrame(
+  line: string,
+  expectedToken: string
+): { request: IpcRequest } | { error: string } {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch {
+    return { error: "request is not valid JSON" };
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { error: "request is not an object" };
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.t === "review") return parseReviewRequest(record, expectedToken);
+  if (record.t === "spawn") return validateSpawn(record, expectedToken);
+  return { error: "unknown request type" };
+}
+
 /** A fresh per-run token. Never reused across cards or restarts. */
 export function createIpcToken(): string {
   // base64url so it survives a JSON round-trip and an env var unchanged.
   return randomBytes(24).toString("base64url");
 }
 
+/**
+ * What either handler may answer. Declared once so the two optional review
+ * fields survive the ternary below — inferring it from the union of the two
+ * handler signatures would type `outcome` as the spawn shape and reject
+ * `posted`/`remaining` outright.
+ */
+type HandlerOutcome = { status: string; summary: string; posted?: number; remaining?: number };
+
 export interface IpcServerOptions {
   token: string;
   host: string;
   /** 0 lets the OS choose, which is what concurrent cards need. */
   port: number;
-  onSpawn: (req: {
+  /** Present for an orchestrator run; absent for a reviewer, which cannot spawn. */
+  onSpawn?: (req: {
     role: string;
     task: string;
     context?: string;
   }) => Promise<{ status: string; summary: string }>;
+  /**
+   * Present for a reviewer run; absent for an orchestrator, which has nothing to
+   * post. Both handlers are optional on purpose: a channel that answered every
+   * request type to every container would let a reviewer start children.
+   */
+  onReview?: (req: {
+    body: string;
+    path?: string;
+    line?: number;
+  }) => Promise<{ status: string; summary: string; posted?: number; remaining?: number }>;
   /** Egress for progress: the host streams tool events back to Discord itself. */
   onConnection?: (kind: "accepted" | "rejected", reason?: string) => void;
 }
@@ -172,7 +305,7 @@ export async function createIpcServer(opts: IpcServerOptions): Promise<IpcServer
       const newline = buffer.indexOf(0x0a);
       if (newline === -1) return;
 
-      const parsed = parseRequest(buffer.subarray(0, newline).toString("utf8"), opts.token);
+      const parsed = parseFrame(buffer.subarray(0, newline).toString("utf8"), opts.token);
       if ("error" in parsed) {
         // Do not say which check failed beyond a category: the token comparison
         // in particular should not be distinguishable by timing or message.
@@ -180,16 +313,34 @@ export async function createIpcServer(opts: IpcServerOptions): Promise<IpcServer
         reply({ v: IPC_PROTOCOL_VERSION, ok: false, error: parsed.error });
         return;
       }
+      const request = parsed.request;
+      // A request type this run has no handler for is refused the same way an
+      // unknown type is, so a reviewer cannot reach the spawn path and an
+      // orchestrator cannot reach the review one.
+      if ((request.t === "spawn" && !opts.onSpawn) || (request.t === "review" && !opts.onReview)) {
+        opts.onConnection?.("rejected", `no ${request.t} handler on this channel`);
+        reply({ v: IPC_PROTOCOL_VERSION, ok: false, error: `unknown request type` });
+        return;
+      }
 
       opts.onConnection?.("accepted");
       void (async () => {
         try {
-          const outcome = await opts.onSpawn(parsed.request);
+          const outcome: HandlerOutcome =
+            request.t === "spawn"
+              ? await opts.onSpawn!(request)
+              : await opts.onReview!({
+                  body: request.body,
+                  ...(request.path !== undefined ? { path: request.path } : {}),
+                  ...(request.line !== undefined ? { line: request.line } : {}),
+                });
           reply({
             v: IPC_PROTOCOL_VERSION,
             ok: outcome.status === "ok",
             status: outcome.status,
             summary: outcome.summary,
+            ...(outcome.posted !== undefined ? { posted: outcome.posted } : {}),
+            ...(outcome.remaining !== undefined ? { remaining: outcome.remaining } : {}),
           });
         } catch (err) {
           reply({
