@@ -19,15 +19,15 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "../../deploy/configure-env.sh");
 const SETUP = path.join(HERE, "../../deploy/setup-factory.sh");
 
-/** The env file a fresh VPS gets: `.env.example` with its commented defaults. */
+/**
+ * The env file a fresh VPS actually gets: `setup-factory.sh` installs
+ * `.env.example`, so this reads that file rather than a hand-copy of it. A copy
+ * would let a rename in `.env.example` pass every test here while the deployed
+ * default stayed commented-out and unreachable — which is the exact bug this
+ * script exists to prevent.
+ */
 function exampleEnv(): string {
-  return [
-    "# Agent graphs (phase 2.2)",
-    "# FACTORY_IPC_BIND=127.0.0.1   loopback works on Docker Desktop.",
-    "# FACTORY_IPC_PORT=0           0 = let the OS pick.",
-    "REPO_PATH=/home/pi/repos/app",
-    "",
-  ].join("\n");
+  return `${fs.readFileSync(path.join(HERE, "../../.env.example"), "utf8")}\n`;
 }
 
 function configure(envFile: string, os: string): { code: number; out: string; err: string } {
@@ -50,12 +50,12 @@ function configure(envFile: string, os: string): { code: number; out: string; er
   }
 }
 
-/** Live (not commented) `FACTORY_IPC_BIND` assignments, in file order. */
-function liveLines(envFile: string): string[] {
+/** Live (not commented) assignments for one variable, in file order. */
+function liveLines(envFile: string, name = "FACTORY_IPC_BIND"): string[] {
   return fs
     .readFileSync(envFile, "utf8")
     .split("\n")
-    .filter((line) => /^\s*FACTORY_IPC_BIND=/.test(line));
+    .filter((line) => new RegExp(`^\\s*${name}=`).test(line));
 }
 
 let dir: string;
@@ -98,14 +98,53 @@ describe("configure_factory_env", () => {
   it("comments the exposure it is accepting, at the line where it writes it", () => {
     configure(envFile, "Linux");
     const written = fs.readFileSync(envFile, "utf8");
-    const block = written.slice(written.indexOf("# --- agent graph spawn channel"));
+    const block = written.slice(written.indexOf("# --- agent graph + PR review spawn channel"));
 
     // Why the default is wrong / what the widened port is gated by / what to do
     // about it at the firewall.
     expect(block).toContain("docker bridge");
     expect(block).toMatch(/per-run token|token gates/i);
     expect(block).toMatch(/firewall/);
-    expect(block.trimEnd().endsWith("FACTORY_IPC_BIND=0.0.0.0")).toBe(true);
+    expect(block).toContain("FACTORY_IPC_BIND=0.0.0.0");
+  });
+
+  /**
+   * The half open-issues #4 missed. Widening the bind is useless if the name the
+   * container dials does not resolve, and Docker Engine on Linux never defines
+   * `host.docker.internal` — so this second line is the other half of the same
+   * one requirement, and it has to be written by the same install step.
+   */
+  it("writes the add-host mapping that makes the hostname resolve at all", () => {
+    configure(envFile, "Linux");
+
+    const written = fs.readFileSync(envFile, "utf8");
+    const block = written.slice(written.indexOf("# Docker Engine on Linux"));
+
+    expect(block).toContain("does not define host.docker.internal");
+    expect(block).toContain("FACTORY_IPC_ADD_HOST=host.docker.internal:host-gateway");
+    // And the name written is the name the host actually reads — the same
+    // parse-then-stub move as the bind test, because a wrong variable name here
+    // deploys a host that still cannot resolve anything.
+    const [addHostLine] = liveLines(envFile, "FACTORY_IPC_ADD_HOST");
+    const [name, value] = addHostLine.split("=");
+    vi.stubEnv(name, value);
+
+    expect(config.factory.ipcAddHost).toBe("host.docker.internal:host-gateway");
+  });
+
+  /**
+   * The two knobs are independent, because an operator may have set only one.
+   * Refusing to touch a file that has a hand-written bind would leave a Linux host
+   * that resolved nothing; refusing both because one was set is the bug this pins.
+   */
+  it("still writes the mapping when the operator set only the bind by hand", () => {
+    fs.writeFileSync(envFile, "FACTORY_IPC_BIND=172.17.0.1\n");
+
+    const result = configure(envFile, "Linux");
+
+    expect(result.out).toContain("FACTORY_IPC_BIND already set");
+    expect(liveLines(envFile)).toEqual(["FACTORY_IPC_BIND=172.17.0.1"]);
+    expect(liveLines(envFile, "FACTORY_IPC_ADD_HOST")).toHaveLength(1);
   });
 
   it("leaves a non-Linux host exactly as it found it", () => {
@@ -118,14 +157,19 @@ describe("configure_factory_env", () => {
     expect(liveLines(envFile)).toEqual([]);
   });
 
-  it("keeps a value the operator already set", () => {
-    fs.writeFileSync(envFile, "FACTORY_IPC_BIND=172.17.0.1\n");
+  it("keeps values the operator already set", () => {
+    const before = "FACTORY_IPC_BIND=172.17.0.1\nFACTORY_IPC_ADD_HOST=custom\n";
+    fs.writeFileSync(envFile, before);
 
     const result = configure(envFile, "Linux");
 
     expect(result.code).toBe(0);
-    expect(liveLines(envFile)).toEqual(["FACTORY_IPC_BIND=172.17.0.1"]);
-    expect(result.out).toContain("already set");
+    expect(fs.readFileSync(envFile, "utf8")).toBe(before);
+    expect(result.out).toContain("FACTORY_IPC_BIND already set");
+    expect(result.out).toContain("FACTORY_IPC_ADD_HOST already set");
+    // And the summary line stays quiet when nothing was written: an install log
+    // that claims it configured the host when it configured nothing is a lie.
+    expect(result.out).not.toContain("wrote FACTORY_IPC_BIND");
   });
 
   it("is idempotent — a re-run does not stack a second listener on the file", () => {
@@ -135,6 +179,7 @@ describe("configure_factory_env", () => {
     configure(envFile, "Linux");
 
     expect(liveLines(envFile)).toHaveLength(1);
+    expect(liveLines(envFile, "FACTORY_IPC_ADD_HOST")).toHaveLength(1);
     expect(fs.readFileSync(envFile, "utf8")).toBe(afterFirst);
   });
 
@@ -147,10 +192,9 @@ describe("configure_factory_env", () => {
     configure(envFile, "Linux");
 
     expect(liveLines(envFile)).toEqual(["FACTORY_IPC_BIND=0.0.0.0"]);
-    // the documentation line stays where it is
-    expect(fs.readFileSync(envFile, "utf8")).toContain(
-      "# FACTORY_IPC_BIND=127.0.0.1"
-    );
+    // the documentation lines stay where they are
+    expect(fs.readFileSync(envFile, "utf8")).toContain("# FACTORY_IPC_BIND=127.0.0.1");
+    expect(fs.readFileSync(envFile, "utf8")).toContain("# FACTORY_IPC_ADD_HOST=");
   });
 
   it("refuses rather than inventing an env file", () => {

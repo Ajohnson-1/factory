@@ -245,6 +245,10 @@ export async function runCardGraph(deps: GraphDeps): Promise<GraphResult> {
         activeTools: ROLES.orchestrator.activeTools,
       }),
       containerName: `factory-${deps.cardId}-orch`,
+      // Without this the orchestrator cannot resolve `host.docker.internal` on a
+      // Linux host at all, so the spawn channel is dead there whatever
+      // FACTORY_IPC_BIND says. Empty by default; see config's getter.
+      addHosts: config.factory.ipcAddHost ? [config.factory.ipcAddHost] : [],
       timeoutMs: orchestratorTimeoutMs(
         limits.timeoutMs,
         limits.maxRuns,

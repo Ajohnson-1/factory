@@ -37,6 +37,14 @@ export const config = {
     owner: () => req("GITHUB_OWNER"),
     repo: () => req("GITHUB_REPO"),
     webhookSecret: () => opt("GITHUB_WEBHOOK_SECRET"),
+    /**
+     * API root. The default is GitHub's own; it is overridable for one reason — so
+     * `scripts/review-smoke.ts` can point the real Octokit client at a local sink
+     * and assert what a review actually put on the wire. Posting factory reviews at
+     * a real repository to test them is not something an opt-in check should do
+     * unasked.
+     */
+    apiBaseUrl: () => opt("GITHUB_API_BASE_URL", "https://api.github.com"),
   },
   factory: {
     repoPath: () => req("REPO_PATH"),
@@ -143,6 +151,22 @@ export const config = {
       return num("FACTORY_IPC_SLACK_MS", 60_000);
     },
     /**
+     * The `--add-host` spec that makes the host reachable *from* a container, or
+     * empty to add nothing.
+     *
+     * This exists because widening `FACTORY_IPC_BIND` is only half the Linux fix.
+     * Docker Engine does not define `host.docker.internal` at all, so on a Linux
+     * host the name simply fails to resolve and no bind value can save it; the
+     * mapping `host.docker.internal:host-gateway` is what creates it. On Docker
+     * Desktop the name is already built in and already reaches a loopback
+     * listener, which is the arrangement `scripts/graph-smoke.ts` passes with —
+     * overriding it there would trade a Linux hole for a Mac hole. So the default
+     * is empty, and `deploy/configure-env.sh` writes the mapping on Linux only.
+     */
+    get ipcAddHost(): string {
+      return opt("FACTORY_IPC_ADD_HOST");
+    },
+    /**
      * Host path to a pi `models.json` (custom/openai-compatible endpoints),
      * mounted read-only into every agent container. Off by default: the two
      * mount paths are the agent's whole filesystem view and adding a third has
@@ -163,6 +187,35 @@ export const config = {
      */
     get agentSettingsFile(): string {
       return opt("FACTORY_AGENT_SETTINGS_FILE");
+    },
+    /**
+     * Line comments one review may post. A reviewer that gets enthusiastic about
+     * naming would otherwise turn a PR into a wall of findings, and GitHub's
+     * review API takes them all in one call, so there is no natural backpressure.
+     */
+    get reviewMaxComments(): number {
+      return Math.max(0, num("REVIEW_MAX_COMMENTS", 20));
+    },
+    /**
+     * Reviews one card may ever have, across every push to every PR.
+     *
+     * `MAX_AGENT_RUNS` cannot cover this: it counts graph children inside one
+     * attempt, and reviews are not graph children — they are triggered by GitHub
+     * events and deliberately do not appear in `agent_runs` (see
+     * `src/reviewer/reviewer.ts`'s header for why putting them there would let a
+     * PR push eat a coder's budget). Without a cap of its own, a card pushed on
+     * every CI fix has no ceiling at all.
+     */
+    get reviewMaxRunsPerCard(): number {
+      return Math.max(0, num("REVIEW_MAX_RUNS_PER_CARD", 5));
+    },
+    /** Wall clock for one review container. Falls back to `AGENT_TIMEOUT_MS`. */
+    get reviewTimeoutMs(): number {
+      return num("REVIEW_TIMEOUT_MS", config.factory.agentTimeoutMs);
+    },
+    /** Model for the reviewer; falls back to `AGENT_MODEL`, like the orchestrator. */
+    get reviewerModel(): string {
+      return opt("REVIEWER_MODEL") || opt("AGENT_MODEL");
     },
   },
 };
