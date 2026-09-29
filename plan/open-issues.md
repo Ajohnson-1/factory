@@ -265,6 +265,21 @@ happily accepts) means a container can never reach the spawn channel — every
   bullet) can close it. Do not read the `[x]` as "a container that cannot reach
   the channel produces this message" — that is an inference from a grep.
 
+- [ ] **`#4 was incomplete, and the missing half made the fixed half useless.**
+      Widening `FACTORY_IPC_BIND` only moves the *listener*. Docker Engine on Linux
+      does not define `host.docker.internal` at all — it is a Docker Desktop
+      convenience — so a container on a VPS still cannot resolve the name it dials,
+      whatever it resolves to. `addHosts` was plumbed through `buildDockerArgs` and
+      **no production caller ever set it**: `grep` found one use, in
+      `scripts/ipc-roundtrip.ts`, a spike. The docs then repeated
+      `--add-host=host.docker.internal:host-gateway` as though it were being passed.
+      Found while wiring 2.3's reviewer, which needs the same channel. Fixed
+      alongside it: `FACTORY_IPC_ADD_HOST` is a real setting, `graph.ts` and
+      `reviewer.ts` pass it, and `configure-env.sh` writes it beside the bind on
+      Linux (they are one requirement, so one install step sets both). The Linux
+      end-to-end proof is still #5's third bullet — what is new is that there is now
+      something correct for that run to verify.
+
 **Tests.** A pure-args/config test for whatever `setup-factory.sh` gains; and a
 spawn-error test asserting the message mentions the bind when the channel is
 unreachable.
@@ -304,8 +319,17 @@ unreachable.
       edit the same file, and assert either a clean serialised landing or a
       visible `MERGE CONFLICT` re-spawn — currently the orchestrator has only ever
       been observed not needing it.
-- [ ] **Reviewer cost/latency**, once 2.3 exists: it will run on every `opened` +
+- [x] **Reviewer cost/latency**, once 2.3 exists: it will run on every `opened` +
       `synchronized`, so #1 and #6 compound. That is why this plan precedes 2.3.
+      Measured now. One review of a 14-line file on a local 27B model: **238 s wall
+      clock, 26 608 input / 2 044 output tokens**, three findings, one summary — from
+      `scripts/review-smoke.ts` against a real container. The numbers land in the
+      `reviews` table (`usage_in`/`usage_out`/`usage_cache_read`, NULL when unreported,
+      same rule as `agent_runs`) and print as their own `review spend:` line in
+      `/factory status`, because a card's graph budget and its review budget are knobs
+      an operator tunes separately. This is also why `REVIEW_MAX_RUNS_PER_CARD` exists:
+      26k tokens per push, uncapped, is the compounding #6 warned about with a price
+      tag on it.
 
 ---
 
@@ -322,7 +346,8 @@ unreachable.
 - [ ] 2.1's canary run has passed once with a real key, and the result is recorded
       in `plan/2.1-secret-isolation.md` as a deviation/verification note.
 - [x] `agent_runs` carries token usage and `/factory status` shows a per-card
-      total.
+      total — and so does `reviews`, separately, which is 2.3's contribution to
+      this list.
 
 ## Notes / risks
 

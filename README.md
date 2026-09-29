@@ -160,15 +160,23 @@ hung orchestrator delays every other card. Its wall clock is therefore capped:
 `AGENT_TIMEOUT_MS × (MAX_AGENT_RUNS + 1)` — 260 minutes at the defaults — cut off
 at `ORCHESTRATOR_TIMEOUT_MS` (45 minutes), never below a single child timeout.
 
-**The bind address is a deployment decision, and `setup-factory.sh` makes it for
-you.** On a Linux host `--add-host=host.docker.internal:host-gateway` arrives at
-the docker bridge, not the host's loopback, so the default
-`FACTORY_IPC_BIND=127.0.0.1` means no container can ever reach the spawn channel:
-every `spawn_agent` fails. The installer writes `FACTORY_IPC_BIND=0.0.0.0` into
-`/etc/factory/factory.env` on Linux (`deploy/configure-env.sh`). If you took the
-Manual path below, set it yourself. The widened port can start containers, so
-keep it off any public interface at the firewall — the per-run token is what
-gates it, not the address.
+**Reaching the host is two settings, and `setup-factory.sh` makes both for you.**
+On a Linux host, a container that dials `host.docker.internal` needs the name to
+*resolve* and the host to be *listening where the name points*:
+
+- Docker Engine does not define `host.docker.internal` at all — that is a Docker
+  Desktop convenience. `FACTORY_IPC_ADD_HOST=host.docker.internal:host-gateway`
+  adds it, and `src/agent/container.ts` passes it as `--add-host` on every run.
+- `host-gateway` arrives at the docker bridge, not the host's loopback, so the
+  default `FACTORY_IPC_BIND=127.0.0.1` is unreachable even once the name resolves.
+
+Get either one wrong and every `spawn_agent` (and every `post_review`) fails, with
+the container's own error naming `FACTORY_IPC_BIND`. The installer writes both
+lines into `/etc/factory/factory.env` on Linux (`deploy/configure-env.sh`) and
+leaves them alone on Docker Desktop, where the defaults are the working
+arrangement. If you took the Manual path below, set them yourself. The widened
+port can start containers and post to GitHub, so keep it off any public interface
+at the firewall — the per-run token is what gates it, not the address.
 
 | Knob | Default | What it decides |
 | --- | --- | --- |
@@ -179,9 +187,14 @@ gates it, not the address.
 | `MAX_AGENT_RUNS` | `12` | child runs per card, **per attempt** — see below |
 | `AGENT_MODEL` / `ORCHESTRATOR_MODEL` | pi's default | model per child / for the long-lived planner |
 | `AGENT_MEMORY` / `AGENT_CPUS` | `2g` / `1` | caps on **each** container |
-| `FACTORY_IPC_BIND` / `_PORT` | `127.0.0.1` / `0` | where the host listens for spawn requests |
+| `FACTORY_IPC_BIND` / `_PORT` | `127.0.0.1` / `0` | where the host listens for container requests |
+| `FACTORY_IPC_ADD_HOST` | unset | `--add-host` spec; required on Linux, see below |
 | `FACTORY_IPC_SLACK_MS` | `60000` | how much longer the in-container tool waits than the host |
 | `FACTORY_AGENT_MODELS_FILE` / `_SETTINGS_FILE` | unset | mount a `models.json` / `settings.json` into agent containers |
+| `REVIEW_MAX_COMMENTS` | `20` | line comments one review may post |
+| `REVIEW_MAX_RUNS_PER_CARD` | `5` | distinct PR heads a card may ever have reviewed |
+| `REVIEWER_MODEL` | `AGENT_MODEL` | model for reviews — usually the cheap one |
+| `REVIEW_TIMEOUT_MS` | `AGENT_TIMEOUT_MS` | wall clock for one review container |
 
 `MAX_AGENT_RUNS` is counted per **attempt**, and an attempt is one trip through
 the queue: a re-drag to Ready, or `/factory retry`, re-queues the card at
@@ -193,6 +206,47 @@ Cost is recorded, not just counted: every run's `usage` lands in `agent_runs`
 (`usage_in`, `usage_out`, `usage_cache_read`) and `/factory status` prints a
 per-card total. Rows left `running` by a process that died mid-card are swept at
 boot and marked `reaped`, so the status view cannot lie about what is in flight.
+
+### The PR reviewer (phase 2.3)
+
+A `pull_request` webhook with action `opened` or `synchronized` on a
+`factory/<card>` branch starts a review:
+
+```
+webhook → claim (pr_number, head_sha) in the store   ← refuses a redelivery
+        → detached `git worktree` at exactly that commit
+        → reviewer container: read / grep / find / ls / bash + post_review
+        → each finding posted by the host, as it is made
+        → worktree removed, review row closed out
+```
+
+What it checks, in the order its charter gives them: correctness (including
+boundaries and error paths), then missing tests for new behaviour, then clarity. A
+review with no findings is a valid review, and it says so. It cannot edit, commit,
+approve, request changes, or merge.
+
+Three things about the shape are worth knowing before you change it:
+
+- **The reviewer never holds `GITHUB_TOKEN`.** It calls a `post_review` tool that
+  goes over the same IPC channel the orchestrator's `spawn_agent` uses, and the
+  host posts. It also *validates* before posting: a comment on a file outside the
+  diff, or on a line past the end of the file's new version, is refused with the
+  reason, because GitHub's API would otherwise accept it and leave it pointing at
+  nothing in a bot's name.
+- **It posts as it works, so a review is never lost.** A reviewer that runs out of
+  time has already put its earlier findings on the PR. If it used no tool at all,
+  its final text is posted as the summary instead.
+- **Reviews live in `reviews`, not `agent_runs`.** A push is not a graph child, and
+  counting reviews against `MAX_AGENT_RUNS` would let a noisy branch starve a card
+  of the budget it needs to do its work. `REVIEW_MAX_RUNS_PER_CARD` is the
+  reviewer's own limit, and its spend is a separate line in `/factory status`.
+
+De-duplication is on `(pr_number, head_sha)`: a redelivered `opened` for a head
+that is running or already reviewed is refused before a container starts, and a
+new push is a new head and gets a fresh review. Draft PRs are not reviewed —
+`opened` fires for those too, and a draft is an author saying the diff is not
+finished. Nothing here is triggered by a card reaching `review` in Trello; the
+GitHub event is the only trigger.
 
 ### Manual (any VPS)
 
