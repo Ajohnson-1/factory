@@ -112,16 +112,84 @@ describe("addComment", () => {
 
 describe("createWebhook", () => {
   it("POSTs idModel + callbackURL to the top-level webhooks route", async () => {
-    fetchMock.mockResolvedValue(reply({ id: "wh1" }));
-    await trello.createWebhook("c1", "https://vps.example/webhook/trello");
+    fetchMock.mockResolvedValue(
+      reply({ id: "wh1", idModel: "board-1", callbackURL: "https://vps.example/webhook/trello", active: true })
+    );
+    const created = await trello.createWebhook("board-1", "https://vps.example/webhook/trello");
 
     const [url, init] = called();
     expect(new URL(url).pathname).toBe("/1/webhooks");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(String(init?.body))).toEqual({
       callbackURL: "https://vps.example/webhook/trello",
-      idModel: "c1",
+      idModel: "board-1",
       description: "factory",
     });
+    // The id comes back: it is the only handle on deleting the registration
+    // again, and webhooks belong to the token that created them.
+    expect(created).toMatchObject({ id: "wh1", idModel: "board-1" });
+  });
+
+  it("carries the documented query parameters as well as the body", async () => {
+    // Trello's spec declares `callbackURL` / `idModel` / `description` as query
+    // parameters and defines no request body for this operation. Which form the
+    // live API honours has never been observed here, so both are sent.
+    fetchMock.mockResolvedValue(reply({ id: "wh1" }));
+    await trello.createWebhook("board-1", "https://vps.example/webhook/trello");
+
+    const params = new URL(called()[0]).searchParams;
+    expect(params.get("callbackURL")).toBe("https://vps.example/webhook/trello");
+    expect(params.get("idModel")).toBe("board-1");
+    expect(params.get("description")).toBe("factory");
+    expect(params.get("key")).toBe("apikey");
+    expect(params.get("token")).toBe("usertoken");
+    expect(new URL(called()[0]).search.slice(1)).not.toContain("?");
+  });
+
+  it("takes a board id as idModel, not a card id", async () => {
+    // The parameter used to be called `cardId`, which is what led README to tell
+    // operators to add one webhook per card from a card menu that does not exist.
+    fetchMock.mockResolvedValue(reply({ id: "wh2" }));
+    await trello.createWebhook("board-1", "https://vps.example/webhook/trello", "board hook");
+
+    expect(JSON.parse(String(called()[1]?.body))).toMatchObject({
+      idModel: "board-1",
+      description: "board hook",
+    });
+  });
+});
+
+describe("listWebhooks", () => {
+  it("GETs the token's own webhooks, with the token in the path", async () => {
+    fetchMock.mockResolvedValue(reply([{ id: "wh1", idModel: "board-1", callbackURL: "https://x/y" }]));
+
+    const hooks = await trello.listWebhooks();
+
+    const [url, init] = called();
+    expect(new URL(url).pathname).toBe("/1/tokens/usertoken/webhooks");
+    expect(init).toBeUndefined();
+    expect(hooks).toEqual([{ id: "wh1", idModel: "board-1", callbackURL: "https://x/y" }]);
+  });
+
+  it("keeps a hostile token inside its own path segment", async () => {
+    // The token comes from the environment rather than from Trello, but it still
+    // gets the same treatment every other id gets.
+    vi.stubEnv("TRELLO_TOKEN", "../webhooks");
+    fetchMock.mockResolvedValue(reply([]));
+    await trello.listWebhooks();
+
+    expect(new URL(called()[0]).pathname).toBe("/1/tokens/..%2Fwebhooks/webhooks");
+  });
+});
+
+describe("deleteWebhook", () => {
+  it("DELETEs /webhooks/{id}", async () => {
+    fetchMock.mockResolvedValue(reply({}));
+
+    await trello.deleteWebhook("wh1");
+
+    const [url, init] = called();
+    expect(new URL(url).pathname).toBe("/1/webhooks/wh1");
+    expect(init?.method).toBe("DELETE");
   });
 });

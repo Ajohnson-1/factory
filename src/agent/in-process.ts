@@ -2,10 +2,10 @@
  * In-process agent runtime — local dev convenience, NOT a security boundary.
  *
  * The agent shares this process, so it inherits the whole orchestrator
- * environment (`TRELLO_*`, `GITHUB_TOKEN`, `DISCORD_BOT_TOKEN`, `WEBHOOK_SECRET`)
- * and can read any file the factory user can, including `<repo>/.env`. Use the
- * container runtime (`AGENT_RUNTIME=container`, the default) anywhere real
- * secrets are present. See plan/2.1-secret-isolation.md.
+ * environment (`TRELLO_*` including `TRELLO_APP_SECRET`, `GITHUB_TOKEN`,
+ * `DISCORD_BOT_TOKEN`) and can read any file the factory user can, including
+ * `<repo>/.env`. Use the container runtime (`AGENT_RUNTIME=container`, the
+ * default) anywhere real secrets are present. See plan/2.1-secret-isolation.md.
  */
 import {
   createAgentSession,

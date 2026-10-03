@@ -58,7 +58,7 @@ import {
 import { runAgentProcess } from "../../src/agent/in-process.js";
 import { createStore, type Store } from "../../src/state/store.js";
 import type { DiscordBot } from "../../src/discord/bot.js";
-import type { TrelloCard } from "../../src/trello/client.js";
+import type { TrelloCard, TrelloWebhook } from "../../src/trello/client.js";
 import { makeTempDir, removeTempDir } from "../helpers/tmp.js";
 
 type TrelloClient = typeof import("../../src/trello/client.js").trello;
@@ -119,7 +119,18 @@ beforeEach(() => {
     getCard: vi.fn(async (_cardId: string): Promise<TrelloCard> => CARD),
     moveCard: vi.fn(async (_cardId: string, _listId: string): Promise<void> => {}),
     addComment: vi.fn(async (_cardId: string, _text: string): Promise<void> => {}),
-    createWebhook: vi.fn(async (_cardId: string, _url: string): Promise<void> => {}),
+    createWebhook: vi.fn(
+      async (_idModel: string, _url: string): Promise<TrelloWebhook> => ({
+        id: "wh-fake",
+        idModel: _idModel,
+        callbackURL: _url,
+        active: true,
+      })
+    ),
+    // Unused by a card run, present because `RunCardDeps["trello"]` is
+    // `typeof trello` — the whole client, so the fake has to be the whole client.
+    listWebhooks: vi.fn(async (): Promise<TrelloWebhook[]> => []),
+    deleteWebhook: vi.fn(async (_webhookId: string): Promise<void> => {}),
   };
 
   ciState = "passed";

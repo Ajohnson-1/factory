@@ -183,9 +183,9 @@ describe("agent container (real image)", () => {
       for (const forbidden of [
         "TRELLO_API_KEY",
         "TRELLO_TOKEN",
+        "TRELLO_APP_SECRET",
         "GITHUB_TOKEN",
         "DISCORD_BOT_TOKEN",
-        "WEBHOOK_SECRET",
         "GITHUB_WEBHOOK_SECRET",
         "REPO_PATH",
       ]) {

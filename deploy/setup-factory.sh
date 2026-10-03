@@ -286,7 +286,13 @@ cat <<'DONE'
      start a container whose git config embeds credentials.
   3. Start:                  systemctl start factory
   4. Webhooks:
-       Trello  card webhook -> https://<domain>/webhook/trello
+       Trello  one BOARD webhook, registered from the API (there is no Trello
+               webhook UI, and no per-card step):
+                 TRELLO_WEBHOOK_URL=https://<domain>/webhook/trello \
+                   npm run register:trello-webhooks
+               Run it AFTER starting the factory: Trello HEADs the callback URL
+               and creates nothing unless that answers 200. Needs
+               TRELLO_APP_SECRET for the factory to verify deliveries with.
        GitHub  repo webhook -> https://<domain>/webhook/github  (Pull requests only)
   5. Verify egress filter:   nft list ruleset | grep factory
                              (test: sudo -u pi curl -sI https://example.com -> dropped)

@@ -27,6 +27,32 @@ export const config = {
     readyListId: () => req("READY_LIST_ID"),
     reviewListId: () => req("REVIEW_LIST_ID"),
     doneListId: () => req("DONE_LIST_ID"),
+    /**
+     * The OAuth 1.0 app secret from https://trello.com/apps/admin. Trello signs
+     * every delivery with it (`X-Trello-Webhook`) and there is no other inbound
+     * credential available, because Trello cannot set custom request headers.
+     *
+     * Optional in the type, mandatory in behaviour: `verifyTrelloSignature`
+     * refuses every delivery while it is unset. It used to be the reverse — an
+     * unset `WEBHOOK_SECRET` left `/webhook/trello` open to anyone who could
+     * reach it, and a set one locked out Trello itself.
+     */
+    appSecret: () => opt("TRELLO_APP_SECRET"),
+    /**
+     * Our own public callback URL, e.g. https://vps.example/webhook/trello.
+     * Part of the signed content: the docs say the body is hashed with "the
+     * callbackURL exactly as it was provided during webhook creation", so a
+     * trailing slash here that the registration did not use is a signature
+     * mismatch, not a typo. Same value the registration script sends.
+     */
+    webhookUrl: () => opt("TRELLO_WEBHOOK_URL"),
+    /**
+     * Debug capture: append every inbound delivery to this file as JSON lines.
+     * Raw bodies contain card names and descriptions, so this is a path an
+     * operator sets deliberately on the host, and nothing here sends a body to
+     * Discord or to the normal log. Empty disables it.
+     */
+    webhookDebugFile: () => opt("TRELLO_WEBHOOK_DEBUG_FILE"),
   },
   discord: {
     botToken: () => req("DISCORD_BOT_TOKEN"),
@@ -51,9 +77,6 @@ export const config = {
     // Getters (not snapshot-at-import) so `vi.stubEnv` works per test.
     get webhookPort(): number {
       return num("WEBHOOK_PORT", 8787);
-    },
-    get webhookSecret(): string {
-      return opt("WEBHOOK_SECRET");
     },
     get ciTimeoutMs(): number {
       return num("CI_TIMEOUT_MS", 15 * 60_000);

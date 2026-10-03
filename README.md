@@ -30,9 +30,30 @@ so the service user cannot even open it.
 1. Create an API key + token at https://trello.com/app-key
 2. In the board, create lists: **Ready**, **Review**, **Done**
 3. Note the board ID and list IDs (visible in the URL when you open them)
-4. For each card you want the factory to pick up, add a webhook pointing at
-   `https://<your-vps>/webhook/trello` (card menu → Webhooks), or call
-   `trello.createWebhook(cardId, url)` from code
+4. Register one **board-level** webhook against the public route the factory
+   serves. Do it with the script, not from the Trello UI — there is no webhook UI
+   ("webhooks are only accessible through the API currently"), and not per card:
+   `updateCard` fires for a webhook on the board, so a single registration covers
+   every card anyone drags into Ready, now and later.
+
+   ```bash
+   # the factory must already be running and reachable: Trello HEADs the
+   # callback URL and creates nothing unless that answers 200
+   TRELLO_WEBHOOK_URL=https://<your-vps>/webhook/trello \
+     npm run register:trello-webhooks            # add --dry-run to just look
+   ```
+
+   Deliveries are authenticated with `TRELLO_APP_SECRET` — Trello signs each one
+   into `X-Trello-Webhook` (HMAC-SHA1 over the body plus the callback URL, keyed
+   with the app secret from https://trello.com/apps/admin) and cannot set custom
+   headers, so there is nothing else to check. The factory refuses every delivery
+   while that secret or `TRELLO_WEBHOOK_URL` is unset.
+
+   A delivery only says a card changed; the factory then asks Trello where the
+   card *is* (`GET /1/cards/{id}`) and enqueues it only if that is Ready. The
+   payload's own list fields are deliberately not trusted — they are not
+   documented tightly enough for a trigger to depend on. Set
+   `TRELLO_WEBHOOK_DEBUG_FILE` to record raw deliveries if you need to see one.
 
 ### Discord
 
@@ -58,7 +79,7 @@ credential.
 
 | | orchestrator (host) | agent container |
 |---|---|---|
-| credentials | `TRELLO_*`, `GITHUB_TOKEN`, `DISCORD_BOT_TOKEN`, `WEBHOOK_SECRET`, `GITHUB_WEBHOOK_SECRET` | `PATH`, `HOME`, and only the provider API keys that are set — allowlisted in [src/agent/env.ts](src/agent/env.ts) |
+| credentials | `TRELLO_*` (including `TRELLO_APP_SECRET`), `GITHUB_TOKEN`, `DISCORD_BOT_TOKEN`, `GITHUB_WEBHOOK_SECRET` | `PATH`, `HOME`, and only the provider API keys that are set — allowlisted in [src/agent/env.ts](src/agent/env.ts) |
 | filesystem | the whole disk | the card's worktree at `/work` (rw) + the repo's shared `.git` (ro) |
 | git | commit, push, open the PR | `log`/`diff`/`status`; cannot commit, push or rewrite refs |
 
@@ -283,7 +304,9 @@ SupplementaryGroups=docker
 WantedBy=multi-user.target
 ```
 
-Caddyfile (Trello webhooks need public HTTPS):
+Caddyfile (Trello webhooks need public HTTPS — Trello also HEADs this URL before
+it will register a webhook, so the route has to answer 200 on `HEAD
+/webhook/trello`):
 
 ```
 factory.example.com {

@@ -46,17 +46,41 @@ describe("config.factory defaults", () => {
   });
 
   it("has empty webhook secrets by default", () => {
-    vi.stubEnv("WEBHOOK_SECRET", undefined);
+    vi.stubEnv("TRELLO_APP_SECRET", undefined);
+    vi.stubEnv("TRELLO_WEBHOOK_URL", undefined);
     vi.stubEnv("GITHUB_WEBHOOK_SECRET", undefined);
-    expect(config.factory.webhookSecret).toBe("");
+    expect(config.trello.appSecret()).toBe("");
+    expect(config.trello.webhookUrl()).toBe("");
     expect(config.github.webhookSecret()).toBe("");
   });
 
   it("picks up secrets when they are set", () => {
-    vi.stubEnv("WEBHOOK_SECRET", "s3cret");
+    vi.stubEnv("TRELLO_APP_SECRET", "appsecret");
+    vi.stubEnv("TRELLO_WEBHOOK_URL", "https://vps.example/webhook/trello");
     vi.stubEnv("GITHUB_WEBHOOK_SECRET", "ghsecret");
-    expect(config.factory.webhookSecret).toBe("s3cret");
+    expect(config.trello.appSecret()).toBe("appsecret");
+    expect(config.trello.webhookUrl()).toBe("https://vps.example/webhook/trello");
     expect(config.github.webhookSecret()).toBe("ghsecret");
+  });
+
+  it("keeps the delivery capture off unless a file is named", () => {
+    vi.stubEnv("TRELLO_WEBHOOK_DEBUG_FILE", undefined);
+    expect(config.trello.webhookDebugFile()).toBe("");
+
+    vi.stubEnv("TRELLO_WEBHOOK_DEBUG_FILE", "");
+    expect(config.trello.webhookDebugFile()).toBe("");
+
+    vi.stubEnv("TRELLO_WEBHOOK_DEBUG_FILE", "/var/log/factory/deliveries.jsonl");
+    expect(config.trello.webhookDebugFile()).toBe("/var/log/factory/deliveries.jsonl");
+  });
+
+  it("has no WEBHOOK_SECRET left to misconfigure", () => {
+    // Gone in 2.4. Trello cannot set custom request headers, so the old
+    // `x-webhook-secret` gate was unusable in both states: set, it 401'd every
+    // real delivery; unset, it left an open endpoint that enqueues paid runs.
+    // A secret that gates *nothing* must not come back as a quiet `opt()`.
+    vi.stubEnv("WEBHOOK_SECRET", "anything");
+    expect(Object.hasOwn(config.factory, "webhookSecret")).toBe(false);
   });
 
   it("is read at call time, not at import time", () => {
