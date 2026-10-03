@@ -21,18 +21,25 @@ agents (pi); Discord is the command center.
   tool fans out spec-writer / researcher / coder / verifier in parallel worktrees.
 - [2.3 — PR reviewer](2.3-pr-reviewer.md) — reviewer agent pulls down factory PRs on
   create/update and posts PR comments (summary + line comments).
-- [2.4 — Trello trigger](2.4-trello-trigger.md) — **a card moved to Ready does not
-  start work today.** Trello's real webhook payload is not the shape
-  `src/trello/webhook.ts` parses, the server has no `HEAD` route so Trello refuses
-  to create the webhook, and the one auth header on that route is one Trello cannot
-  send. Recommends polling the Ready list over fixing all three. Do this before
-  anything that depends on the trigger firing.
+- [2.4 — Trello trigger](2.4-trello-trigger.md) — **implemented (Option B: real
+  webhook payload, `HEAD` route, `X-Trello-Webhook` verified fail-closed, board
+  webhook registered by script), and still unverified.** Three independent reasons
+  a card moved to Ready started nothing: Trello's payload is not the shape
+  `src/trello/webhook.ts` parsed, there was no `HEAD` route so Trello refused to
+  create the webhook, and the one auth header on that route is one Trello cannot
+  send. Polling the Ready list was recommended and was not chosen; it remains the
+  fallback in that file. **The definition of done is not met** — no real delivery
+  has been observed, and `TRELLO_WEBHOOK_DEBUG_FILE` is how one gets recorded.
+  `plan/HANDOFF-2.4.md` holds the gate and the twelve facts that cost
+  verification.
 - [2.5 — Multiple repositories](2.5-multi-repo.md) — N repos, one Trello board and
   one Discord channel each. Maps the ten single-repo assumptions that block it —
   two of which are live cross-repo bugs rather than gaps: worktree directories
   shared by sibling clones, and a `reviews` primary key built on a per-repo PR
   number — plus the seams that are *already* multi-tenant and must not be redone.
-  Needs 2.4 first.
+  Needs 2.4 first; `HANDOFF-2.4.md` names the one decision it inherits (route N
+  boards on `webhook.idModel`, or per-board callback URLs the router does not yet
+  parse).
 - [Open issues](open-issues.md) — defects and operator-facing holes left by 2.1–2.2
   (run budget that never resets, unbounded orchestrator wall clock, stale
   `agent_runs`, undocumented deploy knobs, unmeasured token spend). Do before or
