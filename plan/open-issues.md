@@ -379,6 +379,20 @@ already loaded at the time.
 
 - [ ] Determine why `prebuild-install` timed out, or accept the compile fallback
       as the answer and say so here in one line.
+- [ ] **Third blocker, same deploy, and this one was total:** the script ran
+      `npm install --omit=dev` and then `npm run build`, but `build` is `tsc` and
+      `typescript` is a devDependency. A fresh tree therefore cannot compile
+      itself — measured, not inferred: an `--omit=dev` install of exactly this
+      `package.json` leaves `node_modules/.bin` holding only
+      `pi prebuild-install rc semver`. The build step got as far as
+      `sh: 1: tsc: not found`.
+      Fixed by installing fully, building, then `npm prune --omit=dev` so the
+      service still ends up without test tooling — verified on a clean copy of the
+      tree: install → `tsc` present; build → exit 0 with `dist/index.js`; prune →
+      `tsc` gone, `better-sqlite3` and `dist/` survive, `dist/config.js` still
+      loads. The same omission is why `register:trello-webhooks` cannot run after
+      deploy (`scripts/` isn't compiled and `tsx` is a devDep), so the installer
+      now prints that instead of leaving it to be rediscovered.
 - [ ] `setup-factory.sh` still has no test for its own package list or allowlist.
       `test/deploy/configure-env.test.ts` reads the script as text for the sourcing
       lines; a missing apt package or a host out of sync between `ALLOW_HOSTS` and
@@ -393,8 +407,16 @@ already loaded at the time.
       observed run in `graph-smoke.ts`).
 - [x] No path exists where a hung agent holds `store.isRunning()` true for longer
       than `ORCHESTRATOR_TIMEOUT_MS`.
-- [x] A freshly cloned VPS can be configured from `setup-factory.sh` + README
+- [ ] A freshly cloned VPS can be configured from `setup-factory.sh` + README
       without reading `src/` — specifically the Linux IPC bind.
+      **This box was checked and it was wrong.** An actual fresh Debian 12 LXC
+      deploy stopped three times, none of them at the IPC bind: no C++ toolchain
+      for better-sqlite3's node-gyp fallback (`not found: make`), `release-assets.githubusercontent.com`
+      and `nodejs.org` missing from the egress allowlist, and `--omit=dev`
+      installing a tree with no `tsc` while the next line asked it to build
+      (`sh: 1: tsc: not found`). All three fixed in `deploy/setup-factory.sh`;
+      re-check this box only when a deploy runs start to finish without editing
+      anything by hand.
 - [ ] 2.1's canary run has passed once with a real key, and the result is recorded
       in `plan/2.1-secret-isolation.md` as a deviation/verification note.
 - [x] `agent_runs` carries token usage and `/factory status` shows a per-card

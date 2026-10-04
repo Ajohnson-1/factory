@@ -117,8 +117,22 @@ if [[ ! -d /home/pi/factory/.git ]]; then
   sudo -u pi git clone "$FACTORY_REPO" /home/pi/factory
 fi
 sudo -u pi bash -c 'cd /home/pi/factory && git pull --ff-only || true'
-sudo -u pi npm install --prefix /home/pi/factory --omit=dev
+# NOT `npm install --omit=dev`. This tree builds with a devDependency: `npm run
+# build` is `tsc`, and typescript is only in devDependencies, so a production-only
+# install leaves node_modules/.bin containing nothing that can compile the
+# project — on a fresh LXC the deploy died at `sh: 1: tsc: not found`. Install
+# fully, build, then prune back to production-only so the service does not keep
+# test tooling on disk. Verified on a clean copy of this tree: install -> tsc
+# present; build -> exit 0, dist/index.js; prune --omit=dev -> tsc gone,
+# better-sqlite3 and dist/ both survive, dist/config.js still loads.
+sudo -u pi npm install --prefix /home/pi/factory
 sudo -u pi npm run build --prefix /home/pi/factory
+sudo -u pi bash -c 'cd /home/pi/factory && npm prune --omit=dev'
+# `scripts/` is not compiled (tsconfig includes only src), and the one script an
+# operator needs post-deploy — register:trello-webhooks — runs under tsx, which
+# the prune just removed. Say it out loud rather than letting the next person
+# rediscover it as "tsx: not found":
+log "note: tsx was pruned with the other dev deps. Install it (npm install --no-save tsx) before running npm run register:trello-webhooks."
 
 # ------------------------------------------------------------- secrets file
 # The orchestrator is the only thing that holds secrets, and the agent
