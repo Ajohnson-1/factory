@@ -297,6 +297,22 @@ unreachable.
       arm64), `--user <uid>:<gid>` + `chmod 0777 /home/agent` letting pi write
       `~/.pi/agent`, and Discord receiving per-tool embeds from a real container
       stream.
+      *(First clause advanced 2026-10-04, from a deploy attempt rather than from
+      reading: `docker build --pull --platform linux/amd64 --build-arg
+      PI_VERSION=0.84.4 -f factory-agent.Dockerfile deploy/docker` exited 0, the
+      Dockerfile's own import self-check (`pi-ai` / `defineTool` through
+      `/opt/factory/node_modules`) passed inside the amd64 layers, and the
+      resulting image ran — `docker run --rm --platform linux/amd64
+      factory-agent --version` → `0.84.4`, matching `package-lock.json`, with both
+      `spawn-agent.ts` and `post-review.ts` baked in.
+      **Label it correctly: that is amd64 code executed under emulation on
+      arm64, not a build on amd64 hardware.** It proves the Dockerfile and the
+      pinned pi version, which is what the installer's `exit 1` guards; it does not
+      rule out a native-only defect, and the remaining two clauses — the
+      `--user`/`HOME` writability question and real Discord embeds — still need the
+      container itself. Found while deploying rather than while reading: the image
+      build is not where that deploy died, `npm install` for better-sqlite3 was —
+      see the toolchain/allowlist fix in `deploy/setup-factory.sh`.)*
 - [ ] **The Linux IPC bind question** — same as #4 but the empirical half: prove a
       widened bind + token actually works end to end on Linux, since #9 of the
       handoff's pi facts is a documented inference, not an observation.
@@ -332,6 +348,42 @@ unreachable.
       tag on it.
 
 ---
+
+## 7. A fresh LXC deploy died in `npm install`, and only half of it is explained
+
+**Found by doing the 2.4 gate deploy rather than by reading the docs.** On a
+clean Debian 12 Proxmox LXC, `setup-factory.sh` aborted at `sudo -u pi npm install
+--omit=dev`:
+
+```
+prebuild-install warn install Request timed out
+gyp ERR! stack Error: not found: make
+```
+
+Fixed in `deploy/setup-factory.sh` (commit `4563203`): `build-essential` +
+`python3` + `sudo` are installed, and `release-assets.githubusercontent.com` +
+`nodejs.org` joined the egress allowlist — the first because a GitHub release
+asset only 200s after redirecting there (the allowlist already had its two
+neighbours), the second because node-gyp fetches headers from it. Without those
+two hosts, a later `npm install` as uid `pi` stalls in exactly the same shape,
+and the symptom reads as a network timeout rather than a firewall drop.
+
+**What is NOT explained:** why the prebuild download timed out at all. The asset
+exists and serves 200 for `node-v127-linux-x64`, the registry was reachable (the
+deps around it installed), and the box pulls from Docker Hub fine. Candidates are
+IPv6 preference with no v6 route, or a cold CDN path — not separated. So the
+change makes the *fallback* work; it does not fix the cause. If it recurs, the
+distinguishing test is a direct `curl -4` against the asset URL versus the same
+without `-4`, and `nft list ruleset | grep factory-drop` if the rules were
+already loaded at the time.
+
+- [ ] Determine why `prebuild-install` timed out, or accept the compile fallback
+      as the answer and say so here in one line.
+- [ ] `setup-factory.sh` still has no test for its own package list or allowlist.
+      `test/deploy/configure-env.test.ts` reads the script as text for the sourcing
+      lines; a missing apt package or a host out of sync between `ALLOW_HOSTS` and
+      the `factory-net-apply` copy is invisible to the suite. Both of this issue's
+      bugs are exactly that class.
 
 ## Definition of done
 
