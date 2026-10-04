@@ -94,6 +94,25 @@ describe("moveCard", () => {
     expect(init?.headers).toMatchObject({ "Content-Type": "application/json" });
     expect(JSON.parse(String(init?.body))).toEqual({ idList: "list-review" });
   });
+
+  it("carries idList as a query parameter as well as in the body", async () => {
+    // Handoff fact 9: the spec declares every parameter of `PUT /cards/{id}` as
+    // `in: query` and defines no requestBody, and this call has never hit a real
+    // board. It answers 200 whether or not it honoured the move, so a body-only
+    // request that silently did nothing is undetectable from the response — the
+    // card would just never arrive in Review. Both forms go, like createWebhook.
+    // Still an assumption until someone PUTs against a scratch card.
+    fetchMock.mockResolvedValue(reply({ id: "c1" }));
+    await trello.moveCard("c1", "list-review");
+
+    const params = new URL(called()[0]).searchParams;
+    expect(params.get("idList")).toBe("list-review");
+    expect(params.get("key")).toBe("apikey");
+    expect(params.get("token")).toBe("usertoken");
+    // idList is a 24-char Trello id, so unlike `addComment` it always fits the
+    // mirror bound. If that ever stops being true the silent case comes back.
+    expect([...params.keys()].sort()).toEqual(["idList", "key", "token"]);
+  });
 });
 
 describe("addComment", () => {
@@ -107,6 +126,36 @@ describe("addComment", () => {
     expect(JSON.parse(String(init?.body))).toEqual({
       text: "Factory opened PR: https://x/y/1",
     });
+  });
+
+  it("carries text as a query parameter as well as in the body", async () => {
+    // Same reasoning as moveCard: `POST /cards/{id}/actions/comments` declares
+    // `text` in: query with no requestBody. The failure mode is a card with no
+    // PR link and no error anywhere.
+    fetchMock.mockResolvedValue(reply({ id: "a1" }));
+    await trello.addComment("c1", "Factory opened PR: https://x/y/1");
+
+    const params = new URL(called()[0]).searchParams;
+    expect(params.get("text")).toBe("Factory opened PR: https://x/y/1");
+    // The card id must not leak into the query string as an extra parameter.
+    expect([...params.keys()].sort()).toEqual(["key", "text", "token"]);
+  });
+
+  it("does not put an oversized comment into the URL", async () => {
+    // `runner.ts:245` interpolates an untruncated `Error.message` as the comment
+    // text. Mirroring that into the query string is how a call that works today
+    // starts failing with a 4xx from whatever fronted api.trello.com — so past
+    // the bound the body is the only carrier. The body was the only form this
+    // client ever sent; the risk taken here is the smaller one.
+    fetchMock.mockResolvedValue(reply({ id: "a1" }));
+    const long = `Factory run failed: ${"x".repeat(3000)}`;
+    await trello.addComment("c1", long);
+
+    const [url, init] = called();
+    expect(new URL(url).searchParams.get("text")).toBeNull();
+    expect([...new URL(url).searchParams.keys()].sort()).toEqual(["key", "token"]);
+    // Still sent, still whole.
+    expect(JSON.parse(String(init?.body))).toEqual({ text: long });
   });
 });
 
