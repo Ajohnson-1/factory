@@ -393,6 +393,34 @@ already loaded at the time.
       loads. The same omission is why `register:trello-webhooks` cannot run after
       deploy (`scripts/` isn't compiled and `tsx` is a devDep), so the installer
       now prints that instead of leaving it to be rediscovered.
+- [ ] **Fourth blocker, same deploy: the egress step could never have worked.**
+      `factory-net-apply` writes `/etc/nftables.d/factory.nft`, but Debian's
+      `nftables` package ships `/etc/nftables.conf` and creates no
+      `/etc/nftables.d` (`dpkg -L nftables` → two entries, `/etc` and
+      `/etc/nftables.conf`). The redirect therefore fails with
+      `No such file or directory`, and under `set -e` that ended the whole
+      install — after the image build and the systemd unit, so the deploy looked
+      complete but the security filter had never been applied.
+      Fixed with `install -d -m 755 /etc/nftables.d` inside the generator, then
+      verified by extracting the generated script and running it on
+      `debian:12-slim --privileged`: absent dir → `rc=0`,
+      `[net] egress rules applied for uid 1000 (52 allowlisted IPs)`, table and
+      set live.
+      **A second defect surfaced while testing that, and it is the quieter one:**
+      even when applied, the filter does not survive a reboot. The shipped
+      `/etc/nftables.conf` begins with `flush ruleset` and has no include for the
+      drop-in, so loading it takes `table inet factory` from 1 to 0 — measured on
+      the same container. Adding the include line does fix it (1 after boot, with
+      the `skuid` rule present), but that same `flush ruleset` would also wipe
+      whatever the docker daemon put into nft, so restarting `nftables.service`
+      would break container networking. And the package does not enable that unit
+      on a fresh install anyway (`WantedBy=sysinit.target`; the postinst only
+      enables it if it "was enabled" before). So the fix is a boot-time oneshot,
+      `factory-net.service`, which re-runs the generator — strictly better than a
+      static include because it resolves the allowlisted hostnames again instead of
+      freezing the IPs from install day. Before this, the only thing restoring the
+      filter after a reboot was the 03:00 cron: up to a day of the agent's
+      host reaching anywhere, with nothing logged.
 - [ ] `setup-factory.sh` still has no test for its own package list or allowlist.
       `test/deploy/configure-env.test.ts` reads the script as text for the sourcing
       lines; a missing apt package or a host out of sync between `ALLOW_HOSTS` and
