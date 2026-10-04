@@ -12,6 +12,9 @@ what is only documented, and what nobody has seen yet.
 - `npm test` → **666 passed, 3 skipped** (docker-gated). `npm run typecheck`
   (both configs) and `npm run build` clean. Coverage 95.41% lines overall;
   `src/trello` **100% lines / 94.23% branch**, above its 80% gate.
+  *(Recounted on the follow-up sitting before any edit: still 666 passing. After
+  the fact-9 change it is **669 passed, 3 skipped**, typecheck and build clean,
+  `src/trello` still **100% lines**. Overall lines 95.42% / branch 88.43%.)*
 - **2.4's definition of done is NOT met.** Not one real Trello delivery has been
   observed. The trigger is implemented, unit-proven and dark. See "The open gate".
 - There is no `.env` in this checkout. Everything live happens on the VPS.
@@ -94,10 +97,22 @@ repo-blind (2.5's plan lists that as a live cross-repo bug, not a gap).
    `401 invalid key` while `/1/webhooks` answers `404 Cannot GET`.
 9. **The spec declares every write operation's parameters `in: query` and defines
    no `requestBody`** — `POST /webhooks`, `POST /cards/{id}/actions/comments`,
-   `PUT /cards/{id}`. This client has always sent JSON. `createWebhook` sends both
-   forms now. **`moveCard` and `addComment` still send JSON only, and neither has
-   ever been exercised against a real board.** If Trello ignores that body, cards
-   stall on the way to Review and the card comment never appears.
+   `PUT /cards/{id}`. This client has always sent JSON. **As of the follow-up
+   sitting, all three writes send both forms** — `createWebhook` did already, and
+   `moveCard`/`addComment` now append `idList` and `text` as query parameters too,
+   pinned in `test/trello/client.test.ts`. *This is de-risked, not settled:* which
+   form the live API honours is still unobserved, and the test comment says so.
+   The residual cost is that if Trello honours the body and ignores the query, two
+   calls now carry redundant parameters — harmless. The bug it removes is the other
+   direction: a 200 response to a PUT that did nothing, so a finished card never
+   reaches Review and nothing anywhere reports it. A scratch-card PUT is still the
+   way to close it for good.
+   **The one exception:** `addComment` mirrors only up to 2048 chars
+   (`MAX_QUERY_MIRROR_CHARS`), because `runner.ts:245` interpolates an
+   untruncated `Error.message` as the comment and an oversized URL is a hard 4xx
+   on a call that works today. Over the cap it is body-only, as before — an
+   acceptable gap because that path also sets the job failed and posts to Discord,
+   unlike `moveCard`, whose value is a 24-char id that always fits.
 10. **`updateCard` fires for a webhook on Card, List, Board and Member** — one
     board-level registration is correct and per-card ones were never needed.
 11. **Webhook traffic comes from `104.192.142.240/28`** (and
@@ -113,19 +128,34 @@ repo-blind (2.5's plan lists that as a live cross-repo bug, not a gap).
 
 ## The open gate — four things, and the first one is a question about existence
 
-1. **Do you have an application secret?** Open `trello.com/apps/admin`, Trello
-   Auth tab. If there is no app and only an API key, Option B cannot authenticate
-   and the honest move is plan steps 1–5 (the poll), not more webhook code.
+1. **Do you have an application secret?** — **ANSWERED: yes.** The owner confirmed
+   on the follow-up sitting that `trello.com/apps/admin` shows one. Option B can
+   authenticate; the poll fallback is not triggered. (If this ever reads "no app,
+   only a `trello.com/app-key` pair", stop: this route cannot verify anything and
+   plan steps 1–5 are the answer.)
 2. **Credentials + a reachable host.** `TRELLO_API_KEY`, `TRELLO_TOKEN`,
    `TRELLO_APP_SECRET`, `TRELLO_BOARD_ID`, `READY_LIST_ID`, `TRELLO_WEBHOOK_URL`,
    the factory running, Caddy terminating TLS. Registration cannot be tested
-   without it (fact 5).
+   without it (fact 5). — **BLOCKED, measured:** the VPS is offline (no ARP entry
+   on a LAN this box shares with it; 22/80/443/8787 all closed), there are no
+   credentials in this checkout, and no public HTTPS host is reachable from here.
+   Deliberately *not* substituted with a `cloudflared`-style ephemeral tunnel:
+   the URL changes on restart, `callbackURL` is inside the signed content, and a
+   rotating host produces silent 401s — the failure class this phase exists to
+   end. See "Why the capture is still not here" in the plan.
 3. **One capture.** Set `TRELLO_WEBHOOK_DEBUG_FILE`, restart, register, drag a
    card into Ready, paste the line into `plan/2.4-trello-trigger.md` under
    "Captured payload", and answer its four questions. Then delete whichever
-   signature candidate lost.
+   signature candidate lost. — **NOT DONE, and both `signedForm` candidates stay
+   in `verifyTrelloSignature`** because there is no evidence to choose between
+   them. Neither branch is "the winner" until a delivery says so.
 4. **Leave-one-live-call permission**, to settle fact 9 on a scratch card. It
-   affects code that predates this phase.
+   affects code that predates this phase. — **RESOLVED WITHOUT A LIVE CALL**: the
+   owner chose to send both forms on `moveCard`/`addComment` rather than spend a
+   PUT, which removes the silent-stall failure mode without needing credentials.
+   Bounded for `addComment` (see fact 9 — untruncated error text in a URL). The
+   first person with a token and a scratch card should still PUT once to settle
+   which form Trello actually reads.
 
 Until 3 is done, "the trigger works" is a documentation claim, not an
 observation — the exact sentence this phase exists to stop writing.
