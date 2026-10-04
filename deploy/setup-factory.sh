@@ -265,6 +265,13 @@ ELEMENTS=$(echo "$IPS" | paste -sd, -)
 [[ -n $VLLM_HOST ]] && VLLM_RULE="meta skuid $PI_UID tcp dport $VLLM_PORT ip daddr $VLLM_HOST accept"
 VLLM_RULE=${VLLM_RULE:-#}
 
+# The directory is not a thing Debian gives you: `dpkg -L nftables` ships
+# /etc/nftables.conf and nothing else, and there is no /etc/nftables.d to write
+# into. Without this line the redirect below fails with "No such file or
+# directory" and, under set -e, takes the whole deploy down with it — which is
+# exactly what happened on the 2026-10-04 LXC install.
+install -d -m 755 /etc/nftables.d
+
 cat > /etc/nftables.d/factory.nft <<NFT
 table inet factory {
     set allowed_v4 {
@@ -289,12 +296,47 @@ nft -f /etc/nftables.d/factory.nft
 echo "[net] egress rules applied for uid $PI_UID ($(echo "$IPS" | wc -l) allowlisted IPs)"
 NET
 chmod +x /usr/local/bin/factory-net-apply
+
+# Boot persistence, deliberately NOT via Debian's own config. Two facts from
+# testing this on a stock debian:12-slim with nft v1.0.6:
+#
+#   1. The shipped /etc/nftables.conf starts with `flush ruleset`, and it does not
+#      include /etc/nftables.d. Loading it at boot took the factory table from 1
+#      to 0 — the filter vanishes on reboot. Adding `include
+#      "/etc/nftables.d/*.nft"` to that file does fix it (verified: 1 after boot,
+#      with the skuid rule live), BUT that same `flush ruleset` would also wipe
+#      whatever the docker daemon put in nft when it starts, so restarting
+#      nftables.service would break container networking. Not worth it.
+#   2. The package does not enable nftables.service on a fresh install anyway
+#      (WantedBy=sysinit.target, and the postinst only enables it if it "was
+#      enabled" before), so nothing reads /etc/nftables.conf at boot regardless.
+#
+# So re-run the generator at boot instead. This is better than a static dump of
+# the include route, too: factory-net-apply resolves the allowlisted hostnames
+# afresh, and CDN/IP-shifted entries do not age into a silent drop.
+cat > /etc/systemd/system/factory-net.service <<EOF
+[Unit]
+Description=Re-apply the factory egress allowlist (resolves hostnames fresh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/factory-net-apply
+Environment=VLLM_HOST=${VLLM_HOST}
+Environment=VLLM_PORT=${VLLM_PORT}
+EOF
+systemctl daemon-reload
+systemctl enable factory-net.service
+log "boot-time egress re-apply enabled (factory-net.service)"
 VLLM_HOST="$VLLM_HOST" VLLM_PORT="$VLLM_PORT" /usr/local/bin/factory-net-apply
 
 # Refresh allowlist daily (GitHub/Trello IPs change)
 cat > /etc/cron.d/factory-net <<EOF
 0 3 * * * root VLLM_HOST=$VLLM_HOST VLLM_PORT=$VLLM_PORT /usr/local/bin/factory-net-apply
 EOF
+log "egress filter: see the note above factory-net.service before adding more writers of /etc/nftables.d — the shipped Debian config has no include for it and starts with flush ruleset"
 
 # ---------------------------------------------------------------- caddy
 if [[ -n $DOMAIN ]]; then
