@@ -427,6 +427,46 @@ already loaded at the time.
       the `factory-net-apply` copy is invisible to the suite. Both of this issue's
       bugs are exactly that class.
 
+## 8. The factory could not boot at all, and no test had ever run the line
+
+**Found by starting it on the deploy box, 2026-10-05.** `systemctl start factory`
+died instantly, and `journalctl` named the cause without meaning to:
+
+```
+url: 'https://discord.com/api/v10/applications//commands'
+code: 50035, status: 400, errors: { application_id: [Object] }
+```
+
+That empty path segment is `DiscordBot.start()` registering slash commands
+*before* `client.login()` — `client.user` is populated by login, so the id was
+`null`, `?? ""` filled it in silently, and Discord rejected the malformed route.
+`index.ts` awaits `bot.start()` before it listens, so the webhook server never
+started and `/webhook/trello` did not exist: the Trello trigger was dead for a
+reason that had nothing to do with Trello. `Restart=always` turned one boot into a
+crash loop — restart counter was at **975**.
+
+**Why the suite missed it:** no test called `start()`. `test/discord/bot.test.ts`
+fakes `Client` with `user = null` and `login = vi.fn()`, so the moment anything
+executed that path the bug was visible — but nothing did. 664 green tests and
+`src/trello` at 100% lines described a service that could not start.
+
+- [x] Register commands after login; drop the `?? ""` fallback for a thrown
+      sentence naming the missing id. Two new tests in `test/discord/bot.test.ts`
+      (671 passing), and both verified to fail against the reinjected bug:
+      `expected ['put','login'] to deeply equal ['login','put']` and
+      `promise resolved "undefined" instead of rejecting`.
+- [ ] **Still true, and it is the reason this was a total outage rather than a
+      degraded one:** the inbound trigger shares a boot path with Discord.
+      `main()` is `bot.start() → startWorker() → listen()`, so anything that makes
+      Discord fail at boot — a revoked token, a Discord API 5xx, no route to
+      `discord.com` at the right moment — means Trello is never served. Decide on
+      purpose whether the webhook server should come up independently and treat a
+      Discord failure as degraded-but-running, or stay fatal-by-design; either
+      answer is defensible, drifting into the first state by accident is not.
+- [ ] Nothing in the suite asserts anything about `index.ts`'s boot order. If the
+      answer above is "listen first", the test is that a dead Discord still
+      answers `HEAD /webhook/trello` with 200.
+
 ## Definition of done
 
 - [x] `npm test` green, with the #1 regression test failing before its fix and
