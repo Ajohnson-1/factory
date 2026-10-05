@@ -20,18 +20,45 @@ import { startedEmbed } from "../../src/discord/embeds.js";
 import { createStore, type AgentRun, type Job, type Store } from "../../src/state/store.js";
 import { makeTempDir, removeTempDir } from "../helpers/tmp.js";
 
-// Only the gateway Client is faked — constructing the real one would open a
-// websocket. EmbedBuilder / REST / Routes stay real.
+// Only the gateway Client and the REST shim are faked — constructing the real
+// Client would open a websocket, and a real REST call would put the suite on
+// Discord's API. EmbedBuilder / Routes stay real.
+
+/**
+ * Recorded calls, so a test can read the path the bot actually aimed at instead
+ * of trusting that it aimed somewhere sensible.
+ */
+const discord = vi.hoisted(() => ({
+  puts: [] as string[],
+  order: [] as string[],
+  /** Whether the faked login populates `client.user`, as the real one does. */
+  loginSetsUser: true,
+}));
+
 vi.mock("discord.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("discord.js")>();
   class FakeClient {
     channels = { fetch: vi.fn() };
     user: { id: string } | null = null;
     on = vi.fn();
-    login = vi.fn();
+    login = vi.fn(async () => {
+      discord.order.push("login");
+      if (discord.loginSetsUser) this.user = { id: "app-1" };
+      return "token";
+    });
     constructor(_options?: unknown) {}
   }
-  return { ...actual, Client: FakeClient };
+  class FakeREST {
+    setToken() {
+      return this;
+    }
+    async put(path: string) {
+      discord.order.push("put");
+      discord.puts.push(path);
+      return [];
+    }
+  }
+  return { ...actual, Client: FakeClient, REST: FakeREST };
 });
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -465,6 +492,40 @@ describe("DiscordBot.onInteraction", () => {
     } finally {
       removeTempDir(dir);
     }
+  });
+});
+
+describe("DiscordBot.start", () => {
+  beforeEach(() => {
+    discord.puts.length = 0;
+    discord.order.length = 0;
+    discord.loginSetsUser = true;
+    vi.stubEnv("DISCORD_BOT_TOKEN", "bot-token");
+    vi.stubEnv("DISCORD_CHANNEL_ID", "chan");
+  });
+
+  it("logs in first, then registers against the id login produced", async () => {
+    const bot = new DiscordBot();
+
+    await bot.start();
+
+    expect(discord.order).toEqual(["login", "put"]);
+    expect(discord.puts).toEqual(["/applications/app-1/commands"]);
+  });
+
+  it("never aims at an empty application id", async () => {
+    // The bug this pins: commands were registered before login, when
+    // `client.user` is still null, and `?? ""` supplied an empty path segment.
+    // Discord answered `PUT /applications//commands` with 400 50035 ("Invalid
+    // Form Body, application_id"), `index.ts` awaits start() before it listens,
+    // and so the process died on every boot and /webhook/trello was never served
+    // — a dead Trello trigger for a reason that had nothing to do with Trello.
+    // `Restart=always` turned it into a crash loop against Discord's API.
+    discord.loginSetsUser = false;
+    const bot = new DiscordBot();
+
+    await expect(bot.start()).rejects.toThrow(/application id/);
+    expect(discord.puts).toEqual([]);
   });
 });
 

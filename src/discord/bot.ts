@@ -184,8 +184,36 @@ export class DiscordBot {
     this.channel = config.discord.channelId();
   }
 
+  /**
+   * Log in FIRST, then register slash commands.
+   *
+   * `client.user` is populated by `login()` — it is the gateway's READY payload
+   * that tells the library who it is. Registering before login therefore had no
+   * application id to use, and the old `?? ""` fallback turned that into
+   * `PUT /applications//commands`, which Discord answers 400 `50035 Invalid Form
+   * Body, application_id`. The effect was total: `index.ts` awaits `start()`
+   * before it listens, so the process died on every boot and never got as far as
+   * serving `/webhook/trello`. Observed live on the 2026-10-05 deploy:
+   * `journalctl -u factory` showed exactly that URL and that 400, and
+   * `Restart=always` had already put the service on restart #975 against
+   * Discord's API.
+   *
+   * No empty-string fallback this time: an unresolvable application id is now a
+   * thrown sentence naming what is missing, not a malformed URL halfway across
+   * the network.
+   */
   async start(): Promise<void> {
-    const rest = new REST().setToken(config.discord.botToken());
+    const token = config.discord.botToken();
+    this.client.on("interactionCreate", (i) => this.onInteraction(i));
+    await this.client.login(token);
+    const applicationId = this.client.user?.id;
+    if (!applicationId) {
+      throw new Error(
+        "[discord] logged in but client.user.id is still unset — " +
+          "cannot register /factory slash commands without an application id"
+      );
+    }
+    const rest = new REST().setToken(token);
     const commands = [
       {
         name: "factory",
@@ -210,11 +238,9 @@ export class DiscordBot {
         ],
       },
     ];
-    await rest.put(Routes.applicationCommands(this.client.user?.id ?? ""), {
+    await rest.put(Routes.applicationCommands(applicationId), {
       body: commands,
     });
-    this.client.on("interactionCreate", (i) => this.onInteraction(i));
-    await this.client.login(config.discord.botToken());
     console.log("[discord] bot online");
   }
 
