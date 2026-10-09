@@ -467,6 +467,53 @@ executed that path the bug was visible — but nothing did. 664 green tests and
       answer above is "listen first", the test is that a dead Discord still
       answers `HEAD /webhook/trello` with 200.
 
+- [ ] **`nft -f` MERGES — the "tightening" control only ever widened.** The
+      generator applied a `table inet factory { ... }` file on every run, and nft
+      treats that as add-objects, not replace-objects. Measured on nft v1.0.6:
+      two applies with disjoint element sets left **both** addresses in the set,
+      and 40 applies left 41 elements. So the daily cron was accumulating every
+      CloudFront edge it had ever resolved — a slowly loosening allowlist — while
+      at the same time being too narrow to cover the edge undici was handed that
+      minute. Both failure modes at once.
+      Fixed by refreshing only the set once the table exists:
+      `flush set inet factory allowed_v4` + `add element ...` in one validated
+      batch. Chosen over flushing the table because the chain keeps referencing
+      `@allowed_v4` the whole time, so the instant between flush and add **denies**
+      traffic instead of permitting it — the transient fails closed. Verified on
+      `debian:12-slim --privileged`: 22 runs leave exactly 52 elements, the chain
+      holds exactly one `ip daddr @allowed_v4 accept` rule throughout, and
+      `pi -> api.trello.com` returns 401 while `pi -> example.com` stays dropped,
+      so the control is intact and the failing call works.
+- [ ] **`resolve()`'s fallback turned DNS failure into garbage in the set.** It was
+      `host -4 "$h" | awk '{print $NF}'`, and a failed lookup prints
+      `... not found: 3(NXDOMAIN)` — whose last field is literally
+      `3(NXDOMAIN)`. Non-empty, so it sailed past the "did anything resolve"
+      check and landed in `elements = { ... }`; nft then rejected the whole batch
+      (`unexpected '(', expecting comma or '}'`), which would fail every refresh
+      after the one bad hostname. Found by the partial-DNS test, not by reading.
+      Now filtered to dotted-quad IPv4, so a bad answer counts as unresolved and
+      the run exits **before touching the live ruleset** — verified: `rc=1`,
+      `[net] ERROR: unresolved host(s): …`, set unchanged at 52.
+      **Not hardened by this:** the octets are pattern-matched, not range-checked,
+      so `999.1.1.1` would pass `resolve()` and be refused by `nft -c`. The
+      validator is the backstop, which is the right order, but it is a backstop.
+- [ ] Cadence is now a **5-minute timer** (`factory-net.timer` → the oneshot
+      `factory-net.service`), and `/etc/cron.d/factory-net` is **deleted** on
+      install rather than left beside it. Deliberately not the published-prefix
+      approach: the AWS `CLOUDFRONT` list is 211 v4 prefixes (every one of the
+      eight addresses in this incident is inside it), which is far broader than
+      the ~52 addresses DNS actually returns. Tight-and-fresh beats
+      broad-and-correct here. Note for whoever revisits it: `type ipv4_addr`
+      without `flags interval` **cannot hold a CIDR** — `add element ... {
+      13.225.0.0/16 }` is refused — so option 2 needs the interval flag added.
+- [ ] **Test gap, unfilled.** None of this is covered by `npm test`. A regression
+      test would stub `nft`, `getent` and `host` on `PATH` against the extracted
+      generator and assert: unresolved host ⇒ exit 1 with `nft` never called;
+      existing table ⇒ `flush set` used, not `nft -f` of the create file; and no
+      `3(NXDOMAIN)`-shaped token ever reaches an element list. The three bugs in
+      this issue were all found by running containers by hand, which does not
+      scale and is exactly how a fix gets quietly reverted.
+
 ## Definition of done
 
 - [x] `npm test` green, with the #1 regression test failing before its fix and
