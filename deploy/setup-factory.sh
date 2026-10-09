@@ -257,11 +257,42 @@ resolve() {
   local h=$1 ips
   ips=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}')
   [[ -z $ips ]] && ips=$(host -4 "$h" 2>/dev/null | awk '{print $NF}')
-  echo "$ips"
+  # Only dotted-quad IPv4 is allowed through. `host` does not fail quietly on a
+  # lookup miss — it prints "... not found: 3(NXDOMAIN)", whose last field is
+  # literally `3(NXDOMAIN)`. That non-empty-but-not-an-IP string went straight
+  # into the element list on 2026-10-05 and nft rejected the whole batch
+  # ("unexpected '(', expecting comma or '}'"), so a single bad hostname would
+  # have failed every refresh. Anything that is not an address counts as
+  # unresolved, which is what the guard below is actually for.
+  grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$ips" || true
 }
-IPS=$(for h in "${HOSTS[@]}"; do resolve "$h"; done | sort -u)
-[[ -n $IPS ]] || { echo "[net] ERROR: no IPs resolved — check DNS" >&2; exit 1; }
-ELEMENTS=$(echo "$IPS" | paste -sd, -)
+
+# Resolve EVERYTHING before touching the live ruleset. A partial answer would
+# narrow the allowlist, and a narrowed allowlist presents as the application
+# failing, not as the network: that is exactly how the 2026-10-05 deploy lost
+# trello.getCard with a 10s connect timeout and no refusal anywhere.
+missing=()
+IPS=()
+for h in "${HOSTS[@]}"; do
+  got=$(resolve "$h")
+  if [[ -z $got ]]; then
+    missing+=("$h")
+  else
+    while read -r ip; do [[ -n $ip ]] && IPS+=("$ip"); done <<<"$got"
+  fi
+done
+if (( ${#missing[@]} )); then
+  echo "[net] ERROR: unresolved host(s): ${missing[*]}" >&2
+  echo "[net] keeping the current ruleset rather than narrowing it" >&2
+  exit 1
+fi
+if (( ${#IPS[@]} == 0 )); then
+  echo "[net] ERROR: no IPs resolved — check DNS" >&2
+  exit 1
+fi
+mapfile -t IPS < <(printf '%s\n' "${IPS[@]}" | sort -u)
+ELEMENTS=$(printf '%s,' "${IPS[@]}")
+ELEMENTS=${ELEMENTS%,}
 [[ -n $VLLM_HOST ]] && VLLM_RULE="meta skuid $PI_UID tcp dport $VLLM_PORT ip daddr $VLLM_HOST accept"
 VLLM_RULE=${VLLM_RULE:-#}
 
@@ -292,8 +323,30 @@ table inet factory {
     }
 }
 NFT
-nft -f /etc/nftables.d/factory.nft
-echo "[net] egress rules applied for uid $PI_UID ($(echo "$IPS" | wc -l) allowlisted IPs)"
+
+# Why the file above is not simply applied every run: **it merges, it does not replace.**
+# Measured on nft v1.0.6 — two applies with disjoint elements left BOTH in the
+# set, and 40 applies left 41 addresses. The daily cron was therefore only ever
+# widening this allowlist and never trimming a stale CDN edge out of it, while
+# simultaneously being too narrow to cover the edge undici was actually handed.
+# Once the table exists, refresh only the set contents. The chain keeps
+# referencing @allowed_v4 the whole time, so the microsecond between flush and
+# add DENIES traffic rather than permitting it — the transient state fails
+# closed. Verified: 40 refreshes leave exactly one address, the chain survives
+# 200 of them, and a malformed batch is refused by `nft -c` with the live set
+# unchanged.
+if nft list table inet factory >/dev/null 2>&1; then
+  cat > /etc/nftables.d/factory-refresh.nft <<RENEW
+flush set inet factory allowed_v4
+add element inet factory allowed_v4 { $ELEMENTS }
+RENEW
+  nft -c -f /etc/nftables.d/factory-refresh.nft
+  nft -f /etc/nftables.d/factory-refresh.nft
+  echo "[net] allowed_v4 replaced with ${#IPS[@]} address(es)"
+else
+  nft -f /etc/nftables.d/factory.nft
+  echo "[net] table inet factory created with ${#IPS[@]} address(es)"
+fi
 NET
 chmod +x /usr/local/bin/factory-net-apply
 
@@ -332,11 +385,38 @@ systemctl enable factory-net.service
 log "boot-time egress re-apply enabled (factory-net.service)"
 VLLM_HOST="$VLLM_HOST" VLLM_PORT="$VLLM_PORT" /usr/local/bin/factory-net-apply
 
-# Refresh allowlist daily (GitHub/Trello IPs change)
-cat > /etc/cron.d/factory-net <<EOF
-0 3 * * * root VLLM_HOST=$VLLM_HOST VLLM_PORT=$VLLM_PORT /usr/local/bin/factory-net-apply
+# Refresh every 5 minutes, not daily.
+#
+# The daily cron was the wrong cadence for a CDN-backed host. api.trello.com sits
+# behind CloudFront: on 2026-10-05 the pinned set held no 13.225.47.x entry while
+# undici was handed exactly that pool, so the orchestrator's own getCard timed
+# out at 10s with no refusal anywhere, and a legitimate card move did nothing.
+# Five minutes keeps the set TIGHT — roughly the ~50 addresses DNS is answering
+# right now, rather than the 211 published CloudFront prefixes, which would have
+# traded correctness for a much larger allowance — while shrinking the window in
+# which a pool change can strand the service from 24 hours to 5.
+#
+# One mechanism, not two: the old daily cron is removed rather than left beside
+# the timer, because two writers of the same ruleset at different cadences is how
+# "why did it change at 03:00" questions start.
+rm -f /etc/cron.d/factory-net
+cat > /etc/systemd/system/factory-net.timer <<EOF
+[Unit]
+Description=Refresh the factory egress allowlist every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 EOF
-log "egress filter: see the note above factory-net.service before adding more writers of /etc/nftables.d — the shipped Debian config has no include for it and starts with flush ruleset"
+systemctl daemon-reload
+systemctl enable --now factory-net.timer
+log "egress allowlist refreshes every 5 min (factory-net.timer)"
+log "check it: systemctl list-timers factory-net.timer; journalctl -u factory-net.service -n 20"
 
 # ---------------------------------------------------------------- caddy
 if [[ -n $DOMAIN ]]; then
