@@ -1,0 +1,26 @@
+{
+  "defaultRepo": "factory",
+  "repos": {
+    "factory": {
+      "repoDir": "~/GitHub/factory",
+      "worktreeRoot": "~/GitHub/factory-factory-wt",
+      "baseBranch": "master",
+      "board": "ZHkVYBN1",
+      "deploy": { "driver": "self" },
+      "worktreeBootstrap": []
+    },
+    "discord-bot": {
+      "repoDir": "~/GitHub/discord-bot",
+      "worktreeRoot": "~/GitHub/discord-bot-factory-wt",
+      "baseBranch": "master",
+      "board": "ZHkVYBN1",
+      "deploy": { "driver": "docker-ssh" },
+      "worktreeBootstrap": [
+        "ln -s ../../discord-bot/node_modules node_modules",
+        "cp .env version.json <wt>/",
+        "mkdir -p <wt>/config <wt>/data && cp config/config.json <wt>/config/",
+        "test -f <wt>/.env || cp <factoryRoot>/.env <wt>/.env"
+      ]
+    }
+  }
+}
