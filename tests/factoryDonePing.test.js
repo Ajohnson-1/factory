@@ -24,6 +24,7 @@ import {
   pingDoneArrival,
   STATE_PATH,
 } from '../scripts/lib/factory-done-ping.js';
+import { BOARD } from '../scripts/lib/trello.js';
 import { parseFlags } from '../scripts/lib/factory-ask.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -834,4 +835,16 @@ test('23. hangman regression: pinged → dragged out (poller observes) → back 
   assert.ok(n.texts[1].includes('✅ Done') && n.texts[1].includes('Hang man'));
   assert.equal(r.lines.filter((l) => l.startsWith(`DONE ${hangman.id}`)).length, 2);
   assert.equal(s.get().seen[hangman.id], DONE); // final state: seen-Done again
+});
+
+// FM-2 (§4.3): the per-board pollers share one dedup file per board — two
+// boards alternating the single `doneListId` slot would rotate each other
+// every tick and silently miss arrivals. Default board keeps the legacy file.
+test('24. FM-2: Done-ping state is board-scoped (default board = legacy filename)', () => {
+  assert.ok(STATE_PATH().endsWith('data/factory-done-ping.json'));
+  assert.ok(STATE_PATH(undefined).endsWith('data/factory-done-ping.json'));
+  assert.equal(STATE_PATH(BOARD), STATE_PATH()); // the default board resolves byte-identically
+  const p = STATE_PATH('LLNG5MAm');
+  assert.ok(p.endsWith('data/factory-done-ping.LLNG5MAm.json'));
+  assert.notEqual(p, STATE_PATH());
 });

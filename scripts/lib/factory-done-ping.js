@@ -50,7 +50,21 @@ function envNum(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-export const STATE_PATH = () => resolve(ROOT, 'data', 'factory-done-ping.json');
+/**
+ * Dedup state file. FM-2 (§4.3): the pollers run one loop per registered
+ * board, but the dedup state records a SINGLE `doneListId` — two boards'
+ * Done-list ids written alternately would rotate each other every tick
+ * (each poller would re-baseline and silently miss arrivals). Non-default
+ * boards therefore get their own file (`factory-done-ping.<board>.json`);
+ * the default board keeps the legacy filename byte-for-byte (the inline
+ * `factory.js move` pinger shares it).
+ */
+export const STATE_PATH = (board = undefined) =>
+  resolve(
+    ROOT,
+    'data',
+    board && board !== trello.BOARD ? `factory-done-ping.${board}.json` : 'factory-done-ping.json',
+  );
 
 /**
  * Pure diff core — testable without any IO/timers.
@@ -94,11 +108,12 @@ export function detectDoneArrivals(cards, { doneListId, seen, pruned = [] } = {}
   return { arrivals, seen: { doneListId, seen: next }, baselined: false, rotated: false, pruned };
 }
 
-/** Real state reader → parsed state object, or null on missing/corrupt/unusable. */
-function defaultReadState() {
+/** Real state reader → parsed state object, or null on missing/corrupt/unusable.
+ * FM-2: takes the board so the default file is the per-board one (§4.3). */
+function defaultReadState(board = undefined) {
   let state;
   try {
-    state = JSON.parse(readFileSync(STATE_PATH(), 'utf8'));
+    state = JSON.parse(readFileSync(STATE_PATH(board), 'utf8'));
   } catch {
     return null;
   }
@@ -108,8 +123,8 @@ function defaultReadState() {
 }
 
 /** Real state writer: mkdir -p data/, temp file + rename (atomic-ish). */
-function defaultWriteState(state) {
-  const file = STATE_PATH();
+function defaultWriteState(state, board = undefined) {
+  const file = STATE_PATH(board);
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
@@ -132,10 +147,11 @@ export async function runDoneWatch({
   intervalMs = envNum('FACTORY_DONE_POLL_MS', envNum('FACTORY_POLL_MS', 15_000)),
   once = false,
   shouldStop = undefined,
+  board = undefined, // FM-2 per-board pass-through, docs/factory-migration.md §4.3
   t = trello,
   notify = sendOwnerPing,
-  readState = defaultReadState,
-  writeState = defaultWriteState,
+  readState = () => defaultReadState(board), // FM-2: defaults resolve the per-board state file (§4.3)
+  writeState = (s) => defaultWriteState(s, board),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = console.log,
 } = {}) {
@@ -147,13 +163,13 @@ export async function runDoneWatch({
     let doneListId;
     let cards;
     try {
-      const lists = await t.getLists();
+      const lists = await t.getLists({ board });
       const list = lists.find(
         (l) => !l.closed && l.name.toLowerCase() === String(listName).toLowerCase(),
       );
       if (!list) throw new Error(`No open list named "${listName}" on the board`);
       doneListId = list.id;
-      cards = await t.getBoardCards('id,name,idList,url');
+      cards = await t.getBoardCards('id,name,idList,url', { board });
     } catch (e) {
       // Includes assertCreds() throws (missing TRELLO_KEY/TRELLO_TOKEN) and a
       // missing Done list: transient — log and try again next tick.
@@ -228,10 +244,11 @@ export async function runDoneWatch({
 export async function pingDoneArrival({
   card, // { id, name, url } — the card that just landed in Done
   doneListId, // resolved Done list id (caller already knows it)
+  board = undefined, // FM-2 per-board pass-through, docs/factory-migration.md §4.3
   t = trello,
   notify = sendOwnerPing,
-  readState = defaultReadState,
-  writeState = defaultWriteState,
+  readState = () => defaultReadState(board), // FM-2: shares the poller's per-board state file (§4.3)
+  writeState = (s) => defaultWriteState(s, board),
   log = console.log,
 } = {}) {
   let state = null;
@@ -263,7 +280,7 @@ export async function pingDoneArrival({
   } else {
     // Fresh/corrupt/rotated: full baseline first, then mark this card pinged.
     try {
-      const cards = await t.getBoardCards('id,name,idList,url');
+      const cards = await t.getBoardCards('id,name,idList,url', { board });
       const built = detectDoneArrivals(cards, { doneListId, seen: null });
       next = { ...built.seen, seen: { ...built.seen.seen, [card.id]: doneListId } };
     } catch (e) {

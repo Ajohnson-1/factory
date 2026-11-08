@@ -67,40 +67,49 @@ async function request(method, path, params = {}) {
   }
 }
 
-export const getBoard = () => request('GET', `/boards/${BOARD}`, { fields: 'id,name' });
-export const getLists = () =>
-  request('GET', `/boards/${BOARD}/lists`, { fields: 'id,name,pos,closed' });
-export const getBoardCards = (fields = 'id,name,idList,labels,due,url') =>
-  request('GET', `/boards/${BOARD}/cards`, { fields, limit: 250 });
-export const getCard = (id, fields = 'id,name,desc,url,idList,labels') =>
+// FM-2 (§4.2): every exported call takes a trailing `{ board = BOARD }`
+// option; the `BOARD` default keeps today's precedence (env → .env →
+// ZHkVYBN1) so all existing single-board usage is byte-identical.
+// Board-scoped calls (getBoard/getLists/getBoardCards/getLabels) address
+// `opts.board`; card-scoped calls accept the option for interface uniformity
+// (the Trello card endpoints are card-id keyed — the board is ignored, so a
+// caller threading a board never needs to special-case which call it passes).
+const B = (opts) => opts?.board ?? BOARD;
+
+export const getBoard = (opts = {}) => request('GET', `/boards/${B(opts)}`, { fields: 'id,name' });
+export const getLists = (opts = {}) =>
+  request('GET', `/boards/${B(opts)}/lists`, { fields: 'id,name,pos,closed' });
+export const getBoardCards = (fields = 'id,name,idList,labels,due,url', opts = {}) =>
+  request('GET', `/boards/${B(opts)}/cards`, { fields, limit: 250 });
+export const getCard = (id, fields = 'id,name,desc,url,idList,labels', opts = {}) =>
   request('GET', `/cards/${id}`, { fields });
 // Bot identity for the ask protocol's author matching (factory-ask.js): { id, username, fullName, ... }
 // NOTE: the path is /members/me — /members/me/all 404s on the live API (the
 // `all` association suffix is not accepted for `me`), which had silently
 // degraded the ask protocol to tag-only mode.
-export const getMe = () => request('GET', '/members/me', { fields: 'id,username,fullName' });
-export const getCardComments = (id, limit = 50) =>
+export const getMe = (opts = {}) => request('GET', '/members/me', { fields: 'id,username,fullName' });
+export const getCardComments = (id, limit = 50, opts = {}) =>
   request('GET', `/cards/${id}/actions`, { filter: 'commentCard', limit, memberCreator: true });
 // List moves (`updateCard:idList`) with authorship: scheduler moves are made
 // with the token member (`ompbot`), UI drags by the dragging member, so
 // `memberCreator` tells a human drag from a scheduler move (the comment-resume
 // watcher's human-move trigger, scripts/lib/factory-comment-resume.js).
-export const getCardMoves = (id, limit = 25) =>
+export const getCardMoves = (id, limit = 25, opts = {}) =>
   request('GET', `/cards/${id}/actions`, { filter: 'updateCard:idList', limit, memberCreator: true });
-export const getLabels = () => request('GET', `/boards/${BOARD}/labels`, { fields: 'id,name,color' });
-export const createList = (name, idBoard) => request('POST', '/lists', { name, idBoard });
-export const createLabel = (name, color, idBoard) =>
+export const getLabels = (opts = {}) => request('GET', `/boards/${B(opts)}/labels`, { fields: 'id,name,color' });
+export const createList = (name, idBoard, opts = {}) => request('POST', '/lists', { name, idBoard });
+export const createLabel = (name, color, idBoard, opts = {}) =>
   request('POST', '/labels', { name, color, idBoard });
-export const addLabelToCard = (cardId, labelId) =>
+export const addLabelToCard = (cardId, labelId, opts = {}) =>
   request('POST', `/cards/${cardId}/idLabels`, { value: labelId });
-export const removeLabelFromCard = (cardId, labelId) =>
+export const removeLabelFromCard = (cardId, labelId, opts = {}) =>
   request('DELETE', `/cards/${cardId}/idLabels/${labelId}`);
-export const createCard = (name, idList, desc = '') =>
+export const createCard = (name, idList, desc = '', opts = {}) =>
   request('POST', '/cards', { name, idList, desc, pos: 'top' });
-export const moveCard = (cardId, listId) => request('PUT', `/cards/${cardId}`, { idList: listId });
-export const setCardClosed = (cardId, closed) => request('PUT', `/cards/${cardId}`, { closed });
-export const setCardDesc = (cardId, desc) => request('PUT', `/cards/${cardId}`, { desc });
-export const closeList = (listId) => request('PUT', `/lists/${listId}/closed`, { value: true });
-export const setListPos = (listId, pos) => request('PUT', `/lists/${listId}`, { pos });
-export const addComment = (cardId, text) =>
+export const moveCard = (cardId, listId, opts = {}) => request('PUT', `/cards/${cardId}`, { idList: listId });
+export const setCardClosed = (cardId, closed, opts = {}) => request('PUT', `/cards/${cardId}`, { closed });
+export const setCardDesc = (cardId, desc, opts = {}) => request('PUT', `/cards/${cardId}`, { desc });
+export const closeList = (listId, opts = {}) => request('PUT', `/lists/${listId}/closed`, { value: true });
+export const setListPos = (listId, pos, opts = {}) => request('PUT', `/lists/${listId}`, { pos });
+export const addComment = (cardId, text, opts = {}) =>
   request('POST', `/cards/${cardId}/actions/comments`, { text });

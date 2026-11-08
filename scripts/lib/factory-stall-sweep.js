@@ -206,10 +206,11 @@ function defaultSpawnRun(card, prompt) {
  * failure → no readyList, which handleRunCrash handles by leaving a requeue
  * decision untouched with a log line. Never rejects internally.
  */
-async function defaultRecover(card, code, { log = console.log, shuttingDown = () => false } = {}) {
+async function defaultRecover(card, code, { log = console.log, shuttingDown = () => false, board = undefined } = {}) {
   let readyList;
   try {
-    const lists = await trello.getLists();
+    // FM-2 (docs/factory-migration.md §4.3): board-scoped fetch; undefined → trello.js default board.
+    const lists = await trello.getLists({ board });
     readyList = lists.find((l) => !l.closed && String(l.name).toLowerCase() === 'ready');
   } catch (e) {
     log(`[stall-sweep] Ready list unavailable (${String(e?.message ?? e)}); requeue moves leave the card untouched`);
@@ -248,6 +249,7 @@ export async function runStallSweepWatch({
   dryRun = false,
   shouldStop = undefined,
   t = trello,
+  board = undefined, // FM-2 (docs/factory-migration.md §4.3): multi-board target for the tick's board-scoped calls; undefined → trello.js default (byte-identical)
   recover = undefined,
   isBusy = () => false,
   freeSlots = () => Infinity,
@@ -258,7 +260,7 @@ export async function runStallSweepWatch({
   log(`[stall-sweep] sweeping in-flight cards every ${intervalMs}ms, silence window ${silenceMs}ms${once ? ' (once)' : ''}${dryRun ? ' (dry-run)' : ''}`);
   const stopped = () => shouldStop?.() === true;
   const recoverCard =
-    recover ?? ((card, code) => defaultRecover(card, code, { log, shuttingDown: stopped }));
+    recover ?? ((card, code) => defaultRecover(card, code, { log, shuttingDown: stopped, board }));
   const empty = () => ({
     checked: 0,
     stalled: 0,
@@ -278,7 +280,7 @@ export async function runStallSweepWatch({
     const listNames = new Map(); // idList -> canonical in-flight list name
     const listIds = new Set();
     try {
-      const lists = await t.getLists();
+      const lists = await t.getLists({ board });
       for (const l of lists ?? []) {
         if (l.closed) continue;
         const canonical = IN_FLIGHT_LISTS.find((n) => n.toLowerCase() === String(l.name).toLowerCase());
@@ -288,7 +290,7 @@ export async function runStallSweepWatch({
         }
       }
       if (!listIds.size) throw new Error(`No open in-flight lists (${IN_FLIGHT_LISTS.join('/')}) on the board`);
-      cards = await t.getBoardCards('id,name,idList,labels,url');
+      cards = await t.getBoardCards('id,name,idList,labels,url', { board });
     } catch (e) {
       // Includes assertCreds() throws and a missing in-flight list: transient.
       log(`[stall-sweep] fetch failed: ${String(e?.message ?? e)}; skipping tick`);
@@ -382,6 +384,7 @@ export async function runStallSweepWatch({
  */
 export async function bootStallSweep({
   t = trello,
+  board = undefined, // FM-2 (docs/factory-migration.md §4.3): boot enumeration + forwarded tick sweep target this board; undefined → trello.js default (byte-identical)
   log = console.log,
   recover = undefined,
   isBusy = () => false,
@@ -391,7 +394,7 @@ export async function bootStallSweep({
   now = () => Date.now(),
 } = {}) {
   try {
-    const [lists, allCards] = await Promise.all([t.getLists(), t.getBoardCards()]);
+    const [lists, allCards] = await Promise.all([t.getLists({ board }), t.getBoardCards(undefined, { board })]);
     for (const name of IN_FLIGHT_LISTS) {
       const id = lists.find((l) => !l.closed && String(l.name).toLowerCase() === name.toLowerCase())?.id;
       for (const c of allCards.filter((c) => id && c.idList === id)) {
@@ -401,7 +404,7 @@ export async function bootStallSweep({
   } catch (e) {
     log(`[stall-sweep] boot orphan enumeration failed: ${String(e?.message ?? e)}`);
   }
-  return runStallSweepWatch({ t, once: true, log, recover, isBusy, freeSlots, silenceMs, shouldStop, now });
+  return runStallSweepWatch({ t, board, once: true, log, recover, isBusy, freeSlots, silenceMs, shouldStop, now });
 }
 
 /**

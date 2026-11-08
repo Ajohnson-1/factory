@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 // Auto-start daemon for the software factory (spec: docs/factory.md).
 //
-// Polls the Ready list; each arrival gets a headless `omp` scheduler run that
-// drives the card Plan -> ... -> Done per the board contract. The daemon moves
-// each card Ready -> Plan before spawning (the daemon is part of the
-// scheduler; only the scheduler moves cards), which also makes restarts
-// safe: a dispatched card is no longer in Ready to be double-picked.
+// Polls the Ready list on EVERY board in config/factory-repos.json (FM-2,
+// docs/factory-migration.md §4.3); each arrival gets a headless `omp`
+// scheduler run that drives the card Plan -> ... -> Done per the board
+// contract. The daemon moves each card Ready -> Plan before spawning (the
+// daemon is part of the scheduler; only the scheduler moves cards), which
+// also makes restarts safe: a dispatched card is no longer in Ready to be
+// double-picked. One global queue + one global `FACTORY_MAX_PARALLEL` cap
+// across boards; a card whose `repo:` label cannot be resolved gets an
+// `[ASK]` + `needs-human` and stays in Ready (fail-closed, zero spawn).
 //
 // Run interactively, or install as a launchd agent (RunAtLoad + KeepAlive)
 // so work starts the moment you drag a card to Ready:
@@ -83,7 +87,7 @@
 //   FACTORY_STALL_SILENCE_MS stall silence window     (default FACTORY_MAX_TIME + 15 min)
 //   FACTORY_CHECK_INTERVAL_MS blocking-checks gate poll interval (default: FACTORY_POLL_MS → 15000)
 //   FACTORY_CHECK_CMD     blocking suite override (JSON array of [cmd,...args]; default [["npm","test"]])
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -91,8 +95,10 @@ import * as trelloLib from './lib/trello.js';
 import { runDoneWatch } from './lib/factory-done-ping.js';
 import { ensureBootstrapped, launchctl } from './lib/factory-launchd.js';
 import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending } from './lib/factory-comment-resume.js';
-import { bootStallSweep, superviseStallSweep } from './lib/factory-stall-sweep.js';
+import { bootStallSweep, superviseStallSweep, runStallSweepWatch } from './lib/factory-stall-sweep.js';
 import { runBlockingChecksWatch } from './lib/factory-blocking-checks.js';
+import { askHuman } from './lib/factory-ask.js';
+import { loadRegistry, boardIds, repoForCard, repoContextBlock, worktreeFor } from './lib/factory-registry.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const STATE_DIR = resolve(ROOT, 'data/factory-daemon');
@@ -155,22 +161,28 @@ export function crashTail(text, { maxLines = CRASH_TAIL_LINES, maxChars = CRASH_
 export { crashCommentText };
 
 /**
- * Decide which Ready cards to dispatch this tick.
- * @param {string[]} queued   card ids waiting from previous ticks (arrival order)
- * @param {string[]} readyIds card ids currently in the Ready list (board order)
- * @param {Set<string>} inFlight card ids with a live agent run
- * @param {number} cap        max concurrent runs
- * @returns {{queue: string[], dispatch: string[]}} new waiting queue, ids to start now
+ * Decide which Ready cards to dispatch this tick (FM-2: multi-board —
+ * `queued`/`ready` are `{board, cardId}` entries, one per Ready card on
+ * every registered board; the cap stays GLOBAL: `FACTORY_MAX_PARALLEL`
+ * bounds total in-flight runs ACROSS boards, docs/factory-migration.md §4.3).
+ * @param {Array<{board: string, cardId: string}>} queued  entries waiting from previous ticks (arrival order)
+ * @param {Array<{board: string, cardId: string}>} ready   entries currently in the Ready lists (board order, boards in registry order)
+ * @param {Set<string>} inFlight card ids with a live agent run (ids are globally unique on Trello)
+ * @param {number} cap        max concurrent runs across all boards
+ * @returns {{queue: Array<{board: string, cardId: string}>, dispatch: Array<{board: string, cardId: string}>}} new waiting queue, entries to start now
  *
- * Invariants: queued cards keep their place and drop out only when they leave
- * Ready (cancel); running cards are never re-dispatched; dispatch never
- * exceeds the free slots under the cap.
+ * Invariants (unchanged, now per-board): queued entries keep their place and
+ * drop out only when their card leaves its Ready list (cancel — the SAME
+ * card id on another board is a different entry); running cards are never
+ * re-dispatched; dispatch never exceeds the free slots under the global cap.
  */
-export function planDispatch(queued, readyIds, inFlight, cap) {
-  const ready = new Set(readyIds);
-  const kept = queued.filter((id) => ready.has(id) && !inFlight.has(id));
-  const keptSet = new Set(kept);
-  const fresh = readyIds.filter((id) => !keptSet.has(id) && !inFlight.has(id) && !queued.includes(id));
+export function planDispatch(queued, ready, inFlight, cap) {
+  const key = (e) => `${e.board}/${e.cardId}`;
+  const readySet = new Set(ready.map(key));
+  const kept = queued.filter((e) => readySet.has(key(e)) && !inFlight.has(e.cardId));
+  const keptSet = new Set(kept.map(key));
+  const queuedSet = new Set(queued.map(key));
+  const fresh = ready.filter((e) => !keptSet.has(key(e)) && !inFlight.has(e.cardId) && !queuedSet.has(key(e)));
   const queue = [...kept, ...fresh];
   const slots = Math.max(0, cap - inFlight.size);
   const dispatch = queue.slice(0, slots);
@@ -197,14 +209,34 @@ export const STAGE_SEED_LIST = Object.entries(STAGE_PROMPT_FILES)
   .map(([stage, file]) => `${stage} → ${file}`)
   .join('; ');
 
-/** Headless scheduler prompt for one card (already moved to Plan). */
-export function buildRunPrompt(card) {
+/** Lazy default registry for direct callers (tests, CLI) that build prompts
+ * without a resolved repo; the daemon resolves routing explicitly per card. */
+let defaultRegistryCache;
+function defaultRegistry() {
+  if (defaultRegistryCache === undefined) {
+    try {
+      defaultRegistryCache = loadRegistry();
+    } catch {
+      defaultRegistryCache = null; // unparseable/missing config → no block (§4.1 fail-closed applies to the DAEMON, which loads it explicitly)
+    }
+  }
+  return defaultRegistryCache;
+}
+
+/** Headless scheduler prompt for one card (already moved to Plan).
+ * `repo` = registry entry (config/factory-repos.json) the card routes to;
+ * default = registry `defaultRepo`. FM-2: the REPO CONTEXT block (§4.3)
+ * carries the exact repoDir/worktree paths, bootstrap recipe, and deploy
+ * command lines — pinned by tests/factoryStagePrompts.test.js. */
+export function buildRunPrompt(card, { repo = null } = {}) {
+  const ctxRepo = repo ?? defaultRegistry()?.repos?.[defaultRegistry()?.defaultRepo] ?? null;
+  const repoContext = ctxRepo ? repoContextBlock(ctxRepo, { cardId: card.id, factoryRoot: ROOT }) : null;
   return [
     `You are the software factory scheduler for exactly one Trello card: ${card.id} "${card.name}".`,
     `Read docs/factory.md first and follow the board contract exactly.`,
     `The card has already been moved Ready -> Plan; do not touch any other card and do not drain the board.`,
     `Run the full pipeline for this one card now:`,
-    `1. Worktree bootstrap (branch factory/${card.id} cut from origin/master) per the spec.`,
+    `1. Worktree bootstrap per the REPO CONTEXT block below${ctxRepo ? ` (branch factory/${card.id} cut from origin/${ctxRepo.baseBranch})` : ` (branch factory/${card.id} cut from origin/master) per the spec`}.`,
     `2. Spawn stage subagents: planner ([PLAN]), implementer ([IMPL]), merge gate (rebase onto origin/master + factory.js mergeable), reviewer ([REVIEW:*]; findings tagged [Important]/[Nit]/[Pre-existing]), Review-verify (after every [REVIEW:CHANGES]: spawn one fresh-context read-only verifier per finding — buildVerifierPrompt in scripts/lib/factory-review-verify.js — then pipe the classifications to factory.js review-verify → [REVIEW:VERIFY] verdict; proceed → security pass, bounce → Implement), security pass (scheduler: factory.js security-check factory/<id> master; sensitive → spawn security-reviewer, verdict [SEC:PASS|SEC:FINDINGS]; not sensitive → scheduler posts [SEC:PASS] no-op), qa ([QA:PASS|QA:FAIL]). QA requires REVIEW:APPROVE AND [SEC:PASS] after the latest [IMPL]; [SEC:FINDINGS] bounces → Implement (counts toward the 3-bounce rule). Bounce and needs-human parking rules per spec (node scripts/factory.js bounces <card>).`,
     `   Seed EVERY stage subagent so its prompt begins: "Read docs/factory-prompts/<stage>.md and follow it as your authoritative role instructions (they override your harness role defaults)" — stage → file: ${STAGE_SEED_LIST}. The security-reviewer doc points at docs/security-review.md for the checklist; the [SEC:PASS] no-op stays scheduler-posted.`,
     `3. On QA:PASS: RISK GATE before merge — in the worktree run node scripts/factory.js approve <card> $(git rev-parse HEAD) factory/${card.id}. Tier low → proceed. Tier medium/high → the gate posts [ASK] + pings and blocks for a human comment containing that sha. Gate exit 1 (timeout) → node scripts/factory.js label <card> needs-human, leave the card in QA, do NOT merge; stop this run. Gate exit 0 → run node scripts/factory.js merge-guard factory/<id> master BEFORE merging — exit 0 means the branch sits on the freshly fetched origin/master tip; exit 1 (or a fetch failure — fail-closed) means master advanced: re-run the merge gate (rebase factory/<id> onto fresh origin/master + factory.js mergeable, same conflict rules) then RE-RUN THE RISK GATE on the new tip — node scripts/factory.js approve <card> $(git rev-parse HEAD) (the rebase changed the sha: a stale approval never keys it; tier medium/high re-asks and blocks before merge) — then merge-guard again (loop ≤3, exhausted → needs-human park). Then git merge --ff-only into master and run npm test — this post-merge npm test is the combined re-test against the exact master being pushed; non-zero → git reset --hard origin/master (the branch keeps the work) and bounce to Implement (counts). git push origin master: rejected (the residual fetch→push window) → git reset --hard origin/master and re-run the merge-guard loop (≤3 rounds), NEVER --force-push master.`,
@@ -212,6 +244,7 @@ export function buildRunPrompt(card) {
     `5. Remove worktree + branch, move the card to Done on success (park per spec on failure). A [PROD-WATCH]-titled card must first answer "which layer should have caught this" with node scripts/factory.js prod-close <card> --layer <name> --why "<text>" [--fix "<text>"] — move … Done refuses without the [PROD-CLOSE] comment (--no-close-check opts out).`,
     `Post every stage comment with node scripts/factory.js comment. Finish by printing the final card state.`,
     `Stage context is curated per docs/factory.md "Per-stage context": seed every stage subagent with node scripts/factory.js context <card> <stage> output — the raw factory.js read trail is audit-only.`,
+    ...(repoContext ? ['', repoContext] : []),
   ].join('\n');
 }
 
@@ -384,6 +417,8 @@ export async function handleRunCrash({
   code,
   t = trelloLib,
   readyList,
+  board = undefined,
+  repo = undefined,
   log = (msg) => console.log(msg),
   spawnResumeRun = undefined,
   deferResume = undefined,
@@ -397,7 +432,7 @@ export async function handleRunCrash({
   let listName = '';
   let degraded = false;
   try {
-    const [fresh, lists] = await Promise.all([t.getCard(card.id), t.getLists()]);
+    const [fresh, lists] = await Promise.all([t.getCard(card.id), t.getLists({ board })]);
     listName = String((lists ?? []).find((l) => l.id === fresh?.idList && !l.closed)?.name ?? '');
   } catch (e) {
     degraded = true; // board state unreadable → zero-move degraded mode
@@ -438,14 +473,14 @@ export async function handleRunCrash({
     log(`healthy exit for ${card.id} (${code}); card sits in ${stage || 'an unknown list'} — outside the pipeline, comment suppressed`);
   }
   if (mode === 'park') {
-    const parked = (await t.getLabels()).find((l) => l.name === 'needs-human');
+    const parked = (await t.getLabels({ board })).find((l) => l.name === 'needs-human');
     if (parked) await t.addLabelToCard(card.id, parked.id).catch(() => {});
     log(`crash cap reached for ${card.id}; parked where it stands with needs-human${stage ? ` (${stage})` : ''}`);
   } else if (mode === 'resume') {
     if (!spawnResumeRun) {
       log(`crash recovery wants a resume for ${card.id} at ${stage} but no spawn seam is wired; card untouched`);
     } else {
-      const prompt = buildResumePrompt(card, { stage, crash: code });
+      const prompt = buildResumePrompt(card, { stage, crash: code, repo });
       if (!deferResume || !deferResume({ card, prompt })) {
         spawnResumeRun(card, prompt);
         log(`crashed run for ${card.id} (exit ${code}); stage-aware resume at ${stage}`);
@@ -541,25 +576,39 @@ function acquirePidLock() {
   writeFileSync(PID_FILE, `${process.pid}\n`);
 }
 
-async function findList(name) {
-  const lists = await trelloLib.getLists();
+async function findList(name, board) {
+  const lists = await trelloLib.getLists({ board });
   return lists.find((l) => !l.closed && l.name.toLowerCase() === name.toLowerCase());
 }
 
-async function run() {
+/**
+ * FM-2 (§4.3): one process polls EVERY registered board each tick. `registry`
+ * is the DI seam for tests (default: the loaded config/factory-repos.json —
+ * fail-closed at startup, the loader names the offending key).
+ */
+async function run({ registry = undefined } = {}) {
   const pollMs = envNum('FACTORY_POLL_MS', 15000);
   const cap = envNum('FACTORY_MAX_PARALLEL', DEFAULT_MAX_PARALLEL);
   const ompBin = process.env.FACTORY_OMP_BIN || 'omp';
   trelloLib.assertCreds();
+  const repos = registry ?? loadRegistry(); // D2 fail-closed: invalid registry = startup error
+  const boards = boardIds(repos);
   acquirePidLock();
 
-  const [readyList, planList] = [await findList('Ready'), await findList('Plan')];
-  if (!readyList || !planList) {
-    console.error('Board is missing Ready/Plan lists (run: node scripts/factory.js init)');
-    process.exit(1);
+  // Per-board list context: Ready/Plan are resolved ONCE per board at boot;
+  // every list the daemon names (Ready dispatch, Plan move) is board-scoped.
+  const ctxs = [];
+  for (const board of boards) {
+    const [readyList, planList] = [await findList('Ready', board), await findList('Plan', board)];
+    if (!readyList || !planList) {
+      console.error(`Board ${board} is missing Ready/Plan lists (run: node scripts/factory.js init --board ${board})`);
+      process.exit(1);
+    }
+    ctxs.push({ board, readyList, planList });
   }
+  const byBoard = new Map(ctxs.map((c) => [c.board, c]));
 
-  let queue = [];
+  let queue = []; // {board, cardId, card} — planDispatch entries, board-keyed
   const pendingCrashResumes = []; // crash resumes deferred for lack of a slot (drained per tick)
   const runs = new Map(); // cardId -> ChildProcess
   // Declared before the boot sweep: crashRecovery's `shuttingDown` closure
@@ -572,17 +621,23 @@ async function run() {
   // run already freed its slot (`runs.delete` fires before the exit
   // handler), so the immediate respawn is cap-neutral; `deferResume`
   // absorbs the race where the comment watcher grabbed the last slot
-  // meanwhile by queueing the entry for the poll-loop drain.
-  const crashRecovery = (crashedCard, codeStr) =>
+  // meanwhile by queueing the entry for the poll-loop drain. FM-2: `ctx`
+  // (the run's board context + routed repo) rides along — Ready re-queues
+  // move on the card's OWN board, the [ASK]/resume board-scope likewise,
+  // and the resume prompt's REPO CONTEXT comes from the routing decision
+  // made at dispatch time.
+  const crashRecovery = (crashedCard, codeStr, ctx = ctxs[0]) =>
     handleRunCrash({
       card: crashedCard,
       code: codeStr,
-      readyList,
+      readyList: ctx?.readyList,
+      board: ctx?.board,
+      repo: ctx?.repo,
       log,
-      spawnResumeRun,
+      spawnResumeRun: (c, p) => spawnResumeRun(c, p, ctx),
       deferResume: (entry) => {
         if (runs.size < cap) return false; // slot free — spawn immediately
-        pendingCrashResumes.push(entry);
+        pendingCrashResumes.push({ ...entry, ctx });
         return true; // queued — drained when a slot frees
       },
       shuttingDown: () => shuttingDown,
@@ -593,25 +648,70 @@ async function run() {
   // mid-pipeline with no owned run and a silent comment trail past
   // FACTORY_MAX_TIME + grace get recovered through `crashRecovery` right at
   // boot instead of only being reported (RC2). Never throws internally.
-  await bootStallSweep({
-    log,
-    recover: (orphanCard, code) => crashRecovery(orphanCard, code),
-    isBusy: (id) => runs.has(id),
-    freeSlots: () => Math.max(0, cap - runs.size),
-  });
+  // FM-2: per board — the lists it names are per-board (§4.3).
+  for (const ctx of ctxs) {
+    await bootStallSweep({
+      board: ctx.board,
+      log,
+      recover: (orphanCard, code) => crashRecovery(orphanCard, code, ctx),
+      isBusy: (id) => runs.has(id),
+      freeSlots: () => Math.max(0, cap - runs.size),
+    });
+  }
 
-  async function dispatch(card) {
-    await trelloLib.moveCard(card.id, planList.id);
+  /**
+   * Fail-closed repo routing (§4.3, D3): unknown/ambiguous `repo:` label →
+   * ONE `[ASK]` (+ needs-human park, + Discord ping via the ask protocol) and
+   * the card STAYS in Ready with ZERO spawn — never a guessed checkout. A
+   * pending `[ASK]` owns the reply (isAskPending): re-poll ticks stay silent
+   * until a human comment answers it; then the next re-dispatch re-asks if
+   * the label is still unresolvable (one ask per human reply — no spam).
+   */
+  async function askRepo(card, ctx, routing) {
+    const comments = await trelloLib.getCardComments(card.id).catch(() => []);
+    if (isAskPending(comments)) {
+      log(`repo routing unresolved for ${card.id} (${routing.reason}) — pending [ASK] owns the reply`);
+      return;
+    }
+    const known = Object.keys(repos.repos).join(', ');
+    const detail =
+      routing.reason === 'unknown-repo'
+        ? `repo:${routing.candidates.join(', ')} is not in the registry`
+        : routing.reason === 'ambiguous-repo-label'
+          ? `${routing.candidates.map((c) => `repo:${c}`).join(' + ')} are both set`
+          : `board ${routing.board} is claimed by multiple repos (${routing.candidates.join(', ')})`;
+    log(`repo routing unresolved for ${card.id} (${routing.reason}) — [ASK] + needs-human, left in Ready`);
+    await askHuman({
+      cardId: card.id,
+      question:
+        `Repo routing unresolved: ${detail}. Exactly one \`repo:<name>\` label out of {${known}} decides the checkout ` +
+        '(docs/factory-migration.md D3); with no label the board default applies. Fix the labels (or comment the choice) — the card stays in Ready until then.',
+      noWait: true,
+      board: ctx.board,
+    }).catch((e) => log(`[ASK] failed for ${card.id}: ${e.message}`));
+    const labels = await trelloLib.getLabels({ board: ctx.board }).catch(() => []);
+    const label = labels.find((l) => l.name === 'needs-human');
+    if (label) await trelloLib.addLabelToCard(card.id, label.id).catch(() => {});
+  }
+
+  async function dispatch(entry) {
+    const ctx = byBoard.get(entry.board) ?? ctxs[0];
+    const card = entry.card ?? { id: entry.cardId };
+    // Repo routing BEFORE the move — a routing failure never touches the board.
+    const routing = repoForCard(repos, { labels: card.labels ?? [], board: ctx.board });
+    if (!routing.ok) return askRepo(card, ctx, routing);
+    const runCtx = { ...ctx, repo: routing.repo };
+    await trelloLib.moveCard(card.id, ctx.planList.id);
     if (card.labels?.some((l) => l.name === 'needs-human')) {
-      const parked = (await trelloLib.getLabels()).find((l) => l.name === 'needs-human');
+      const parked = (await trelloLib.getLabels({ board: ctx.board })).find((l) => l.name === 'needs-human');
       if (parked) await trelloLib.removeLabelFromCard(card.id, parked.id).catch(() => {});
       log(`re-queued needs-human card ${card.id}; label removed`);
     }
     const logPath = join(STATE_DIR, `${card.id}.log`);
     const fd = openSync(logPath, 'a');
     writeFileSync(fd, `\n# dispatch ${new Date().toISOString()} ${ompBin} ${JSON.stringify(agentArgs(''))}\n`);
-    log(`dispatching ${card.id} "${card.name}" -> Plan (log: ${logPath})`);
-    const child = spawn(ompBin, agentArgs(buildRunPrompt(card)), {
+    log(`dispatching ${card.id} "${card.name}" -> Plan (${routing.source === 'label' ? `repo:${routing.repo.name} label` : `board default repo:${routing.repo.name}`}; log: ${logPath})`);
+    const child = spawn(ompBin, agentArgs(buildRunPrompt(card, { repo: routing.repo })), {
       cwd: ROOT,
       stdio: ['ignore', fd, fd],
       env: process.env,
@@ -624,12 +724,12 @@ async function run() {
       // D1: exit 0 is only silent when handleRunCrash decides a healthy
       // left-the-pipeline hold (D4); an in-flight card that exits 0 stalled
       // and gets the same stage-aware recovery as a crash.
-      crashRecovery(card, exitCodeStr(code, sig)).catch((e) => log(`crash handling failed: ${e.message}`));
+      crashRecovery(card, exitCodeStr(code, sig), runCtx).catch((e) => log(`crash handling failed: ${e.message}`));
     });
     child.on('error', (e) => {
       runs.delete(card.id);
       log(`spawn failed for ${card.id}: ${e.message}`);
-      crashRecovery(card, 'spawn-failed').catch((err) => log(`crash handling failed: ${err.message}`));
+      crashRecovery(card, 'spawn-failed', runCtx).catch((err) => log(`crash handling failed: ${err.message}`));
     });
   }
 
@@ -640,7 +740,7 @@ async function run() {
   // BOTH resume kinds: a human comment (the watcher) and a crashed run
   // (`handleRunCrash`'s resume mode); a crash at the cap parks
   // needs-human where the card stands, never a Ready re-queue.
-  function spawnResumeRun(card, prompt) {
+  function spawnResumeRun(card, prompt, ctx = ctxs[0]) {
     const logPath = join(STATE_DIR, `${card.id}.log`);
     const fd = openSync(logPath, 'a');
     writeFileSync(fd, `\n# resume ${new Date().toISOString()} ${ompBin} ${JSON.stringify(agentArgs(''))}\n`);
@@ -657,12 +757,12 @@ async function run() {
       log(`run for ${card.id} exited code=${code} signal=${sig ?? '-'}`);
       // D1 covers resume runs too: a resume that stalls at exit 0 mid-pipeline
       // re-enters stage-aware (or parks at the cap), never strands the card.
-      crashRecovery(card, exitCodeStr(code, sig)).catch((e) => log(`crash handling failed: ${e.message}`));
+      crashRecovery(card, exitCodeStr(code, sig), ctx).catch((e) => log(`crash handling failed: ${e.message}`));
     });
     child.on('error', (e) => {
       runs.delete(card.id);
       log(`spawn failed for ${card.id}: ${e.message}`);
-      crashRecovery(card, 'spawn-failed').catch((err) => log(`crash handling failed: ${err.message}`));
+      crashRecovery(card, 'spawn-failed', ctx).catch((err) => log(`crash handling failed: ${err.message}`));
     });
   }
 
@@ -683,77 +783,134 @@ async function run() {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  // Done-list pinger: auto-started and supervised in-process (the
-  // `factory.js done-watch` poller), so Done arrivals ping on EVERY path —
-  // scheduler moves AND UI drags, including drag-out → back-in — with zero
-  // human ceremony (docs/factory.md "Pinging on Done"). The pid lock above
-  // guarantees a single daemon, hence exactly one poller; it shares the
-  // daemon's ROOT/data/factory-done-ping.json with the inline `move` pings.
-  // `shuttingDown` flips on SIGTERM/SIGINT and the poller returns between
-  // ticks; the existing 500 ms exit path is unchanged. Do NOT run
-  // `factory.js done-watch` by hand alongside the daemon (double-ping race).
-  void superviseDoneWatch({ log, shouldStop: () => shuttingDown });
+  // Per-board pollers (FM-2 §4.3): the Done-pinger, comment-resume watcher,
+  // stall sweeper, and blocking-checks gate each run ONE supervised loop per
+  // registered board (the lists they name are per-board; the state files are
+  // card-id keyed → unchanged). The pid lock guarantees a single daemon, so
+  // exactly one of each per board. The daemon's per-board `repoOf` resolves
+  // the resume/run repo context from the card's labels + board.
+  const repoOf = (card, board) => {
+    const r = repoForCard(repos, { labels: card?.labels ?? [], board });
+    return r.ok ? r.repo : null;
+  };
+  for (const ctx of ctxs) {
+    // Done-list pinger: auto-started and supervised in-process (the
+    // `factory.js done-watch` poller), so Done arrivals ping on EVERY path —
+    // scheduler moves AND UI drags, including drag-out → back-in — with zero
+    // human ceremony (docs/factory.md "Pinging on Done"). It shares the
+    // daemon's ROOT/data/factory-done-ping.json with the inline `move` pings.
+    // `shuttingDown` flips on SIGTERM/SIGINT and the poller returns between
+    // ticks; the existing 500 ms exit path is unchanged. Do NOT run
+    // `factory.js done-watch` by hand alongside the daemon (double-ping race).
+    void superviseDoneWatch({
+      log,
+      shouldStop: () => shuttingDown,
+      runWatch: (opts) => runDoneWatch({ ...opts, board: ctx.board }),
+    });
 
-  // Comment-resume watcher: auto-started and supervised in-process (the
-  // `factory.js resume-watch` poller), so a human comment on an in-flight
-  // card whose run has died gets a `[RESUME]` ack + a scheduler run seeded at
-  // the card's CURRENT stage — the stuck-Verify fix (docs/factory.md
-  // "Listening for human comments"). It shares this daemon's `runs` map
-  // (live-run dedup), the FACTORY_MAX_PARALLEL cap, and the spawn
-  // machinery above; the pid lock guarantees a single watcher. Do NOT run
-  // `factory.js resume-watch` by hand alongside the daemon (double-spawn race).
-  void superviseCommentWatch({
-    log,
-    shouldStop: () => shuttingDown,
-    isBusy: (id) => runs.has(id),
-    freeSlots: () => Math.max(0, cap - runs.size),
-    spawnRun: spawnResumeRun,
-  });
+    // Comment-resume watcher: auto-started and supervised in-process (the
+    // `factory.js resume-watch` poller), so a human comment on an in-flight
+    // card whose run has died gets a `[RESUME]` ack + a scheduler run seeded at
+    // the card's CURRENT stage — the stuck-Verify fix (docs/factory.md
+    // "Listening for human comments"). It shares this daemon's `runs` map
+    // (live-run dedup), the FACTORY_MAX_PARALLEL cap, and the spawn
+    // machinery above; the pid lock guarantees a single watcher per board. Do
+    // NOT run `factory.js resume-watch` by hand alongside the daemon
+    // (double-spawn race).
+    void superviseCommentWatch({
+      log,
+      shouldStop: () => shuttingDown,
+      isBusy: (id) => runs.has(id),
+      freeSlots: () => Math.max(0, cap - runs.size),
+      spawnRun: (card, prompt) => spawnResumeRun(card, prompt, { ...ctx, repo: repoOf(card, ctx.board) }),
+      runWatch: (opts) => runCommentResumeWatch({ ...opts, board: ctx.board, repoFor: (card) => repoOf(card, ctx.board) }),
+    });
 
-  // Stall sweep: supervised in-process after the boot pass above, so cards
-  // orphaned LATER (runs killed by a SIGKILLed daemon, exit-0 stalls whose
-  // crashRecovery died mid-flight) get recovered within
-  // FACTORY_STALL_POLL_MS instead of waiting for the next restart (docs/
-  // factory.md "Auto-start daemon" — stall recovery). It shares this
-  // daemon's `runs` map, the concurrency cap, and the SAME crash-recovery
-  // path (`crashRecovery`), and stops on `shuttingDown` between ticks; the
-  // pid lock guarantees a single sweeper. Do NOT run a LIVE
-  // `factory.js stall-sweep` by hand alongside the daemon (double-spawn).
-  void superviseStallSweep({
-    log,
-    shouldStop: () => shuttingDown,
-    isBusy: (id) => runs.has(id),
-    freeSlots: () => Math.max(0, cap - runs.size),
-    recover: (stalledCard, code) => crashRecovery(stalledCard, code),
-  });
-  // Independent blocking-checks gate: auto-started and supervised in-process
-  // (docs/factory.md "Independent blocking checks"). When a card sits in QA
-  // with latest stage tag `[QA:PASS]`, the daemon runs the blocking suite
-  // (`npm test`; `FACTORY_CHECK_CMD` override) ITSELF against the card's
-  // worktree tip and posts `[CHECK:PASS]`/`[CHECK:FAIL]`; a FAIL bounces to
-  // Implement and counts toward the 3-bounce rule — exactly like
-  // `[VERIFY:FAIL]`. The sha watermark in data/factory-blocking-checks.json
-  // makes checks exactly-once per worktree tip across restarts, so a long
-  // suite never double-runs the same commit. No spawn: the poller runs the
-  // commands itself, so nothing registers in `runs`/the cap, and a manual
-  // `factory.js blocking-checks` one-shot alongside is harmless.
-  void superviseBlockingChecks({ log, shouldStop: () => shuttingDown });
+    // Stall sweep: supervised in-process after the boot pass above, so cards
+    // orphaned LATER (runs killed by a SIGKILLed daemon, exit-0 stalls whose
+    // crashRecovery died mid-flight) get recovered within
+    // FACTORY_STALL_POLL_MS instead of waiting for the next restart (docs/
+    // factory.md "Auto-start daemon" — stall recovery). It shares this
+    // daemon's `runs` map, the concurrency cap, and the SAME crash-recovery
+    // path (`crashRecovery`), and stops on `shuttingDown` between ticks; the
+    // pid lock guarantees a single sweeper per board. Do NOT run a LIVE
+    // `factory.js stall-sweep` by hand alongside the daemon (double-spawn).
+    void superviseStallSweep({
+      log,
+      shouldStop: () => shuttingDown,
+      isBusy: (id) => runs.has(id),
+      freeSlots: () => Math.max(0, cap - runs.size),
+      recover: (stalledCard, code) => crashRecovery(stalledCard, code, { ...ctx, repo: repoOf(stalledCard, ctx.board) }),
+      runWatch: (opts) => runStallSweepWatch({ ...opts, board: ctx.board }),
+    });
 
-  log(`watching "Ready" every ${pollMs}ms, cap ${cap}, agent "${ompBin}"`);
+    // Independent blocking-checks gate: auto-started and supervised in-process
+    // (docs/factory.md "Independent blocking checks"). When a card sits in QA
+    // with latest stage tag `[QA:PASS]`, the daemon runs the blocking suite
+    // (`npm test`; `FACTORY_CHECK_CMD` override) ITSELF against the card's
+    // worktree tip and posts `[CHECK:PASS]`/`[CHECK:FAIL]`; a FAIL bounces to
+    // Implement and counts toward the 3-bounce rule — exactly like
+    // `[VERIFY:FAIL]`. The sha watermark in data/factory-blocking-checks.json
+    // makes checks exactly-once per worktree tip across restarts, so a long
+    // suite never double-runs the same commit. No spawn: the poller runs the
+    // commands itself, so nothing registers in `runs`/the cap, and a manual
+    // `factory.js blocking-checks` one-shot alongside is harmless. FM-2: the
+    // worktree path is registry-driven (§4.1 `worktreeRoot` per repo).
+    void superviseBlockingChecks({
+      log,
+      shouldStop: () => shuttingDown,
+      runWatch: (opts) =>
+        runBlockingChecksWatch({
+          ...opts,
+          board: ctx.board,
+          worktreeOf: (card) => worktreeFor(repoOf(card, ctx.board) ?? repos.repos[repos.defaultRepo], card.id),
+          // A routed card's branch refs live in ITS repo (worktrees share
+          // refs per repo) — the tip read must run there (§4.4).
+          gitFor: (card) => {
+            const dir = (repoOf(card, ctx.board) ?? repos.repos[repos.defaultRepo]).repoDir;
+            return (argv) =>
+              execFileSync('git', argv, {
+                cwd: dir,
+                encoding: 'utf8',
+                maxBuffer: 64 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'pipe'],
+              });
+          },
+        }),
+    });
+  }
+
+  log(`watching "Ready" on ${ctxs.length} board(s) (${ctxs.map((c) => c.board).join(', ')}) every ${pollMs}ms, cap ${cap}, agent "${ompBin}"`);
   for (;;) {
     try {
       // Drain crash-recovery resumes deferred for lack of a slot (same
       // shape as the Ready `queue` above; the `[DAEMON-CRASH]` comment
       // already landed, so a re-crash still counts toward the cap).
       while (pendingCrashResumes.length && runs.size < cap) {
-        const { card: c, prompt } = pendingCrashResumes.shift();
-        spawnResumeRun(c, prompt);
+        const { card: c, prompt, ctx } = pendingCrashResumes.shift();
+        spawnResumeRun(c, prompt, ctx);
       }
-      const cards = (await trelloLib.getBoardCards()).filter((c) => c.idList === readyList.id);
+      // Per-board Ready pass (§4.3): every registered board contributes
+      // {board, cardId, card} entries; the GLOBAL queue + global cap order
+      // them across boards (board order = registry order, default first).
+      const ready = [];
+      for (const ctx of ctxs) {
+        const cards = await trelloLib.getBoardCards(undefined, { board: ctx.board });
+        for (const c of (cards ?? []).filter((c) => c.idList === ctx.readyList.id)) {
+          ready.push({ board: ctx.board, cardId: c.id, card: c });
+        }
+      }
       const started = new Set(runs.keys());
-      const { queue: nextQueue, dispatch: toStart } = planDispatch(queue, cards.map((c) => c.id), started, cap);
+      const { queue: nextQueue, dispatch: toStart } = planDispatch(queue, ready, started, cap);
       queue = nextQueue;
-      for (const id of toStart) await dispatch(cards.find((c) => c.id === id));
+      // Queue entries survive ticks — dispatch re-resolves the card from THIS
+      // tick's fetch so labels added while the card waited (a `repo:` fix
+      // after an [ASK]) route correctly; a vanished card falls back to the
+      // queued snapshot.
+      const freshCards = new Map(ready.map((e) => [`${e.board}/${e.cardId}`, e.card]));
+      for (const entry of toStart) {
+        await dispatch({ ...entry, card: freshCards.get(`${entry.board}/${entry.cardId}`) ?? entry.card });
+      }
     } catch (e) {
       log(`poll error: ${e.message}`);
     }
@@ -827,6 +984,11 @@ async function status() {
     try {
       process.kill(pid, 0);
       console.log(`daemon pid ${pid} alive`);
+      try {
+        console.log(`Boards polled from config/factory-repos.json: ${boardIds(loadRegistry()).join(', ')}`);
+      } catch (e) {
+        console.log(`Boards polled: registry unavailable (${e.message})`);
+      }
       console.log('Done-ping watcher: supervised in-process by the daemon (do not run factory.js done-watch separately)');
       console.log('Comment-resume watcher: supervised in-process by the daemon (do not run factory.js resume-watch separately)');
       console.log('Stall sweep: supervised in-process by the daemon (do not run a live factory.js stall-sweep separately; --dry-run is safe)');

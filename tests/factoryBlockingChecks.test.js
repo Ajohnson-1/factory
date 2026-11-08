@@ -300,17 +300,25 @@ function tickHarness({
   runResults = [{ exit: 0, stdout: 'green', stderr: '' }],
   fail = {},
   shouldStop = () => false,
+  board,
+  worktreeOf,
+  gitFor,
 } = {}) {
   const logs = [];
   const writes = [];
   const runs = [];
+  const listsOpts = [];
+  const boardOpts = [];
+  const gitForCards = [];
   const t = {
     calls: { addComment: [], moveCard: [], getCard: [] },
-    async getLists() {
+    async getLists(opts) {
+      listsOpts.push(opts);
       if (fail.lists) throw new Error('lists exploded');
       return LISTS;
     },
-    async getBoardCards() {
+    async getBoardCards(fields, opts) {
+      boardOpts.push(opts);
       if (fail.cards) throw new Error('cards exploded');
       return cards;
     },
@@ -345,6 +353,15 @@ function tickHarness({
   };
   const promise = tickBlockingChecks({
     t,
+    board,
+    worktreeOf,
+    gitFor:
+      gitFor === undefined
+        ? undefined
+        : (card) => {
+            gitForCards.push(card);
+            return gitFor;
+          },
     git,
     run,
     readState: () => state,
@@ -353,7 +370,7 @@ function tickHarness({
     shouldStop,
     log: (m) => logs.push(m),
   });
-  return { logs, writes, runs, calls: t.calls, state, promise };
+  return { logs, writes, runs, calls: t.calls, state, listsOpts, boardOpts, gitForCards, promise };
 }
 
 test('tick bounces to Implement on FAIL while the card is still in QA', async () => {
@@ -709,4 +726,46 @@ test('runBlockingChecksWatch never rejects on board errors', async () => {
     log: () => {},
   });
   assert.equal(res.ok, false, 'tick error surfaces as ok:false, not a rejection');
+});
+
+// FM-2 (§4.3/§4.4): the daemon injects the registry-driven seams — the tick's
+// board-scoped reads, the routed repo's git runner (branch refs live in the
+// routed repo), and the registry worktree path.
+test('FM-2: board + worktreeOf + gitFor route the gate through the card registry', async () => {
+  const routedShas = { [`factory/${CARD_ID}`]: 'cafebabe' };
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: passComments() },
+    shas: {}, // the DEFAULT runner knows NO branch — only the routed one does
+    board: 'ZZboard',
+    worktreeOf: (card) => `/routed-wt/${card.id}`,
+    gitFor: (argv) => {
+      const key = argv.slice(1).join(' ');
+      if (routedShas[key] == null) throw new Error(`fatal: unknown rev ${key}`);
+      return `${routedShas[key]}\n`;
+    },
+  });
+  const summary = await h.promise;
+  assert.deepEqual({ checked: summary.checked, pass: summary.pass }, { checked: 1, pass: 1 });
+  assert.equal(h.gitForCards.length, 1); // the tip read went through the routed runner
+  assert.equal(h.gitForCards[0].id, CARD_ID);
+  assert.deepEqual(h.listsOpts, [{ board: 'ZZboard' }, { board: 'ZZboard' }]); // QA + Implement scoped
+  assert.deepEqual(h.boardOpts, [{ board: 'ZZboard' }]);
+  assert.equal(h.runs[0].cwd, `/routed-wt/${CARD_ID}`); // suite ran in the registry-resolved worktree
+  assert.ok(h.calls.addComment[0].text.startsWith(CHECK_TAG_PASS));
+  assert.ok(h.calls.addComment[0].text.includes('sha=cafebabe'));
+});
+
+// FM-2 back-compat: with no seams injected, the tick behaves exactly as before
+// (default git runner resolves the branch, suite runs in the discord-bot worktree).
+test('FM-2: flagless tick stays byte-identical (default git + legacy worktree path)', async () => {
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: passComments() },
+    shas: { [`factory/${CARD_ID}`]: 'deadbeef' },
+  });
+  const summary = await h.promise;
+  assert.equal(summary.pass, 1);
+  assert.equal(h.gitForCards.length, 0);
+  assert.ok(h.runs[0].cwd.endsWith(path.join('discord-bot-factory-wt', CARD_ID)));
 });

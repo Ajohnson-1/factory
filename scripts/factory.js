@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as t from './lib/trello.js';
 import { askHuman, waitForHuman, parseFlags } from './lib/factory-ask.js';
+import { loadRegistry, detectRepo, repoForCard, worktreeFor } from './lib/factory-registry.js';
 import { runDoneWatch, pingDoneArrival } from './lib/factory-done-ping.js';
 import { runCommentResumeWatch } from './lib/factory-comment-resume.js';
 import { runStallSweepWatch } from './lib/factory-stall-sweep.js';
@@ -17,7 +18,7 @@ import { mergeGuard } from './lib/factory-merge-guard.js';
 import { getContext, CONTEXT_STAGES } from './lib/factory-context.js';
 import { runMetricsReport } from './lib/factory-metrics.js';
 import { getDiffStat, classifyDiff, approvalGate } from './lib/factory-risk.js';
-import { checkCommands, tipShaOf, worktreePath, runCheckSuite, checkCommentText } from './lib/factory-blocking-checks.js';
+import { checkCommands, tipShaOf, runCheckSuite, checkCommentText } from './lib/factory-blocking-checks.js';
 import {
   CASES_PATH,
   harvestBoard,
@@ -30,17 +31,13 @@ import {
 } from './lib/factory-eval.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const git = (argv) =>
-  execFileSync('git', argv, {
-    cwd: ROOT,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+// FM-2 (§4.4): git runs target the registry-resolved repo dir — see `gitIn`
+// beside the command helpers below (the pre-FM-2 ROOT-pinned helper is gone:
+// every git caller now resolves a repo).
 
 const [, , cmd = 'help', ...args] = process.argv;
 
-const STAGES = ['Ready', 'Plan', 'Implement', 'Review', 'QA', 'Deploy', 'Verify', 'Done'];
+const STAGES = ['To Do', 'Ready', 'Plan', 'Implement', 'Review', 'QA', 'Deploy', 'Verify', 'Done'];
 
 const out = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 const die = (msg) => {
@@ -54,8 +51,8 @@ function parseCardId(s) {
   return m[0].toLowerCase();
 }
 
-async function findList(name) {
-  const lists = await t.getLists();
+async function findList(name, board) {
+  const lists = await t.getLists({ board });
   const list = lists.find((l) => !l.closed && l.name.toLowerCase() === String(name).toLowerCase());
   if (!list) die(`No open list named "${name}" on the board (run: node scripts/factory.js init)`);
   return list;
@@ -94,30 +91,86 @@ const takeFlag = (positional, name) => {
   return true;
 };
 
+// FM-2 CLI targeting (docs/factory-migration.md §4.2/§4.4): `--board <id>` and
+// `--repo <name>` resolve against config/factory-repos.json. Both are stripped
+// from `args` BEFORE parseFlags runs (unknown value flags would otherwise leak
+// into its positional remainder) and threaded into every board/list/git call.
+// Flagless behavior is unchanged: undefined board → the trello.js BOARD
+// default; undefined repo → the registry defaultRepo (today's ROOT); cwd
+// detection resolves the very repo dir git already ran in when invoked from
+// inside a registered checkout/worktree.
+let registryCache;
+const registry = () => (registryCache ??= loadRegistry());
+
+// Pull a `--name <value>` pair out of the module-level `args`.
+function takeOpt(name) {
+  const i = args.indexOf(name);
+  if (i === -1) return undefined;
+  const v = args[i + 1];
+  if (!v || v.startsWith('--')) die(`Missing value for ${name}`);
+  args.splice(i, 2);
+  return v;
+}
+
+// Board-scoped resolve (§4.2): --board directly, else the --repo's board;
+// both given must agree. undefined = neither passed (trello.js default board).
+function boardOf() {
+  const board = takeOpt('--board');
+  const repoName = takeOpt('--repo');
+  if (!repoName) return board;
+  const repo = registry().repos[repoName];
+  if (!repo) die(`Unknown --repo "${repoName}" (registry: ${Object.keys(registry().repos).join(', ')})`);
+  if (board && repo.board !== board)
+    die(`Conflicting flags: --board ${board} does not match --repo ${repoName} (board ${repo.board})`);
+  return repo ? repo.board : board;
+}
+
+// Git-flow repo resolve (§4.4 precedence): --repo flag → cwd git toplevel
+// matching a registry repoDir/worktreeRoot → registry defaultRepo.
+function repoOf() {
+  const r = detectRepo(registry(), { repo: takeOpt('--repo') });
+  if (!r.ok)
+    die(`Unknown --repo "${r.candidates?.[0]}" (registry: ${Object.keys(registry().repos).join(', ')})`);
+  return r.repo;
+}
+
+const gitIn = (dir) => (argv) =>
+  execFileSync('git', argv, {
+    cwd: dir,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
 const commands = {
   async init() {
-    const board = await t.getBoard();
-    const [lists, labels] = await Promise.all([t.getLists(), t.getLabels()]);
+    const board = boardOf();
+    const boardInfo = await t.getBoard({ board });
+    const [lists, labels] = await Promise.all([
+      t.getLists({ board }),
+      t.getLabels({ board }),
+    ]);
     const listsCreated = [];
     for (const name of STAGES) {
       if (!lists.some((l) => !l.closed && l.name.toLowerCase() === name.toLowerCase())) {
-        const created = await t.createList(name, board.id);
+        const created = await t.createList(name, boardInfo.id);
         listsCreated.push({ id: created.id, name: created.name });
       }
     }
     let label = labels.find((l) => l.name === 'needs-human');
-    if (!label) label = await t.createLabel('needs-human', 'red', board.id);
-    out({ board: { id: board.id, name: board.name }, listsCreated, needsHumanLabel: label });
+    if (!label) label = await t.createLabel('needs-human', 'red', boardInfo.id);
+    out({ board: { id: boardInfo.id, name: boardInfo.name }, listsCreated, needsHumanLabel: label });
   },
 
   async status() {
-    const [board, lists, cards] = await Promise.all([
-      t.getBoard(),
-      t.getLists(),
-      t.getBoardCards(),
+    const board = boardOf();
+    const [boardInfo, lists, cards] = await Promise.all([
+      t.getBoard({ board }),
+      t.getLists({ board }),
+      t.getBoardCards(undefined, { board }),
     ]);
     out({
-      board: board.name,
+      board: boardInfo.name,
       lists: lists
         .filter((l) => !l.closed)
         .sort((a, b) => a.pos - b.pos)
@@ -137,8 +190,9 @@ const commands = {
   },
 
   async pull() {
-    const list = await findList(args[0] || 'Ready');
-    const cards = await t.getBoardCards();
+    const board = boardOf();
+    const list = await findList(args[0] || 'Ready', board);
+    const cards = await t.getBoardCards(undefined, { board });
     out(
       cards
         .filter((c) => c.idList === list.id)
@@ -152,7 +206,8 @@ const commands = {
   },
 
   async add() {
-    const list = await findList(args[0] || 'Ready');
+    const board = boardOf();
+    const list = await findList(args[0] || 'Ready', board);
     const title = args.slice(1).join(' ');
     if (!title) die('Usage: factory.js add <listName> <title>');
     const card = await t.createCard(title, list.id);
@@ -169,15 +224,17 @@ const commands = {
   },
 
   async mergeable() {
-    const branch = args[0] || git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    const rp = repoOf();
+    const gitAt = gitIn(rp.repoDir);
+    const branch = args[0] || gitAt(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
     const target = args[1] || 'master';
     let base;
     try {
-      base = git(['merge-base', target, branch]).trim();
+      base = gitAt(['merge-base', target, branch]).trim();
     } catch (e) {
       die(`no merge-base between "${target}" and "${branch}": ${String(e.stderr ?? e.message).trim()}`);
     }
-    const merged = git(['merge-tree', base, target, branch]);
+    const merged = gitAt(['merge-tree', base, target, branch]);
     const conflicted = merged.includes('<<<<<<<');
     out({ branch, target, mergeBase: base.slice(0, 10), mergeable: !conflicted });
     if (conflicted) process.exit(1);
@@ -188,9 +245,11 @@ const commands = {
   // to decide whether to spawn the security-reviewer (sensitive) or post the
   // [SEC:PASS] no-op itself (not sensitive).
   async 'security-check'() {
-    const branch = args[0] || git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    const rp = repoOf();
+    const gitAt = gitIn(rp.repoDir);
+    const branch = args[0] || gitAt(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
     const target = args[1] || 'master';
-    out(await securityCheck({ branch, target, git }));
+    out(await securityCheck({ branch, target, git: gitAt }));
   },
 
   // Fresh-master merge guard (docs/factory.md "Scheduler loop" PRE-MERGE
@@ -200,10 +259,12 @@ const commands = {
   // fetch failed — fail-closed) → re-run the MERGE GATE rebase+mergeable and
   // this guard before merging.
   async 'merge-guard'() {
+    const rp = repoOf();
+    const gitAt = gitIn(rp.repoDir);
     if (args.length > 2) die('Usage: factory.js merge-guard <branch> [target=master]');
-    const branch = args[0] || git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    const branch = args[0] || gitAt(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
     const target = args[1] || 'master';
-    const verdict = await mergeGuard({ branch, target, git });
+    const verdict = await mergeGuard({ branch, target, git: gitAt });
     out(verdict);
     if (verdict.stale) process.exit(1);
   },
@@ -217,25 +278,28 @@ const commands = {
   // only when the board fetch failed (nothing to report). The standing
   // schedule is scripts/factory-metrics.js install (launchd, 6 h).
   async metrics() {
+    const board = boardOf();
     // parseFlags keeps unknown --flags positional; --no-post lives there.
     const noPost = args.includes('--no-post');
     const { flags, positional } = parseFlags(args.filter((a) => a !== '--no-post'));
     if (positional.length) die(`Unknown metrics argument "${positional[0]}" (usage: metrics [--no-post] [--since <ISO8601>])`);
-    const res = await runMetricsReport({ since: flags.sinceIso ?? null, noPost });
+    const res = await runMetricsReport({ since: flags.sinceIso ?? null, noPost, board });
     out(res.report);
     if (!res.ok) process.exit(1);
   },
 
   async archive() {
+    const board = boardOf();
     if (!args[0]) die('Usage: factory.js archive <listName>');
-    const list = await findList(args[0]);
+    const list = await findList(args[0], board);
     await t.closeList(list.id);
     out({ archived: list.name });
   },
 
   async reorder() {
+    const board = boardOf();
     const flow = ['To Do', 'Ready', 'Plan', 'Implement', 'Review', 'QA', 'Deploy', 'Verify', 'Done'];
-    const lists = await t.getLists();
+    const lists = await t.getLists({ board });
     const reordered = [];
     for (const [i, name] of flow.entries()) {
       const list = lists.find((l) => !l.closed && l.name.toLowerCase() === name.toLowerCase());
@@ -301,11 +365,12 @@ const commands = {
   // out; comment-fetch errors are fail-open (stderr note, move proceeds —
   // best-effort board reads per the Done-ping precedent).
   async move() {
+    const board = boardOf();
     const noCloseCheck = args.includes('--no-close-check');
     const { flags, positional } = parseFlags(args.filter((a) => a !== '--no-close-check'));
     const id = parseCardId(positional[0]);
     if (!positional[1]) die('Usage: factory.js move <card> <listName>');
-    const list = await findList(positional[1]);
+    const list = await findList(positional[1], board);
     if (list.name.toLowerCase() === 'done' && !noCloseCheck) {
       // die() exits synchronously, so the catch below only ever sees fetch
       // errors — those are fail-open by design (best-effort board reads).
@@ -323,7 +388,7 @@ const commands = {
     await t.moveCard(id, list.id);
     const [card, lists] = await Promise.all([
       t.getCard(id, 'id,idList,name,url'),
-      t.getLists(),
+      t.getLists({ board }),
     ]);
     const destName = lists.find((l) => l.id === card.idList)?.name ?? card.idList;
     if (card.idList !== list.id) die(`move did not take effect; card is in "${destName}"`);
@@ -333,6 +398,7 @@ const commands = {
       donePing = await pingDoneArrival({
         card: { id, name: card.name, url: card.url },
         doneListId: card.idList,
+        board,
         log: console.error,
       });
     }
@@ -512,25 +578,27 @@ const commands = {
   },
 
   async label() {
+    const board = boardOf();
     const id = parseCardId(args[0]);
     const name = args[1] || 'needs-human';
-    const board = await t.getBoard();
-    let label = (await t.getLabels()).find((l) => l.name === name);
-    if (!label) label = await t.createLabel(name, 'red', board.id);
+    const boardInfo = await t.getBoard({ board });
+    let label = (await t.getLabels({ board })).find((l) => l.name === name);
+    if (!label) label = await t.createLabel(name, 'red', boardInfo.id);
     await t.addLabelToCard(id, label.id);
     out({ card: id, label: label.name });
   },
 
   async watch() {
+    const board = boardOf();
     const intervalMs = Number(process.env.FACTORY_POLL_MS || 15000);
-    const list = await findList(args[0] || 'Ready');
+    const list = await findList(args[0] || 'Ready', board);
     const known = new Set(
-      (await t.getBoardCards()).filter((c) => c.idList === list.id).map((c) => c.id),
+      (await t.getBoardCards(undefined, { board })).filter((c) => c.idList === list.id).map((c) => c.id),
     );
     console.log(`watching "${list.name}" every ${intervalMs}ms (${known.size} cards already known)`);
     for (;;) {
       await new Promise((r) => setTimeout(r, intervalMs));
-      const cards = (await t.getBoardCards()).filter((c) => c.idList === list.id);
+      const cards = (await t.getBoardCards(undefined, { board })).filter((c) => c.idList === list.id);
       for (const c of cards) {
         if (!known.has(c.id)) {
           known.add(c.id);
@@ -544,13 +612,14 @@ const commands = {
   // (author-based; the [HUMAN] tag is an optional fast-path).
   // Protocol: docs/factory.md ("Asking a human"). Timeout → exit 1 (bounce/park).
   async ask() {
+    const board = boardOf();
     const { flags, positional } = parseFlags(args);
     const id = parseCardId(positional[0]);
     let question = positional.slice(1).join(' ');
     if (question === '-') question = await readStdin();
     if (!question.trim())
       die('Usage: factory.js ask <card> <question|-> [--timeout <ms>] [--interval <ms>] [--no-wait]');
-    const res = await askHuman({ cardId: id, question, ...flags });
+    const res = await askHuman({ cardId: id, question, ...flags, board });
     out(res);
     if (res.timedOut) process.exit(1);
   },
@@ -558,9 +627,10 @@ const commands = {
   // Resume half of the ask protocol: wait for the human reply without
   // posting/pinging again (ask once, wait many times — survives restarts).
   async wait() {
+    const board = boardOf();
     const { flags, positional } = parseFlags(args);
     const id = parseCardId(positional[0]);
-    const res = await waitForHuman({ cardId: id, ...flags });
+    const res = await waitForHuman({ cardId: id, ...flags, board });
     out(res);
     if (res.timedOut) process.exit(1);
   },
@@ -571,8 +641,9 @@ const commands = {
   // docs/factory.md ("Pinging on Done"). Continuous mode is a service: logs
   // only; --once runs one cycle and prints the JSON result.
   async 'done-watch'() {
+    const board = boardOf();
     const { flags, positional } = parseFlags(args);
-    const res = await runDoneWatch({ listName: positional[0] || 'Done', ...flags });
+    const res = await runDoneWatch({ listName: positional[0] || 'Done', board, ...flags });
     if (flags.once) out(res);
   },
 
@@ -585,8 +656,9 @@ const commands = {
   // cycle and prints the JSON result; --dry-run reports would-resume cards
   // with ZERO board writes and ZERO state writes (safe alongside the daemon).
   async 'resume-watch'() {
+    const board = boardOf();
     const { flags } = parseFlags(args);
-    const res = await runCommentResumeWatch({ ...flags });
+    const res = await runCommentResumeWatch({ ...flags, board });
     if (flags.once) out(res);
   },
 
@@ -600,8 +672,9 @@ const commands = {
   // prints the JSON result; --dry-run reports would-resume + ask-pending
   // holds with ZERO writes — safe alongside the live daemon.
   async 'stall-sweep'() {
+    const board = boardOf();
     const { flags } = parseFlags(args);
-    const res = await runStallSweepWatch({ ...flags });
+    const res = await runStallSweepWatch({ ...flags, board });
     if (flags.once) out(res);
   },
 
@@ -610,11 +683,13 @@ const commands = {
   // docs/factory.md "Risk-tiered approval before Deploy"). Informational —
   // exit 0 on any diff; dies only when git itself fails (bad refs).
   async risk() {
+    const rp = repoOf();
+    const gitAt = gitIn(rp.repoDir);
     const branch = args[0] || 'HEAD';
     const target = args[1] || 'origin/master';
     let stat;
     try {
-      stat = getDiffStat({ branch, target });
+      stat = getDiffStat({ branch, target, git: gitAt });
     } catch (e) {
       die(`risk diff failed for "${branch}" against "${target}": ${String(e.stderr ?? e.message).trim()}`);
     }
@@ -631,13 +706,15 @@ const commands = {
   // scan finds the comment). Spec: docs/factory.md "Risk-tiered approval
   // before Deploy"; protocol reuse: "Asking a human".
   async approve() {
+    const rp = repoOf();
+    const gitAt = gitIn(rp.repoDir);
     const { flags, positional } = parseFlags(args);
     const id = parseCardId(positional[0]);
     const sha = String(positional[1] ?? '').toLowerCase();
     if (!/^[0-9a-f]{7,40}$/.test(sha))
       die('Usage: factory.js approve <card> <sha> [branch] [--timeout <ms>] [--interval <ms>]  (sha = 7-40 hex chars — the QA-passed HEAD)');
-    const branch = positional[2] || git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
-    const res = await approvalGate({ cardId: id, sha, branch, ...flags });
+    const branch = positional[2] || gitAt(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    const res = await approvalGate({ cardId: id, sha, branch, ...flags, git: gitAt });
     out(res);
     process.exit(res.approved ? 0 : 1);
   },
@@ -651,11 +728,20 @@ const commands = {
   // bounce move; the scheduler owns moves). Operator/debug tool, same
   // spirit as security-check.
   async 'blocking-checks'() {
+    const board = boardOf();
     if (!args[0]) die('Usage: factory.js blocking-checks <card>');
     const id = parseCardId(args[0]);
-    const sha = tipShaOf(`factory/${id}`);
-    if (!sha) die(`no branch factory/${id} (nothing to check — run the factory pipeline first)`);
-    const worktree = worktreePath(id);
+    // Repo routing FIRST (§4.4/D3): the card's repo comes from its
+    // labels/board; unroutable cards fall back to the registry defaultRepo,
+    // exactly like the CLI's flagless default today. The branch tip is then
+    // read in that repo (refs are shared across ITS worktrees) and the suite
+    // runs in that repo's registered worktree path.
+    const card = await t.getCard(id, 'id,name,idList,labels');
+    const routing = repoForCard(registry(), { labels: card.labels ?? [], board });
+    const repo = routing.ok ? routing.repo : registry().repos[registry().defaultRepo];
+    const sha = tipShaOf(`factory/${id}`, { git: gitIn(repo.repoDir) });
+    if (!sha) die(`no branch factory/${id} in ${repo.repoDir} (nothing to check — run the factory pipeline first)`);
+    const worktree = worktreeFor(repo, id);
     if (!existsSync(worktree)) die(`no worktree at ${worktree} (nothing to check)`);
     const commands = checkCommands();
     const { pass, results } = await runCheckSuite({ worktree, commands });
@@ -676,6 +762,7 @@ const commands = {
   // --dry-run reports the plan with ZERO board writes. Semantics:
   // scripts/lib/factory-audit-cards.js header.
   async 'seed-audit'() {
+    const board = boardOf();
     const { flags, positional } = parseFlags(args);
     // parseFlags keeps unknown --flags (and their values) positional; pull the
     // two value flags out of the remainder by hand.
@@ -690,7 +777,7 @@ const commands = {
     const listName = takeValue('--list') ?? 'To Do';
     const docPath = takeValue('--doc');
     // stderr for the CREATED/SKIP progress lines: stdout stays the JSON contract.
-    const res = await runAuditSeed({ listName, docPath, dryRun: flags.dryRun, log: console.error });
+    const res = await runAuditSeed({ listName, docPath, dryRun: flags.dryRun, board, log: console.error });
     out(res);
     if (!res.ok) process.exit(1);
   },
@@ -731,8 +818,9 @@ const commands = {
     process.stdout.write(
       [
         'Software factory board CLI (spec: docs/factory.md)',
+        '  --board <id> | --repo <name>   target a registered board/repo (config/factory-repos.json) on board/list/git commands; default = TRELLO_BOARD board / registry defaultRepo / cwd-matched repo',
         '',
-        '  init                        ensure factory lists + needs-human label',
+        '  init                        ensure factory lists (incl. To Do) + needs-human label',
         '  status                      board snapshot JSON',
         '  pull [Ready]                cards in a list',
         '  add [Ready] <title>         create a card in a list',

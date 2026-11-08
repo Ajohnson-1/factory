@@ -219,7 +219,7 @@ export async function sendOwnerPing({
   }
 }
 
-async function pollForReply({ cardId, sinceDate, excludeCommentId, timeoutMs, intervalMs, t, sleep, now }) {
+async function pollForReply({ cardId, sinceDate, excludeCommentId, timeoutMs, intervalMs, board, t, sleep, now }) {
   const startMs = Date.parse(now());
   let polls = 0;
   // Bot identity: undefined = unresolved (retry next poll), null/object = settled.
@@ -232,13 +232,13 @@ async function pollForReply({ cardId, sinceDate, excludeCommentId, timeoutMs, in
   for (;;) {
     if (bot === undefined && typeof t.getMe === 'function') {
       try {
-        const me = await t.getMe();
+        const me = await t.getMe({ board });
         if (me?.id != null || me?.username != null) bot = me;
       } catch {
         /* identity lookup failed — fail-closed (tag-only) until a retry succeeds */
       }
     }
-    const actions = await t.getCardComments(cardId);
+    const actions = await t.getCardComments(cardId, undefined, { board });
     polls += 1;
     const reply = extractHumanReply(actions, { sinceDate, excludeCommentId, bot: bot ?? null });
     if (reply) return { replied: true, reply, polls, waitedMs: Date.parse(now()) - startMs };
@@ -265,6 +265,7 @@ export async function askHuman({
   timeoutMs = envNum('FACTORY_ASK_TIMEOUT_MS', 3_600_000),
   intervalMs = envNum('FACTORY_ASK_POLL_MS', 30_000),
   noWait = false,
+  board = undefined, // FM-2 per-board pass-through, docs/factory-migration.md §4.3
   t = trello,
   notify = sendOwnerPing,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -272,7 +273,7 @@ export async function askHuman({
 }) {
   const q = String(question ?? '').trim();
   const text = /^\[ASK\]/i.test(q) ? q : `[ASK] ${q}`;
-  const posted = await t.addComment(cardId, text);
+  const posted = await t.addComment(cardId, text, { board });
   const askCommentId = posted?.id;
   const sinceDate = normalizeIso(posted?.date) || now();
 
@@ -280,7 +281,7 @@ export async function askHuman({
   // (url-only, then a constructed card URL) — the ping must never out-fail the ask.
   let card = {};
   try {
-    card = (await t.getCard(cardId)) ?? {};
+    card = (await t.getCard(cardId, undefined, { board })) ?? {};
   } catch {
     /* degrade to url only */
   }
@@ -304,6 +305,7 @@ export async function askHuman({
     excludeCommentId: askCommentId,
     timeoutMs,
     intervalMs,
+    board,
     t,
     sleep,
     now,
@@ -324,10 +326,11 @@ export async function waitForHuman({
   sinceIso,
   timeoutMs = envNum('FACTORY_ASK_TIMEOUT_MS', 3_600_000),
   intervalMs = envNum('FACTORY_ASK_POLL_MS', 30_000),
+  board = undefined, // FM-2 per-board pass-through, docs/factory-migration.md §4.3
   t = trello,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   now = () => new Date().toISOString(),
 }) {
   const sinceDate = normalizeIso(sinceIso) || now();
-  return pollForReply({ cardId, sinceDate, timeoutMs, intervalMs, t, sleep, now });
+  return pollForReply({ cardId, sinceDate, timeoutMs, intervalMs, board, t, sleep, now });
 }

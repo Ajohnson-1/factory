@@ -243,3 +243,21 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
 - `.env.example`: discord-bot's factory blocks copied verbatim;
   worktree bootstrap prefers the discord-bot root `.env` (BOT_TOKEN for
   ask/done-ping) and falls back to this repo's `.env`.
+
+### FM-2 notes (recorded)
+
+- **Per-board Done-ping dedup:** the state file records ONE `doneListId`, so
+  two boards alternating the legacy file rotate each other every tick (each
+  poller re-baselines and silently misses arrivals — caught in the live
+  two-board smoke). Non-default boards now get
+  `data/factory-done-ping.<board>.json`; the default board keeps the legacy
+  filename byte-for-byte (the inline `move` pinger shares it).
+- **`init --board LLNG5MAm` ran early during FM-2 verification** (creating
+  To Do/Plan/Implement/QA/Deploy/Verify + the `needs-human` label on the
+  softwarefactory board, so the two-board poll smoke had legal lists). The 9
+  backlog cards still sit in the older `Todo` list — FM-3's remaining work is
+  the card moves + the doc/pointer updates; the registry keeps both entries on
+  `ZHkVYBN1` per FM-1 (the flip stays FM-3's step).
+- **`FACTORY_MAX_PARALLEL=0` is poll-only mode** (dispatch never starts) —
+  used for the read-only two-board daemon smoke so §7's single-dispatcher
+  rule held while the discord-bot daemon stayed live.

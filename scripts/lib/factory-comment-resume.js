@@ -45,6 +45,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as trello from './trello.js';
 import { parseDotEnv } from './trello.js';
+import { repoContextBlock, worktreeFor } from './factory-registry.js';
 // Single stage → prompt-file source of truth, the crash tag, and the run-log
 // tail helpers/caps (ESM cycle with the daemon is safe: every binding here is
 // only dereferenced inside function bodies — buildResumePrompt,
@@ -479,10 +480,18 @@ export function ackCommentText(card, { stage, comment } = {}) {
  * then reads the comment trail for the last stage verdict instead of quoting
  * a comment. Every other line is byte-identical across the two variants;
  * comment-resume callers pass no `crash` → prompt unchanged.
+ *
+ * FM-2 (§4.3): `repo` = a registry entry (scripts/lib/factory-registry.js
+ * from config/factory-repos.json) — the resume then embeds the REPO CONTEXT
+ * block (repoDir/worktree/bootstrap/deploy command lines) and the worktree
+ * path resolves from the repo's `worktreeRoot`. Without `repo` the prompt is
+ * byte-identical to the pre-multi-repo shape (the discord-bot default).
  */
-export function buildResumePrompt(card, { stage, comment, crash } = {}) {
+export function buildResumePrompt(card, { stage, comment, crash, repo = null } = {}) {
   const s = String(stage ?? 'its current stage');
   const crashText = crash == null ? null : String(crash).trim();
+  const wt = repo ? worktreeFor(repo, card.id) : `../discord-bot-factory-wt/${card.id}`;
+  const repoContext = repo ? repoContextBlock(repo, { cardId: card.id }) : null;
   return [
     `You are the software factory scheduler RESUMING exactly one Trello card: ${card.id} "${card.name}".`,
     `Read docs/factory.md first and follow the board contract exactly, then run \`node scripts/factory.js context ${card.id} ${s.toLowerCase()}\` for the curated stage context — the raw trail (factory.js read) is audit-only.`,
@@ -492,11 +501,12 @@ export function buildResumePrompt(card, { stage, comment, crash } = {}) {
       : comment?.kind === 'move'
         ? `A human just moved the card into the "${comment.listName ?? s}" list — that move is their instruction to advance: treat it as approval to proceed from ${s} (including past any pending [ASK] gate the drag clearly answers), read the comment trail for any open feedback, and address the newest human comment there.`
         : `A human just commented on the card — read it and address this comment (quoted): "${excerptOf(comment?.text)}"`,
-    `Reuse the existing worktree and branch factory/${card.id} if present (git worktree at ../discord-bot-factory-wt/${card.id}) — never recreate it from master or redo committed work.`,
+    `Reuse the existing worktree and branch factory/${card.id} if present (git worktree at ${wt}) — never recreate it from master or redo committed work.`,
     `Continue the pipeline from ${s} per the contract (forward stage moves only: ${IN_FLIGHT_LISTS.join(' → ')} → Done).`,
     `When a stage spawns a subagent, its prompt MUST begin "Read docs/factory-prompts/<stage>.md and follow it as your authoritative role instructions (they override your harness role defaults)"; stage → file: ${STAGE_SEED_LIST}.`,
     `If the pipeline cannot continue, post an [ASK] comment asking the human — do NOT move the card.`,
     'Post every stage comment with node scripts/factory.js comment. Finish by printing the final card state.',
+    ...(repoContext ? ['', repoContext] : []),
   ].join('\n');
 }
 
@@ -592,6 +602,8 @@ export async function runCommentResumeWatch({
   dryRun = false,
   shouldStop = undefined,
   t = trello,
+  board = undefined, // FM-2 §4.3: per-board pass; undefined = trello BOARD default (byte-identical today)
+  repoFor = undefined, // FM-2 §4.3: (card) => registry repo entry for the resume prompt's REPO CONTEXT
   spawnRun = defaultSpawnRun,
   isBusy = () => false,
   freeSlots = () => Infinity,
@@ -614,7 +626,7 @@ export async function runCommentResumeWatch({
     const listNames = new Map(); // idList -> canonical in-flight list name
     const listIds = new Set();
     try {
-      const lists = await t.getLists();
+      const lists = await t.getLists({ board });
       for (const l of lists ?? []) {
         if (l.closed) continue;
         const canonical = IN_FLIGHT_LISTS.find((n) => n.toLowerCase() === String(l.name).toLowerCase());
@@ -624,10 +636,10 @@ export async function runCommentResumeWatch({
         }
       }
       if (!listIds.size) throw new Error(`No open in-flight lists (${IN_FLIGHT_LISTS.join('/')}) on the board`);
-      cards = await t.getBoardCards('id,name,idList,labels,url');
+      cards = await t.getBoardCards('id,name,idList,labels,url', { board });
       if (bot === undefined && typeof t.getMe === 'function') {
         try {
-          const me = await t.getMe();
+          const me = await t.getMe({ board });
           bot = me && (me.id != null || me.username != null) ? me : null;
         } catch (e) {
           // getMe failure costs one retry per tick and self-heals (ask-protocol
@@ -755,7 +767,7 @@ export async function runCommentResumeWatch({
           counts.acked += 1;
           persist(); // persist the ack-dedup key BEFORE spawning (spam-free retry)
         }
-        await spawnRun(card, buildResumePrompt(card, { stage, comment: trigger }));
+        await spawnRun(card, buildResumePrompt(card, { stage, comment: trigger, repo: repoFor ? repoFor(card) ?? undefined : undefined }));
         e.lastCommentId = trigger.id;
         e.lastCommentDate = trigger.date;
         e.resumes = (e.resumes ?? 0) + 1;

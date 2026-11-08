@@ -30,7 +30,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { STAGE_PROMPT_FILES, buildRunPrompt } from '../scripts/factory-daemon.js';
-import { loadRegistry } from '../scripts/lib/factory-registry.js';
+import { buildResumePrompt } from '../scripts/lib/factory-comment-resume.js';
+import { loadRegistry, worktreeFor } from '../scripts/lib/factory-registry.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROMPT_DIR = path.join(ROOT, 'docs', 'factory-prompts');
@@ -423,5 +424,61 @@ describe('scheduler prompts seed the stage docs', () => {
       expect(prompt).toContain(STAGE_PROMPT_FILES[stage]);
     }
     expect(prompt).toContain('override your harness role defaults');
+  });
+});
+
+// FM-2 (§4.3): the REPO CONTEXT block — the run/resume prompts must carry the
+// exact repo paths, bootstrap recipe, and deploy command lines from
+// config/factory-repos.json, so the stage agents never guess where the repo,
+// worktree, or deploy runner lives. Pinned here alongside the stage seeds.
+describe('REPO CONTEXT block (FM-2, docs/factory-migration.md §4.3)', () => {
+  const registry = loadRegistry({ env: {} });
+  const card = { id: '6ae4b88307df4b89018e8d7f', name: 'Context canary' };
+  const HEAD = 'REPO CONTEXT (repo registry: config/factory-repos.json';
+  const FACTORY_CLI =
+    '- All factory CLI invocations (node scripts/factory.js …) run from the FACTORY repo checkout, not the card worktree.';
+
+  it('the default run prompt carries the registry defaultRepo context', () => {
+    const p = buildRunPrompt(card);
+    expect(p).toContain(HEAD);
+    expect(p).toContain(`- repo: ${registry.defaultRepo}`);
+    expect(p).toContain(FACTORY_CLI);
+  });
+
+  it('a routed repo entry carries repoDir, baseBranch, worktree path, worktree-add line, bootstrap recipe, and deploy driver lines', () => {
+    const repo = registry.repos['discord-bot'];
+    const wt = worktreeFor(repo, card.id);
+    const p = buildRunPrompt(card, { repo });
+    expect(p).toContain(HEAD);
+    expect(p).toContain('- repo: discord-bot');
+    expect(p).toContain(`- repoDir: ${repo.repoDir}`);
+    expect(p).toContain('- baseBranch: master');
+    expect(p).toContain(`- worktree: ${wt}`);
+    expect(p).toContain(`git -C ${repo.repoDir} worktree add ${wt} -b factory/${card.id} origin/master`);
+    for (const step of repo.worktreeBootstrap) {
+      expect(p).toContain(step.replaceAll('<wt>', wt).replaceAll('<factoryRoot>', ROOT));
+    }
+    expect(p).not.toContain('<wt>'); // placeholders fully substituted
+    expect(p).toContain('- deploy driver: docker-ssh');
+    expect(p).toContain('node scripts/deploy.js build master');
+    expect(p).toContain('node scripts/deploy.js rollback');
+    expect(p).toContain('node scripts/verify-deploy.js');
+  });
+
+  it('the resume prompt carries the same block and mandates the registry worktree', () => {
+    const repo = registry.repos['discord-bot'];
+    const wt = worktreeFor(repo, card.id);
+    const p = buildResumePrompt(card, { stage: 'Implement', crash: 1, repo });
+    expect(p).toContain(HEAD);
+    expect(p).toContain('- repo: discord-bot');
+    expect(p).toContain(`git worktree at ${wt}`);
+    expect(p).toContain('- deploy driver: docker-ssh');
+    expect(p).toContain(FACTORY_CLI);
+  });
+
+  it('repo-less callers keep the pre-FM-2 prompt shape (byte-identical legacy worktree path)', () => {
+    const p = buildResumePrompt(card, { stage: 'Implement', crash: 1 });
+    expect(p).not.toContain(HEAD);
+    expect(p).toContain(`git worktree at ../discord-bot-factory-wt/${card.id}`);
   });
 });

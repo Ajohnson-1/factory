@@ -203,6 +203,7 @@ export async function runCycle({
   cfg,
   run,
   t = trello,
+  board, // FM-2 (§4.3): the board-scoped Ready-list lookup targets this board; undefined = default (byte-identical)
   ping = sendOwnerPing,
   state = readState(),
   sweep = sweepForHost,
@@ -236,7 +237,7 @@ export async function runCycle({
     if (verdict.kind === 'unreachable') {
       ({ ip: foundIp } = await sweep({ cfg, run }));
     }
-    const lists = await t.getLists();
+    const lists = await t.getLists({ board });
     const ready = lists.find((l) => l.name === 'Ready' && !l.closed);
     if (!ready) throw new Error('Ready list missing (run factory.js init)');
     const card = await t.createCard(incidentTitle(verdict.kind, verdict.detail), ready.id, incidentBody({ cfg, verdict, foundIp }));

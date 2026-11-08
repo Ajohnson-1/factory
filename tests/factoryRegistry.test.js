@@ -11,6 +11,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { expandTilde, validateRegistry, loadRegistry } from '../scripts/lib/factory-registry.js';
+import {
+  boardIds,
+  repoForCard,
+  repoForPath,
+  detectRepo,
+  worktreeFor,
+  renderWorktreeBootstrap,
+  repoContextBlock,
+  deployCommands,
+} from '../scripts/lib/factory-registry.js';
 
 const HOME = process.env.HOME ?? '~';
 
@@ -159,4 +169,168 @@ test('11. the committed config/factory-repos.json itself validates (FM-1 single-
   }
   assert.equal(reg.repos['discord-bot'].deploy.driver, 'docker-ssh');
   assert.equal(reg.repos.factory.deploy.driver, 'self');
+});
+
+// ── FM-2 routing surface (docs/factory-migration.md §4.1–§4.4, D3) ─────────
+
+// Two repos, two distinct boards — the shape FM-3+ ships (factory entry
+// flipped to LLNG5MAm). The committed config (test 11) keeps BOTH on
+// ZHkVYBN1 until then, which is what the ambiguous-board path models.
+function twoRepo(overrides = {}) {
+  return validateRegistry({
+    defaultRepo: 'factory',
+    repos: {
+      factory: {
+        repoDir: '~/GitHub/factory',
+        worktreeRoot: '~/GitHub/factory-factory-wt',
+        baseBranch: 'master',
+        board: 'LLNG5MAm',
+        deploy: { driver: 'self' },
+      },
+      'discord-bot': {
+        repoDir: '~/GitHub/discord-bot',
+        worktreeRoot: '~/GitHub/discord-bot-factory-wt',
+        baseBranch: 'master',
+        board: 'ZHkVYBN1',
+        deploy: { driver: 'docker-ssh' },
+        worktreeBootstrap: [
+          'ln -s ../../discord-bot/node_modules node_modules',
+          'cp .env version.json <wt>/',
+          'mkdir -p <wt>/config <wt>/data && cp config/config.json <wt>/config/',
+          'test -f <wt>/.env || cp <factoryRoot>/.env <wt>/.env',
+        ],
+      },
+    },
+    ...overrides,
+  });
+}
+
+const CARD = '6ae4b88307df4b89018e8d7f';
+
+// ── boardIds ───────────────────────────────────────────────────────────────
+
+test('12. boardIds: distinct boards, defaultRepo first; same-board repos dedup to one poll id (FM-1 parity config)', () => {
+  const reg = twoRepo();
+  assert.deepEqual(boardIds(reg), ['LLNG5MAm', 'ZHkVYBN1']); // defaultRepo=factory first, then registry order
+  const parity = loadRegistry({ env: {} }); // both entries ZHkVYBN1
+  assert.deepEqual(boardIds(parity), ['ZHkVYBN1']); // deduped — today's daemon polls ONE board
+});
+
+// ── repoForCard (D3 precedence) ────────────────────────────────────────────
+
+test('13. repoForCard: repo: label beats the board default; duplicate same-name labels dedup', () => {
+  const reg = twoRepo();
+  const r = repoForCard(reg, { labels: [{ name: 'needs-human' }, { name: 'repo:discord-bot' }], board: 'LLNG5MAm' });
+  assert.equal(r.ok, true);
+  assert.equal(r.repo.name, 'discord-bot'); // label overrides the factory board default
+  assert.equal(r.source, 'label');
+  const dup = repoForCard(reg, { labels: ['repo:discord-bot', 'repo:discord-bot'], board: 'LLNG5MAm' }); // strings too
+  assert.equal(dup.ok && dup.repo.name, 'discord-bot');
+});
+
+test('14. repoForCard: unknown repo label fails closed (unknown-repo), never guesses', () => {
+  const reg = twoRepo();
+  const r = repoForCard(reg, { labels: [{ name: 'repo:ghost-repo' }], board: 'ZHkVYBN1' });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'unknown-repo');
+  assert.deepEqual(r.candidates, ['ghost-repo']);
+});
+
+test('15. repoForCard: two repo: labels fail closed (ambiguous-repo-label) even when both known', () => {
+  const reg = twoRepo();
+  const r = repoForCard(reg, { labels: [{ name: 'repo:factory' }, { name: 'repo:discord-bot' }], board: 'LLNG5MAm' });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'ambiguous-repo-label');
+  assert.deepEqual(r.candidates.sort(), ['discord-bot', 'factory']);
+});
+
+test('16. repoForCard: no label → board default; several repos on one board → ambiguous-board; unregistered board → defaultRepo', () => {
+  const reg = twoRepo();
+  assert.equal(repoForCard(reg, { labels: [], board: 'ZHkVYBN1' }).repo.name, 'discord-bot'); // unique board owner
+  assert.equal(repoForCard(reg, { labels: [], board: 'LLNG5MAm' }).repo.name, 'factory');
+  assert.equal(repoForCard(reg, { labels: [], board: 'UnknownBd' }).repo.name, 'factory'); // default fallback
+  assert.equal(repoForCard(reg, { labels: [] }).repo.name, 'factory'); // no board either
+  const shared = loadRegistry({ env: {} }); // FM-1 parity: BOTH repos claim ZHkVYBN1
+  const amb = repoForCard(shared, { labels: [], board: 'ZHkVYBN1' });
+  assert.equal(amb.ok, false);
+  assert.equal(amb.reason, 'ambiguous-board');
+  assert.deepEqual(amb.candidates.sort(), ['discord-bot', 'factory']);
+  assert.equal(amb.board, 'ZHkVYBN1');
+});
+
+// ── repoForPath / detectRepo (§4.4) ────────────────────────────────────────
+
+test('17. repoForPath: exact repoDir or strictly under worktreeRoot/; siblings and strangers are null', () => {
+  const reg = twoRepo();
+  assert.equal(repoForPath(reg, join(HOME, 'GitHub/discord-bot')).name, 'discord-bot');
+  assert.equal(repoForPath(reg, join(HOME, 'GitHub/discord-bot-factory-wt', CARD)).name, 'discord-bot');
+  assert.equal(repoForPath(reg, join(HOME, 'GitHub/discord-bot-factory-wt')), reg.repos['discord-bot']); // worktreeRoot itself counts
+  assert.equal(repoForPath(reg, join(HOME, 'GitHub/discord-bot-factory-wt-fake', CARD)), null); // prefix WITHOUT separator is not a child
+  assert.equal(repoForPath(reg, '/somewhere/else'), null);
+  assert.equal(repoForPath(reg, ''), null);
+});
+
+test('18. detectRepo: --repo flag wins; bad flag fails closed; cwd toplevel matches a registered dir; else defaultRepo', () => {
+  const reg = twoRepo();
+  assert.equal(detectRepo(reg, { repo: 'discord-bot' }).repo.name, 'discord-bot');
+  const bad = detectRepo(reg, { repo: 'ghost' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'unknown-repo');
+  const cwd = detectRepo(reg, { cwd: '/wt', toplevelOf: () => join(HOME, 'GitHub/factory-factory-wt', CARD) });
+  assert.equal(cwd.ok && cwd.repo.name, 'factory');
+  assert.equal(cwd.source, 'cwd');
+  const def = detectRepo(reg, { cwd: '/nowhere', toplevelOf: () => '/nowhere' });
+  assert.equal(def.ok && def.repo.name, 'factory');
+  assert.equal(def.source, 'default');
+  const notRepo = detectRepo(reg, { cwd: '/tmp', toplevelOf: () => '' }); // git fails → ''
+  assert.equal(notRepo.repo.name, 'factory');
+});
+
+// ── worktree + bootstrap rendering ─────────────────────────────────────────
+
+test('19. worktreeFor joins the registry worktreeRoot; renderWorktreeBootstrap substitutes <wt>/<factoryRoot>', () => {
+  const reg = twoRepo();
+  const db = reg.repos['discord-bot'];
+  const wt = join(HOME, 'GitHub/discord-bot-factory-wt', CARD);
+  assert.equal(worktreeFor(db, CARD), wt);
+  const steps = renderWorktreeBootstrap(db, { cardId: CARD, factoryRoot: '/opt/factory' });
+  assert.deepEqual(steps, [
+    'ln -s ../../discord-bot/node_modules node_modules',
+    `cp .env version.json ${wt}/`,
+    `mkdir -p ${wt}/config ${wt}/data && cp config/config.json ${wt}/config/`,
+    `test -f ${wt}/.env || cp /opt/factory/.env ${wt}/.env`,
+  ]);
+  assert.deepEqual(renderWorktreeBootstrap(reg.repos.factory, { cardId: CARD }), []); // empty recipe → no steps
+});
+
+test('20. deployCommands: docker-ssh = the existing runners; self = FM-4 command lines', () => {
+  const reg = twoRepo();
+  assert.deepEqual(deployCommands(reg.repos['discord-bot']), [
+    'build: node scripts/deploy.js build master',
+    'deploy: node scripts/deploy.js deploy <sha>',
+    'rollback (after [VERIFY:FAIL]): node scripts/deploy.js rollback',
+    'verify: node scripts/verify-deploy.js',
+  ]);
+  const self = deployCommands(reg.repos.factory).join('\n');
+  assert.match(self, /deploy-factory\.js/);
+  assert.match(self, /git pull --ff-only origin master/);
+});
+
+test('21. repoContextBlock: REPO CONTEXT header, repoDir/baseBranch/worktree, exact worktree-add + bootstrap lines, deploy lines, factory-CLI rule', () => {
+  const reg = twoRepo();
+  const db = reg.repos['discord-bot'];
+  const wt = join(HOME, 'GitHub/discord-bot-factory-wt', CARD);
+  const block = repoContextBlock(db, { cardId: CARD, factoryRoot: '/opt/factory' });
+  assert.match(block, /^REPO CONTEXT \(repo registry: config\/factory-repos\.json/);
+  assert.ok(block.includes(`- repo: discord-bot`));
+  assert.ok(block.includes(`- repoDir: ${join(HOME, 'GitHub/discord-bot')} (all git operations for this repo run here)`));
+  assert.ok(block.includes('- baseBranch: master'));
+  assert.ok(block.includes(`- worktree: ${wt}`));
+  assert.ok(block.includes(`- branch: factory/${CARD} cut from origin/master`));
+  assert.ok(block.includes(`  create: git -C ${join(HOME, 'GitHub/discord-bot')} worktree add ${wt} -b factory/${CARD} origin/master`));
+  assert.ok(block.includes(`    cp .env version.json ${wt}/`));
+  assert.ok(block.includes(`    test -f ${wt}/.env || cp /opt/factory/.env ${wt}/.env`));
+  assert.ok(block.includes('- deploy driver: docker-ssh'));
+  assert.ok(block.includes('build: node scripts/deploy.js build master'));
+  assert.ok(block.includes('- All factory CLI invocations (node scripts/factory.js …) run from the FACTORY repo checkout, not the card worktree.'));
 });

@@ -727,6 +727,7 @@ export function buildMetricsComment(r) {
  */
 export async function runMetricsReport({
   t = trello,
+  board, // FM-2 (§4.3): board-scoped reads (getBoardCards/getLists/getMe) target this board; undefined = default (byte-identical)
   since = null,
   noPost = false,
   notify = sendOwnerPing,
@@ -746,19 +747,19 @@ export async function runMetricsReport({
   let sinceIso = since ?? envStr('FACTORY_METRICS_SINCE') ?? state.lastRun ?? null;
   if (sinceIso && !Number.isFinite(Date.parse(sinceIso))) sinceIso = null;
 
-  const cards = await t.getBoardCards().catch((e) => {
+  const cards = await t.getBoardCards(undefined, { board }).catch((e) => {
     log(`board fetch failed: ${e.message}`);
     return null;
   });
   if (!cards) return { ok: false, report: null, errors: [`board fetch failed — no report this cycle`] };
 
-  const me = await t.getMe().catch((e) => {
+  const me = await t.getMe({ board }).catch((e) => {
     log(`identity lookup failed: ${e.message} — reply matching falls back to [HUMAN]-tag-only`);
     return null;
   });
 
   const listName = envStr('FACTORY_METRICS_LIST') || 'Done';
-  const lists = await t.getLists().catch(() => []);
+  const lists = await t.getLists({ board }).catch(() => []);
   const targetList =
     lists.find((l) => !l.closed && l.name?.toLowerCase() === String(listName).toLowerCase()) ?? null;
 

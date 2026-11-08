@@ -154,6 +154,34 @@ and the reviewer applies every matched area's doc before judging a diff.
   `tests/factoryStagePrompts.test.js` pins the guide, the reviewer doc,
   and this doc in sync.
 
+## Multi-repo + multi-board (FM-2)
+
+`config/factory-repos.json` (the repo registry, docs/factory-migration.md
+§4.1) maps each repo to its board, worktree root, base branch, deploy driver,
+and worktree bootstrap recipe. The rules:
+
+- **Card → repo routing:** a card `repo:<name>` label pins the repo; with no
+  label the board's registry entry is the default. An unknown or ambiguous
+  `repo:` label is **fail-closed**: the daemon posts one `[ASK]` + `needs-human`
+  and leaves the card in Ready (zero spawn) — never a guessed checkout.
+- **REPO CONTEXT block:** every dispatch and resume prompt ends with the
+  block generated from the registry — exact `repoDir`, worktree path,
+  `git worktree add` line, bootstrap recipe, and deploy/verify command lines.
+  Run all git operations for a repo in its `repoDir`; every
+  `node scripts/factory.js …` invocation runs from the FACTORY repo checkout.
+- **The daemon polls every registered board** each tick — per-board Ready
+  passes, Done-ping / comment-resume / stall-sweep / blocking-checks loops,
+  and crash recovery — through ONE global queue and the global
+  `FACTORY_MAX_PARALLEL` cap. State files stay card-id keyed (Done-ping is
+  per-board: `data/factory-done-ping.<board>.json` for non-default boards).
+- **CLI targeting:** `--board <id>` / `--repo <name>` resolve through the
+  registry on board/list/git commands (`status`, `init`, `pull`, `add`,
+  `move`, `ask`, `risk`, `merge-guard`, …). Flagless stays today's behavior:
+  the `TRELLO_BOARD` board and the registry `defaultRepo` — the git-flow
+  commands additionally resolve the repo when the cwd sits inside a
+  registered checkout or worktree. `init` ensures `To Do` alongside the
+  stage lists.
+
 ## Isolation — one worktree per card
 
 The factory spans out: cards run **concurrently** (`FACTORY_MAX_PARALLEL`,

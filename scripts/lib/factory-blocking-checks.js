@@ -303,8 +303,10 @@ function defaultWriteState(state) {
   renameSync(tmp, file);
 }
 
-async function findOpenList(listName, t) {
-  const lists = await t.getLists();
+// FM-2 (docs/factory-migration.md §4.3): `opts` carries the optional `board`
+// for the board-scoped getLists call; undefined → trello.js default board.
+async function findOpenList(listName, t, opts = {}) {
+  const lists = await t.getLists(opts);
   return (lists ?? []).find((l) => !l.closed && String(l.name).toLowerCase() === listName);
 }
 
@@ -322,6 +324,9 @@ async function findOpenList(listName, t) {
  */
 export async function tickBlockingChecks({
   t = trello,
+  board = undefined, // FM-2 (docs/factory-migration.md §4.3): list/card-fetch calls target this board; undefined → trello.js default (byte-identical)
+  worktreeOf = undefined, // FM-2 — the daemon injects a registry-driven resolver (config/factory-repos.json worktreeRoot); undefined keeps today's discord-bot default byte-identical
+  gitFor = undefined, // FM-2 — (card) => git runner of the card's ROUTED repo (branch refs live in that repo); undefined → the single `git` runner (byte-identical today)
   git = defaultGit,
   run = defaultRun,
   readState = defaultReadState,
@@ -333,10 +338,10 @@ export async function tickBlockingChecks({
   const summary = { checked: 0, pass: 0, fail: 0, bounced: 0, movedOutOfQa: 0, pruned: [], ok: true };
   let qaList, implList, cards;
   try {
-    qaList = await findOpenList('qa', t);
-    implList = await findOpenList('implement', t);
+    qaList = await findOpenList('qa', t, { board });
+    implList = await findOpenList('implement', t, { board });
     if (!qaList) throw new Error('no open QA list on the board');
-    cards = await t.getBoardCards('id,name,idList,labels,url');
+    cards = await t.getBoardCards('id,name,idList,labels,url', { board });
   } catch (e) {
     // assertCreds() throws / transient API errors — skip the tick (comment-
     // resume philosophy); the loop retries next tick.
@@ -389,7 +394,10 @@ export async function tickBlockingChecks({
     }
   };
 
-  const shaOfCard = (card) => tipShaOf(`factory/${card.id}`, { git });
+  // FM-2 (§4.4): a routed card's branch refs live in ITS repo (worktrees
+  // share refs per repo), so with `gitFor` injected the tip read runs in the
+  // routed repoDir; without it the single runner = today's ROOT byte-for-byte.
+  const shaOfCard = (card) => tipShaOf(`factory/${card.id}`, { git: gitFor ? gitFor(card) : git });
   const triggers = planChecks({ cards, qaListId: qaList.id, state, shaOf: shaOfCard });
   // Bounce moves owed from earlier ticks (moved:false at the current tip).
   const retries = planMoveRetries({ cards, qaListId: qaList.id, state, shaOf: shaOfCard });
@@ -410,8 +418,11 @@ export async function tickBlockingChecks({
       log(`[blocking-checks] ${card.id}: latest stage tag is ${latest ?? '(none)'}, not [QA:PASS] — skipping`);
       continue;
     }
+    // FM-2 (§4.3): registry-driven worktree resolver when injected; the
+    // default keeps today's discord-bot path byte-identical.
+    const wt = worktreeOf ? worktreeOf(card) : worktreePath(card.id);
     const { pass, results } = await runCheckSuite({
-      worktree: worktreePath(card.id),
+      worktree: wt,
       commands,
       run,
     });
@@ -487,6 +498,9 @@ export async function runBlockingChecksWatch({
   intervalMs = envNum('FACTORY_CHECK_INTERVAL_MS', envNum('FACTORY_POLL_MS', 15_000)),
   shouldStop = undefined,
   t = trello,
+  board = undefined, // FM-2 (docs/factory-migration.md §4.3): forwarded to every tick; undefined → trello.js default (byte-identical)
+  worktreeOf = undefined, // FM-2 — the daemon injects a registry-driven resolver (config/factory-repos.json worktreeRoot); undefined keeps today's discord-bot default byte-identical
+  gitFor = undefined, // FM-2 — (card) => git runner of the card's routed repo; undefined → `git` (byte-identical today)
   git = defaultGit,
   run = defaultRun,
   readState = defaultReadState,
@@ -503,7 +517,7 @@ export async function runBlockingChecksWatch({
   let last = empty();
   for (;;) {
     if (stopped()) return { ok: true, stopped: true, ...last };
-    const res = await tickBlockingChecks({ t, git, run, readState, writeState, commands, shouldStop: stopped, log });
+    const res = await tickBlockingChecks({ t, board, worktreeOf, gitFor, git, run, readState, writeState, commands, shouldStop: stopped, log });
     const { ok, pruned = [], ...counts } = res;
     last = {
       checked: last.checked + counts.checked,

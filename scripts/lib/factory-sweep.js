@@ -213,6 +213,7 @@ export async function runSweepOnce({
   gitLog = defaultGitLog,
   now = () => new Date(),
   log = console.error,
+  board, // FM-2 (§4.3): board-scoped reads (getLists/getBoardCards/label lookup) target this board; undefined = default (byte-identical)
 } = {}) {
   if (fetch) {
     // Best-effort freshness: on network failure sweep local refs instead
@@ -228,10 +229,10 @@ export async function runSweepOnce({
   if (slice.covered.length === 0) {
     return { action: 'skipped-empty-window', days, files: 0 };
   }
-  const lists = await t.getLists();
+  const lists = await t.getLists({ board });
   const ready = lists.find((l) => !l.closed && l.name.toLowerCase() === 'ready');
   if (!ready) throw new Error('Ready list missing (run factory.js init)');
-  const boardCards = await t.getBoardCards('id,name,idList');
+  const boardCards = await t.getBoardCards('id,name,idList', { board });
   const dupe = findSweepCard(boardCards, dateStr);
   if (dupe) {
     // Double-fire guard (cron+launchd coexistence, sleep-wake catch-up).
@@ -246,7 +247,8 @@ export async function runSweepOnce({
   const card = await t.createCard(title, ready.id, desc);
   // Existing precedent: the audit seeder's label helper (reuse-by-name, so
   // zero creates once the board's priority labels exist after seed-audit).
-  const labels = await ensurePriorityLabels({ t, boardId: t.BOARD });
+  // `boardId` follows the scoped board (undefined ⇒ t.BOARD, today's value).
+  const labels = await ensurePriorityLabels({ t, boardId: board ?? t.BOARD, board });
   await t.addLabelToCard(card.id, labels.Low);
   log(`filed: ${card.url}`);
   return { action: 'filed', card: card.id, url: card.url, title, list: 'Ready', files: slice.covered.length, overflow: slice.overflow };

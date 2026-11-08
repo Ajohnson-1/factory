@@ -104,9 +104,12 @@ function fakeTrello({ lists = LISTS, cardsSeq = [[]], comments = {}, moves = {},
     getCardCommentsBy: {},
     getCardMoves: 0,
     getCardMovesBy: {},
+    listsOpts: [],
+    boardOpts: [],
     addComment: 0,
     moveCard: 0,
     addLabelToCard: 0,
+    removeLabelToCard: 0,
     removeLabelFromCard: 0,
     fields: [],
   };
@@ -116,13 +119,15 @@ function fakeTrello({ lists = LISTS, cardsSeq = [[]], comments = {}, moves = {},
     calls,
     addCommentTexts,
     addCommentCards,
-    async getLists() {
+    async getLists(opts) {
       calls.getLists += 1;
+      calls.listsOpts.push(opts);
       return lists;
     },
-    async getBoardCards(fields) {
+    async getBoardCards(fields, opts) {
       calls.getBoardCards += 1;
       calls.fields.push(fields);
+      calls.boardOpts.push(opts);
       const v = take(cs);
       if (v instanceof Error) throw v;
       return v;
@@ -1215,4 +1220,43 @@ test('46. tick: getCardMoves throw → comment resume still proceeds + log', asy
   const r = await h.run({ once: true });
   assert.equal(r.resumed, 1);
   assert.ok(h.r.lines.some((l) => /move fetch failed/.test(l) && /comment-only/.test(l)));
+});
+
+// 47. FM-2 (§4.3): the per-board pass threads `board` into every board-scoped
+// read, and `repoFor` resolves the routed repo → the resume prompt carries the
+// REPO CONTEXT block with the registry worktree path.
+test('47. FM-2: board + repoFor → board-scoped reads + REPO CONTEXT resume prompt', async () => {
+  const repo = {
+    name: 'discord-bot',
+    repoDir: '/srv/discord-bot',
+    worktreeRoot: '/srv/discord-bot-factory-wt',
+    baseBranch: 'master',
+    board: 'ZZboard',
+    deploy: { driver: 'docker-ssh' },
+    worktreeBootstrap: ['cp .env <wt>/'],
+  };
+  const t = fakeTrello({ cardsSeq: [[stuckCard()]], comments: { [STUCK_ID]: stuckComments() } });
+  const sp = spawner();
+  const h = harness({ t, sp });
+  const r = await h.run({ once: true, board: 'ZZboard', repoFor: () => repo });
+  assert.equal(r.resumed, 1);
+  assert.deepEqual(t.calls.listsOpts, [{ board: 'ZZboard' }]); // every board read scoped
+  assert.deepEqual(t.calls.boardOpts, [{ board: 'ZZboard' }]);
+  assert.equal(sp.calls.length, 1);
+  assert.ok(sp.calls[0].prompt.includes('REPO CONTEXT (repo registry: config/factory-repos.json'));
+  assert.ok(sp.calls[0].prompt.includes(`git worktree at ${path.join('/srv/discord-bot-factory-wt', STUCK_ID)}`));
+  assert.ok(sp.calls[0].prompt.includes('- deploy driver: docker-ssh'));
+});
+
+// 48. FM-2 back-compat: no board/repoFor callers get `{ board: undefined }`
+// (trello's own default board — byte-identical) and the legacy prompt shape.
+test('48. FM-2: flagless callers stay byte-identical (undefined board, legacy prompt)', async () => {
+  const t = fakeTrello({ cardsSeq: [[stuckCard()]], comments: { [STUCK_ID]: stuckComments() } });
+  const sp = spawner();
+  const h = harness({ t, sp });
+  const r = await h.run({ once: true });
+  assert.equal(r.resumed, 1);
+  assert.deepEqual(t.calls.listsOpts, [{ board: undefined }]);
+  assert.ok(!sp.calls[0].prompt.includes('REPO CONTEXT'));
+  assert.ok(sp.calls[0].prompt.includes(`git worktree at ../discord-bot-factory-wt/${STUCK_ID}`));
 });

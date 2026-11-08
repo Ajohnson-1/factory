@@ -89,9 +89,12 @@ export function parseSectionC(md) {
  * Ensure open labels named exactly High/Medium/Low exist on the board
  * (PRIORITY_LABELS colors); reuse any that already exist by name.
  * Returns { High: labelId, Medium: labelId, Low: labelId }.
+ * FM-2 (§4.3): optional `board` scopes the label lookup to that board; a
+ * caller passing a custom board must pass its id as `boardId` too (createLabel
+ * takes an explicit idBoard). Undefined `board` = today's default board.
  */
-export async function ensurePriorityLabels({ t = trello, boardId } = {}) {
-  const labels = await t.getLabels();
+export async function ensurePriorityLabels({ t = trello, boardId, board } = {}) {
+  const labels = await t.getLabels({ board });
   const ids = {};
   for (const [name, color] of Object.entries(PRIORITY_LABELS)) {
     let label = labels.find((l) => l.name === name);
@@ -115,9 +118,10 @@ export async function runAuditSeed({
   dryRun = false,
   readDoc = (p) => readFileSync(p, 'utf8'),
   log = console.log,
+  board, // FM-2 (§4.3): board-scoped reads + the getBoard id resolve target this board; undefined = default (byte-identical)
 } = {}) {
   const parsed = parseSectionC(readDoc(docPath));
-  const lists = await t.getLists();
+  const lists = await t.getLists({ board });
   const list = lists.find(
     (l) => !l.closed && l.name.toLowerCase() === String(listName).toLowerCase(),
   );
@@ -125,7 +129,7 @@ export async function runAuditSeed({
   // Dedup against EVERY open card name on the board — survives mid-rerun
   // stage moves (a card the human already dragged to Ready must not be re-created).
   const existing = new Set(
-    (await t.getBoardCards('id,name,idList')).map((c) => String(c.name).trim()),
+    (await t.getBoardCards('id,name,idList', { board })).map((c) => String(c.name).trim()),
   );
   const names = parsed.map((f) => f.name);
   if (dryRun) {
@@ -139,8 +143,10 @@ export async function runAuditSeed({
       labelColors: PRIORITY_LABELS,
     };
   }
-  const board = await t.getBoard();
-  const labels = await ensurePriorityLabels({ t, boardId: board.id });
+  // The label-target board id comes from getBoard, so labels seed the same
+  // board the cards land on (custom `board` ⇒ that board's id).
+  const boardMeta = await t.getBoard({ board });
+  const labels = await ensurePriorityLabels({ t, boardId: boardMeta.id, board });
   const created = [];
   const skipped = [];
   for (const f of parsed) {

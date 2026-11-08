@@ -1,5 +1,7 @@
 // Scheduling invariants for the factory auto-start daemon (docs/factory.md).
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { loadRegistry, repoForCard } from '../scripts/lib/factory-registry.js'
 import {
   planDispatch,
   buildRunPrompt,
@@ -24,46 +26,75 @@ import {
 } from '../scripts/factory-daemon.js'
 import { ensureBootstrapped } from '../scripts/lib/factory-launchd.js'
 
-describe('planDispatch', () => {
+describe('planDispatch (FM-2: board-keyed entries {board, cardId}, global cap)', () => {
+  const E = (board, cardId) => ({ board, cardId })
+  const B1 = 'Bboard1'
+  const B2 = 'Bboard2'
   it('dispatches backlog up to the cap and queues the rest', () => {
-    const { queue, dispatch } = planDispatch([], ['a', 'b', 'c'], new Set(), 2)
-    expect(dispatch).toEqual(['a', 'b'])
-    expect(queue).toEqual(['c'])
+    const { queue, dispatch } = planDispatch([], [E(B1, 'a'), E(B1, 'b'), E(B1, 'c')], new Set(), 2)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['a', 'b'])
+    expect(queue.map((e) => e.cardId)).toEqual(['c'])
   })
 
   it('respects existing in-flight runs against the cap', () => {
-    const { queue, dispatch } = planDispatch([], ['a', 'b'], new Set(['x', 'y']), 3)
-    expect(dispatch).toEqual(['a'])
-    expect(queue).toEqual(['b'])
+    const { queue, dispatch } = planDispatch([], [E(B1, 'a'), E(B1, 'b')], new Set(['x', 'y']), 3)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['a'])
+    expect(queue.map((e) => e.cardId)).toEqual(['b'])
   })
 
   it('never re-dispatches a card whose run is still alive', () => {
-    const { queue, dispatch } = planDispatch([], ['a'], new Set(['a']), 3)
+    const { queue, dispatch } = planDispatch([], [E(B1, 'a')], new Set(['a']), 3)
     expect(dispatch).toEqual([])
     expect(queue).toEqual([]) // left in Ready while running, not double-tracked
   })
 
   it('keeps queued cards in arrival order ahead of new arrivals', () => {
-    const { queue, dispatch } = planDispatch(['c'], ['b', 'c'], new Set(), 3)
-    expect(dispatch).toEqual(['c', 'b'])
+    const { queue, dispatch } = planDispatch([E(B1, 'c')], [E(B1, 'b'), E(B1, 'c')], new Set(), 3)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['c', 'b'])
     expect(queue).toEqual([])
   })
 
   it('drops a queued card once it leaves Ready (cancel)', () => {
-    const { queue, dispatch } = planDispatch(['a'], [], new Set(), 3)
+    const { queue, dispatch } = planDispatch([E(B1, 'a')], [], new Set(), 3)
     expect(dispatch).toEqual([])
     expect(queue).toEqual([])
   })
 
   it('dispatches a waiting card when a slot frees', () => {
-    const { queue, dispatch } = planDispatch(['z'], ['z'], new Set(), 3)
-    expect(dispatch).toEqual(['z'])
+    const { queue, dispatch } = planDispatch([E(B1, 'z')], [E(B1, 'z')], new Set(), 3)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['z'])
     expect(queue).toEqual([])
   })
 
   it('is idempotent for a card already queued this tick', () => {
-    const { queue, dispatch } = planDispatch(['a'], ['a'], new Set(), 3)
-    expect(dispatch).toEqual(['a'])
+    const { queue, dispatch } = planDispatch([E(B1, 'a')], [E(B1, 'a')], new Set(), 3)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['a'])
+    expect(queue).toEqual([])
+  })
+
+  // FM-2 acceptance: two boards polled concurrently — one global queue, one
+  // global cap (FACTORY_MAX_PARALLEL bounds total in-flight runs ACROSS
+  // boards, docs/factory-migration.md §4.3).
+  it('interleaves two boards into one queue, cap stays global', () => {
+    const { queue, dispatch } = planDispatch(
+      [],
+      [E(B1, 'a'), E(B2, 'b'), E(B1, 'c')],
+      new Set(),
+      1,
+    )
+    expect(dispatch).toEqual([E(B1, 'a')])
+    expect(queue).toEqual([E(B2, 'b'), E(B1, 'c')]) // board order preserved, both boards queued
+  })
+
+  it('cancels a queued entry only when the card leaves ITS board (same id on another board is a different entry)', () => {
+    const { queue, dispatch } = planDispatch([E(B2, 'a')], [E(B1, 'a')], new Set(), 3)
+    expect(dispatch.map((e) => e.board)).toEqual([B1]) // B1/a is fresh; B2/a vanished from B2's Ready
+    expect(queue).toEqual([])
+  })
+
+  it('queued entries from one board keep their place ahead of fresh arrivals on the other', () => {
+    const { queue, dispatch } = planDispatch([E(B2, 'old')], [E(B1, 'new'), E(B2, 'old')], new Set(), 3)
+    expect(dispatch.map((e) => e.cardId)).toEqual(['old', 'new'])
     expect(queue).toEqual([])
   })
 })
@@ -138,6 +169,40 @@ describe('buildRunPrompt', () => {
     expect(prompt).toContain('review-verify')
     expect(prompt).toContain('[REVIEW:VERIFY]')
     expect(prompt).toContain('bounces')
+  })
+
+  // FM-2 (docs/factory-migration.md §4.3): the REPO CONTEXT block — exact
+  // paths and commands from config/factory-repos.json, so a run never has to
+  // guess where its repo lives.
+  const reg = loadRegistry({ env: {} })
+  const BOT = reg.repos['discord-bot']
+
+  it('embeds the REPO CONTEXT block from the committed registry default (factory)', () => {
+    const p = buildRunPrompt({ id: '6ae4b88307df4b89018e8d7f', name: 'X' })
+    expect(p).toContain('REPO CONTEXT (repo registry: config/factory-repos.json')
+    expect(p).toContain('- repo: factory')
+    expect(p).toContain(`- repoDir: ${reg.repos.factory.repoDir} (all git operations for this repo run here)`)
+    expect(p).toContain('- deploy driver: self')
+    expect(p).toContain('- All factory CLI invocations (node scripts/factory.js …) run from the FACTORY repo checkout, not the card worktree.')
+    expect(p).toContain('Worktree bootstrap per the REPO CONTEXT block below (branch factory/6ae4b88307df4b89018e8d7f cut from origin/master)')
+  })
+
+  it('renders the routed repo: worktree path, worktree-add line, and the exact bootstrap recipe (discord-bot)', () => {
+    const id = '6ae4b88307df4b89018e8d7f'
+    const p = buildRunPrompt({ id, name: 'X' }, { repo: BOT })
+    const wt = join(BOT.worktreeRoot, id)
+    expect(p).toContain('- repo: discord-bot')
+    expect(p).toContain(`- worktree: ${wt}`)
+    expect(p).toContain(`  create: git -C ${BOT.repoDir} worktree add ${wt} -b factory/${id} origin/master`)
+    expect(p).toContain('ln -s ../../discord-bot/node_modules node_modules')
+    expect(p).toContain(`cp .env version.json ${wt}/`)
+    expect(p).toContain(`test -f ${wt}/.env || cp `) // <factoryRoot> substituted
+    expect(p).not.toContain('<wt>')
+    expect(p).toContain('build: node scripts/deploy.js build master')
+    expect(p).toContain('deploy: node scripts/deploy.js deploy <sha>')
+    expect(p).toContain('rollback (after [VERIFY:FAIL]): node scripts/deploy.js rollback')
+    expect(p).toContain('verify: node scripts/verify-deploy.js')
+    expect(p).toContain('- deploy driver: docker-ssh')
   })
 })
 
@@ -609,7 +674,7 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
 
   // Fake board: every trello call the crash path makes, scripted + recorded.
   const fakeT = ({ comments = [], idList = IMPL.id, getCardThrows = false, getListsThrows = false } = {}) => {
-    const calls = { comments: [], getCard: [], getLists: 0, commentsWritten: [], moves: [], labels: 0, labelAdded: [] }
+    const calls = { comments: [], getCard: [], getLists: 0, listsOpts: [], commentsWritten: [], moves: [], labels: 0, labelAdded: [] }
     return {
       calls,
       getCardComments: async (id) => {
@@ -621,8 +686,9 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
         if (getCardThrows) throw new Error('404: card gone')
         return { id, idList }
       },
-      getLists: async () => {
+      getLists: async (opts) => {
         calls.getLists += 1
+        calls.listsOpts.push(opts)
         if (getListsThrows) throw new Error('429: rate limited')
         return [READY, IMPL, VERIFY, DONE, { id: 'L-closed', name: 'Archive', closed: true }]
       },
@@ -983,6 +1049,68 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     )
     expect(spawned).toHaveLength(1)
   })
+
+  it('FM-2: board scopes the fresh board read; repo embeds the REPO CONTEXT in the resume prompt', async () => {
+    const t = fakeT({ comments: [implVerdict] })
+    const spawned = []
+    const repo = {
+      name: 'discord-bot',
+      repoDir: '/srv/discord-bot',
+      worktreeRoot: '/srv/discord-bot-factory-wt',
+      baseBranch: 'master',
+      board: 'ZZboard',
+      deploy: { driver: 'docker-ssh' },
+      worktreeBootstrap: ['cp .env <wt>/'],
+    }
+    await handleRunCrash({
+      readRunLog: () => '',
+      card,
+      code: 'SIGKILL',
+      t,
+      readyList: READY,
+      board: 'ZZboard',
+      repo,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(t.calls.listsOpts).toEqual([{ board: 'ZZboard' }]) // the per-board pass reads ITS board
+    const [, prompt] = spawned[0]
+    expect(prompt).toContain('REPO CONTEXT (repo registry: config/factory-repos.json')
+    expect(prompt).toContain(`Reuse the existing worktree and branch factory/${card.id} if present (git worktree at ${join('/srv/discord-bot-factory-wt', card.id)})`)
+    expect(prompt).toContain(`cp .env ${join('/srv/discord-bot-factory-wt', card.id)}/`)
+    expect(prompt).not.toContain('../discord-bot-factory-wt/') // no stale hard-coded path
+  })
+})
+
+// FM-2 card acceptance: a `repo:discord-bot`-labelled card on the softwarefactory
+// board must get a discord-bot worktree — label → registry repo → worktree path
+// in the dispatched prompt (dispatch itself uses exactly this chain).
+describe('FM-2 dispatch routing (repo: label → registry repo → worktree prompt)', () => {
+  const reg = loadRegistry({ env: {} })
+
+  it('routes the labelled card past the softwarefactory board default into discord-bot', () => {
+    const card = {
+      id: '6ae4b88307df4b89018e8d7f',
+      name: 'FM-2 canary',
+      labels: [{ name: 'Factory Migrations' }, { name: 'repo:discord-bot' }],
+    }
+    const routing = repoForCard(reg, { labels: card.labels, board: 'LLNG5MAm' }) // softwarefactory board default = factory
+    expect(routing.ok).toBe(true)
+    expect(routing.source).toBe('label')
+    expect(routing.repo.name).toBe('discord-bot')
+    const prompt = buildRunPrompt(card, { repo: routing.repo })
+    expect(prompt).toContain(`- worktree: ${join(routing.repo.worktreeRoot, card.id)}`)
+    expect(prompt).toContain('- deploy driver: docker-ssh')
+    // worktree bootstrap recipe for the discord-bot worktree
+    expect(prompt).toContain('ln -s ../../discord-bot/node_modules node_modules')
+  })
+
+  it('an unknown repo label fails closed (the daemon [ASK]s + leaves the card in Ready — zero spawn)', () => {
+    const routing = repoForCard(reg, { labels: [{ name: 'repo:nope-bot' }], board: 'LLNG5MAm' })
+    expect(routing.ok).toBe(false)
+    expect(routing.reason).toBe('unknown-repo')
+  })
 })
 
 describe('exitCodeStr / isStallCode (D1 stall codes — card 6aebab9a65613358f4ca333a)', () => {
@@ -1008,7 +1136,7 @@ describe('daemon stall-sweep wiring pins (card 6aebab9a65613358f4ca333a)', () =>
   const src = readFileSync(new URL('../scripts/factory-daemon.js', import.meta.url), 'utf8')
 
   it('both exit handlers route EVERY exit through crashRecovery (no code !== 0 gate left)', () => {
-    expect(src.match(/crashRecovery\(card, exitCodeStr\(code, sig\)\)/g)).toHaveLength(2)
+    expect(src.match(/crashRecovery\(card, exitCodeStr\(code, sig\), (runCtx|ctx)\)/g)).toHaveLength(2)
     expect(src).not.toMatch(/if \(code !== 0\) crashRecovery/)
   })
 
@@ -1017,6 +1145,15 @@ describe('daemon stall-sweep wiring pins (card 6aebab9a65613358f4ca333a)', () =>
     expect(src).toMatch(/void superviseStallSweep\(\{/)
     expect(src).toMatch(/recover: \(orphanCard, code\) => crashRecovery/)
     expect(src).toMatch(/recover: \(stalledCard, code\) => crashRecovery/)
+  })
+
+  it('FM-2: every registered board gets its own boot sweep + supervised pollers (§4.3)', () => {
+    expect(src).toMatch(/for \(const ctx of ctxs\) \{[\s\S]*?await bootStallSweep\(\{[\s\S]*?board: ctx\.board/)
+    expect(src).toMatch(/for \(const ctx of ctxs\) \{[\s\S]*?runDoneWatch\(\{ \.\.\.opts, board: ctx\.board \}\)/)
+    expect(src).toMatch(/runCommentResumeWatch\(\{ \.\.\.opts, board: ctx\.board, repoFor/)
+    expect(src).toMatch(/runStallSweepWatch\(\{ \.\.\.opts, board: ctx\.board \}\)/)
+    expect(src).toMatch(/runBlockingChecksWatch\(\{[\s\S]*?board: ctx\.board,[\s\S]*?worktreeOf:[\s\S]*?gitFor/)
+    expect(src).toMatch(/boardIds\(repos\)/)
   })
 })
 

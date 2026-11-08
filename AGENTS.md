@@ -15,8 +15,14 @@ risk gate) is [docs/factory.md](docs/factory.md). Stage prompts:
 ## Repo registry
 
 `config/factory-repos.json` maps repo ↔ board ↔ worktree ↔ deploy driver;
-machine-local override via `FACTORY_REPOS_FILE`. v1 = load/validate only
-(routing lands FM-2).
+machine-local override via `FACTORY_REPOS_FILE`. FM-2 landed the routing:
+`repoForCard` (`repo:<name>` card label beats the board default;
+unknown/ambiguous → fail-closed `[ASK]`, never a guess), `detectRepo`
+(`--repo` flag → cwd worktree/checkout match → `defaultRepo`), the daemon
+polls every registered board (per-board lists + pollers, one global cap),
+and the run/resume prompts carry a REPO CONTEXT block with the exact
+worktree/bootstrap/deploy lines. Both entries still carry `ZHkVYBN1` until
+FM-3 flips the factory entry to `LLNG5MAm`.
 
 ## Runtime rule
 
