@@ -1,7 +1,9 @@
 # Software Factory
 
-Looping card pipeline over the Trello board
-<https://trello.com/b/ZHkVYBN1/discord-bot>. The omp session is the
+Looping card pipeline over the Trello boards in the repo registry
+(<https://trello.com/b/LLNG5MAm/softwarefactory> for factory work since
+FM-3; <https://trello.com/b/ZHkVYBN1/discord-bot> for product cards until
+the FM-6 cutover). The omp session is the
 **scheduler**: it polls the board, fans cards out as parallel pipelines, and
 spawns a specialized subagent per stage. Trello lists are state; card
 comments are the audit log.
@@ -158,7 +160,8 @@ and the reviewer applies every matched area's doc before judging a diff.
 
 `config/factory-repos.json` (the repo registry, docs/factory-migration.md
 §4.1) maps each repo to its board, worktree root, base branch, deploy driver,
-and worktree bootstrap recipe. The rules:
+and worktree bootstrap recipe. Since FM-3 the committed config is split:
+`factory` → `LLNG5MAm`, `discord-bot` → `ZHkVYBN1`. The rules:
 
 - **Card → repo routing:** a card `repo:<name>` label pins the repo; with no
   label the board's registry entry is the default. An unknown or ambiguous

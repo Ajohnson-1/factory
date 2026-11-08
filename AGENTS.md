@@ -9,8 +9,9 @@ and migration state live in [docs/factory-migration.md](docs/factory-migration.m
 
 The full board-is-the-state contract (stages, tags, watermarks, ask protocol,
 risk gate) is [docs/factory.md](docs/factory.md). Stage prompts:
-[docs/factory-prompts/](docs/factory-prompts/). Board today: `ZHkVYBN1`
-(single-board parity); the factory board `LLNG5MAm` activates in FM-3.
+[docs/factory-prompts/](docs/factory-prompts/). Factory work flows on the
+factory board `LLNG5MAm` (FM-3 flipped the registry); product cards keep
+flowing on `ZHkVYBN1` until the FM-6 cutover.
 
 ## Repo registry
 
@@ -21,8 +22,8 @@ unknown/ambiguous → fail-closed `[ASK]`, never a guess), `detectRepo`
 (`--repo` flag → cwd worktree/checkout match → `defaultRepo`), the daemon
 polls every registered board (per-board lists + pollers, one global cap),
 and the run/resume prompts carry a REPO CONTEXT block with the exact
-worktree/bootstrap/deploy lines. Both entries still carry `ZHkVYBN1` until
-FM-3 flips the factory entry to `LLNG5MAm`.
+worktree/bootstrap/deploy lines. The `factory` entry carries `LLNG5MAm`
+since FM-3; `discord-bot` stays on `ZHkVYBN1` until FM-6.
 
 ## Runtime rule
 

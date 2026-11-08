@@ -160,22 +160,21 @@ test('10. loadRegistry: DI read supplies the file content (no fs)', () => {
   assert.equal(reg.repos.factory.repoDir, 'C:/factory');
 });
 
-test('11. the committed config/factory-repos.json itself validates (FM-1 single-board parity)', () => {
+test('11. the committed config/factory-repos.json itself validates (FM-3 board split)', () => {
   const reg = loadRegistry({ env: {} }); // default path → repo's own config file
   assert.equal(reg.defaultRepo, 'factory');
-  for (const name of ['factory', 'discord-bot']) {
-    assert.ok(reg.repos[name], `registry must contain ${name}`);
-    assert.equal(reg.repos[name].board, 'ZHkVYBN1'); // FM-1: single board until FM-3 flips factory
-  }
+  assert.ok(reg.repos.factory && reg.repos['discord-bot'], 'registry must contain both repos');
+  assert.equal(reg.repos.factory.board, 'LLNG5MAm'); // FM-3: factory work flows on the factory board
+  assert.equal(reg.repos['discord-bot'].board, 'ZHkVYBN1'); // product board until FM-6
   assert.equal(reg.repos['discord-bot'].deploy.driver, 'docker-ssh');
   assert.equal(reg.repos.factory.deploy.driver, 'self');
 });
 
 // ── FM-2 routing surface (docs/factory-migration.md §4.1–§4.4, D3) ─────────
 
-// Two repos, two distinct boards — the shape FM-3+ ships (factory entry
-// flipped to LLNG5MAm). The committed config (test 11) keeps BOTH on
-// ZHkVYBN1 until then, which is what the ambiguous-board path models.
+// Two repos, two distinct boards — exactly the shape the committed config
+// carries since FM-3's flip (test 11); sharedBoard() below models the
+// FM-1/FM-2 interim parity that the ambiguous-board path still guards.
 function twoRepo(overrides = {}) {
   return validateRegistry({
     defaultRepo: 'factory',
@@ -205,15 +204,40 @@ function twoRepo(overrides = {}) {
   });
 }
 
+// Both repos on ONE board — the FM-1/FM-2 interim parity shape the boardIds
+// dedup + ambiguous-board paths model (the committed config looked like this
+// until FM-3's flip).
+function sharedBoard() {
+  return validateRegistry({
+    defaultRepo: 'factory',
+    repos: {
+      factory: {
+        repoDir: '~/GitHub/factory',
+        worktreeRoot: '~/GitHub/factory-factory-wt',
+        baseBranch: 'master',
+        board: 'ZHkVYBN1',
+        deploy: { driver: 'self' },
+      },
+      'discord-bot': {
+        repoDir: '~/GitHub/discord-bot',
+        worktreeRoot: '~/GitHub/discord-bot-factory-wt',
+        baseBranch: 'master',
+        board: 'ZHkVYBN1',
+        deploy: { driver: 'docker-ssh' },
+      },
+    },
+  });
+}
+
 const CARD = '6ae4b88307df4b89018e8d7f';
 
 // ── boardIds ───────────────────────────────────────────────────────────────
 
-test('12. boardIds: distinct boards, defaultRepo first; same-board repos dedup to one poll id (FM-1 parity config)', () => {
+test('12. boardIds: distinct boards, defaultRepo first; same-board repos dedup to one poll id', () => {
   const reg = twoRepo();
   assert.deepEqual(boardIds(reg), ['LLNG5MAm', 'ZHkVYBN1']); // defaultRepo=factory first, then registry order
-  const parity = loadRegistry({ env: {} }); // both entries ZHkVYBN1
-  assert.deepEqual(boardIds(parity), ['ZHkVYBN1']); // deduped — today's daemon polls ONE board
+  assert.deepEqual(boardIds(loadRegistry({ env: {} })), ['LLNG5MAm', 'ZHkVYBN1']); // FM-3: the committed config is split — the daemon polls BOTH boards
+  assert.deepEqual(boardIds(sharedBoard()), ['ZHkVYBN1']); // parity shape dedups to ONE poll id (FM-1/FM-2 interim)
 });
 
 // ── repoForCard (D3 precedence) ────────────────────────────────────────────
@@ -250,7 +274,7 @@ test('16. repoForCard: no label → board default; several repos on one board �
   assert.equal(repoForCard(reg, { labels: [], board: 'LLNG5MAm' }).repo.name, 'factory');
   assert.equal(repoForCard(reg, { labels: [], board: 'UnknownBd' }).repo.name, 'factory'); // default fallback
   assert.equal(repoForCard(reg, { labels: [] }).repo.name, 'factory'); // no board either
-  const shared = loadRegistry({ env: {} }); // FM-1 parity: BOTH repos claim ZHkVYBN1
+  const shared = sharedBoard(); // FM-1/FM-2 parity: BOTH repos claimed ZHkVYBN1
   const amb = repoForCard(shared, { labels: [], board: 'ZHkVYBN1' });
   assert.equal(amb.ok, false);
   assert.equal(amb.reason, 'ambiguous-board');

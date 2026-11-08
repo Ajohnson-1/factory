@@ -5,7 +5,7 @@
       "repoDir": "~/GitHub/factory",
       "worktreeRoot": "~/GitHub/factory-factory-wt",
       "baseBranch": "master",
-      "board": "ZHkVYBN1",
+      "board": "LLNG5MAm",
       "deploy": { "driver": "self" },
       "worktreeBootstrap": []
     },

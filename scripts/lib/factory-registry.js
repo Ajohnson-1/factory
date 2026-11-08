@@ -122,10 +122,10 @@ export function loadRegistry({ file, env = process.env, read = readFileSync } = 
 
 /**
  * The distinct board ids the daemon must poll (FM-2, §4.3). One board per
- * registered repo, deduped — today's committed config shares `ZHkVYBN1`
- * across both entries (single-board parity until FM-3 flips the factory
- * entry to `LLNG5MAm`), so this returns one id until then. The
- * `defaultRepo`'s board leads; the rest keep registry order.
+ * registered repo, deduped — since FM-3 the committed config is split
+ * (`factory` → `LLNG5MAm`, `discord-bot` → `ZHkVYBN1`), so this returns two
+ * ids; a legacy single-board config (both entries on `ZHkVYBN1`) returns one.
+ * The `defaultRepo`'s board leads; the rest keep registry order.
  */
 export function boardIds(registry) {
   const ids = [];
@@ -159,8 +159,9 @@ function labelNames(labels) {
  *      two named repos is still an ambiguity only a human can resolve);
  *   3. no label → the unique repo whose `board` equals `board`; several repos
  *      sharing a board → `{ ok: false, reason: 'ambiguous-board' }` (the
- *      FM-2/interim shape while both entries carry `ZHkVYBN1` — a label or
- *      FM-3's board split resolves it);
+ *      FM-1/FM-2 interim shape while both entries carried `ZHkVYBN1` —
+ *      FM-3's board split resolved it; the fail-closed path stays for any
+ *      config that maps two repos to one board);
  *   4. no board match at all → `defaultRepo` (a board outside the registry
  *      — the CLI's `--board` can name one — routes to the default).
  * `labels` accepts Trello label objects (`{name}`) or plain strings. The
