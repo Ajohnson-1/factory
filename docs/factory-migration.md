@@ -261,3 +261,42 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
 - **`FACTORY_MAX_PARALLEL=0` is poll-only mode** (dispatch never starts) —
   used for the read-only two-board daemon smoke so §7's single-dispatcher
   rule held while the discord-bot daemon stayed live.
+
+### FM-3 notes (recorded)
+
+- **Registry flip landed:** the `factory` entry now carries `LLNG5MAm`;
+  `discord-bot` stays on `ZHkVYBN1` until FM-6. `boardIds()` returns two
+  boards for the daemon; the committed-config test pins assert the split and
+  a `sharedBoard()` fixture keeps the parity shape (dedup + ambiguous-board)
+  under test.
+- **Board state at flip:** `LLNG5MAm` already had all stage lists + `To Do`
+  (FM-2's early `init`), the legacy `Todo` list was archived, and the
+  backlog cards sat inert in `To Do`. `metrics --repo factory` recreated the
+  `Factory metrics report` card in the board's `Done` list (idShort 14) —
+  find-or-create works against a fresh board. Sweep/prod-watch cards land
+  natively: both take the scoped board and default to `TRELLO_BOARD` while
+  the discord-bot daemon still runs them (FM-6 moves them).
+- **Acceptance canary (end-to-end on `LLNG5MAm`, discord-bot board live):**
+  docs-only card `6af08deef81c512d67d5cd3a`, label `repo:discord-bot`,
+  dispatched by the factory repo's daemon (`FACTORY_STALL_SILENCE_MS` frozen
+  so stall recovery stayed owned by the live discord-bot daemon for its
+  in-flight card): `[PLAN]`→`[IMPL]`→`[REVIEW:APPROVE]`→`[SEC:PASS]`→
+  `[QA:PASS]`→merge `--ff-only`→`[DEPLOY] sha=5d405d8`→`[VERIFY:PASS]`→Done,
+  worktree + branch cut and cleaned in the registry's
+  `discord-bot-factory-wt` root. Deviation: two daemon processes on one
+  machine during the window (§7's one-checkout rule) — boards were disjoint
+  by construction: the discord-bot daemon (pre-FM-2 copy) only knows
+  `ZHkVYBN1`; the canary polled both but `ZHkVYBN1`'s Ready stayed empty,
+  so zero cross-dispatch. FM-6 folds ownership back into one daemon.
+- **`[CHECK:FAIL]` bounce was real, not plumbing:** the blocking gate ran
+  `npm test` in the routed worktree and 3 suites (7 tests) failed —
+  reproducing byte-identically in the main discord-bot checkout (product
+  `multiBotConfig`-style tests need the gitignored `config/*.config.json`
+  per-bot overlays; they've been cleaned off the machine). The pipeline
+  bounced once, the run rebased/re-pushed, Deploy+Verify passed. A product
+  test fix is discord-bot backlog work, not factory plumbing.
+- **Self-dispatch footgun:** starting the factory daemon while FM-3 itself
+  sat in `Ready` made it dispatch its own step card (the agent began the
+  pipeline before the operator killed it; the card's `[DAEMON-CRASH]`
+  comment is that SIGTERM's trail). Meta-cards being worked interactively
+  MUST sit in `To Do`, not `Ready`.
