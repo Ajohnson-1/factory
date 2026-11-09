@@ -645,13 +645,21 @@ async function run({ registry = undefined } = {}) {
 
   // Boot STALL SWEEP (card 6aebab9a65613358f4ca333a — replaces the old
   // log-only orphan-candidate loop, keeping its log lines): cards stranded
-  // mid-pipeline with no owned run and a silent comment trail past
-  // FACTORY_MAX_TIME + grace get recovered through `crashRecovery` right at
-  // boot instead of only being reported (RC2). Never throws internally.
+  // mid-pipeline with no owned run are recovered through `crashRecovery`
+  // right at boot instead of only being reported (RC2). Never throws
+  // internally. FM-4: `silenceMs: 0` — the SILENCE window (max-time+grace)
+  // protects LIVE runs from the periodic sweep; at boot it protects nothing,
+  // because a freshly started daemon owns no children — every in-flight card
+  // without an owned run IS a stranded run (the `self` deploy driver makes
+  // this the normal path: deploying restarts the daemon, killing its own
+  // run, and the boot sweep resumes it within seconds instead of after the
+  // 12h+ window). Two-dispatcher deviation windows (§7, FM-3/FM-4) keep
+  // boards DISJOINT so a boot sweep never touches the other daemon's runs.
   // FM-2: per board — the lists it names are per-board (§4.3).
   for (const ctx of ctxs) {
     await bootStallSweep({
       board: ctx.board,
+      silenceMs: 0,
       log,
       recover: (orphanCard, code) => crashRecovery(orphanCard, code, ctx),
       isBusy: (id) => runs.has(id),

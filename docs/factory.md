@@ -202,9 +202,16 @@ a child of the daemon it restarts, so the restart is **armed, not
 completed** — macOS hands bootout+bootstrap to a detached guard in its own
 session (the `bootstrapGuard` precedent, `scripts/lib/factory-launchd.js`);
 Linux arms `systemd-run --user --on-active=2s systemctl --user restart
-factory-daemon.service` (the FM-5 box path). If the SIGTERM cascade kills the
-run mid-deploy, crash recovery resumes the card and the deploy is idempotent
-(ff-pull of the same sha = no-op; a guard re-arm is harmless). The runtime
+`factory-daemon.service` (the FM-5 box path). If the SIGTERM cascade kills the
+run mid-deploy, crash recovery resumes the card and the deploy is idempotent:
+ff-pull of the same sha is a no-op, and a redeploy of a sha the unit is
+ALREADY ACTIVE on (last deploy-history entry = same sha) prints
+`restart skipped`, exits 0 WITHOUT arming another restart and without a
+history append — otherwise the resumed run would self-kill on every retry and
+bounce into the crash cap (the boot orphan sweep resumes with ZERO silence,
+so one restart = one `[DAEMON-CRASH]` + one stage-aware resume). A dead unit
+still gets the guard (its bootstrap revives it);
+`FACTORY_DEPLOY_FORCE=1` forces a restart on an unchanged sha. The runtime
 clone is `deploy.runtimeClone` (default `repoDir`); a dirty clone fails
 closed (exit 2, never clobbers local work). `verify-factory.js` proves the
 new daemon really reaches Trello: a `watching "Ready"` boot marker AND a
@@ -216,6 +223,7 @@ deterministically between the last two shas. Until the FM-6 cutover the
 installed launchd job still runs the discord-bot checkout — a `self` restart
 cycles THAT job; FM-6 points the plist at the factory runtime clone this
 driver pulls. Knobs: `FACTORY_DEPLOY_CLONE` (override the runtime clone),
+`FACTORY_DEPLOY_FORCE=1` (restart even when already active on the target sha),
 `FACTORY_VERIFY_TIMEOUT_MS` (default 180000), `FACTORY_VERIFY_INTERVAL_MS`
 (default 5000).
 
@@ -566,7 +574,11 @@ node scripts/factory-daemon.js uninstall
 - The daemon also **boot-sweeps and supervises the STALL SWEEP** in-process
   (`scripts/lib/factory-stall-sweep.js`; CLI `factory.js stall-sweep`), the
   orphan-recovery twin of the comment watcher. At boot — replacing the old
-  log-only "orphan candidate" report, whose log lines it keeps — and every
+  log-only "orphan candidate" report, whose log lines it keeps — with **zero
+  silence** (FM-4: a freshly started daemon owns no children, so every
+  in-flight card without an owned run is stranded — the `self` deploy
+  driver's restart kills its own caller run, and boot recovery resumes it in
+  seconds; deviation windows keep boards DISJOINT per §7), then every
   `FACTORY_STALL_POLL_MS` (default 300000 = 5 min) it recovers in-flight
   cards with no live run whose NEWEST comment of any kind is older than
   `FACTORY_STALL_SILENCE_MS` (default `FACTORY_MAX_TIME` + 15 min; the

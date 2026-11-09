@@ -1162,6 +1162,13 @@ describe('daemon stall-sweep wiring pins (card 6aebab9a65613358f4ca333a)', () =>
     expect(src).toMatch(/export const LABEL = 'com\.ajjohnson\.factory-daemon'/)
     expect(src).toMatch(/export const PLIST_PATH =/)
   })
+
+  it('FM-4: boot orphan recovery uses zero silence — the `self` deploy restart resumes its own run at boot', () => {
+    // A fresh daemon owns no children: every in-flight card without an owned
+    // run is stranded (the self driver's restart kills its own caller run).
+    // The periodic sweep keeps the max-time+grace window; boot must not wait.
+    expect(src).toMatch(/bootStallSweep\(\{[\s\S]{0,120}silenceMs: 0,/)
+  })
 })
 
 describe('superviseBlockingChecks', () => {

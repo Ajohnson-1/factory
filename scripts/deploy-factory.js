@@ -39,6 +39,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { detectRepo, loadRegistry } from './lib/factory-registry.js';
 import { LABEL, PLIST_PATH } from './factory-daemon.js';
+import { unitActiveDarwin, unitActiveLinux } from './verify-factory.js';
 
 const LAUNCHD_LIB_URL = pathToFileURL(join(resolve(dirname(fileURLToPath(import.meta.url)), '..'), 'scripts/lib/factory-launchd.js')).href;
 
@@ -176,7 +177,7 @@ export function restartFor(platform = process.platform) {
  * deploy — ff the runtime clone to origin/<branch>, then arm the restart.
  * @returns {{ok:boolean, exit:number, sha?:string, short?:string, via?:string, error?:string}}
  */
-export function deploy({ target, restart = restartFor(), platform = process.platform, git = defaultGitRunner, out = (s) => console.log(s) } = {}) {
+export function deploy({ target, restart = restartFor(), platform = process.platform, git = defaultGitRunner, unitActive = undefined, env = process.env, out = (s) => console.log(s) } = {}) {
   if (!target.ok) return { ok: false, exit: 2, error: target.error };
   const { clone, branch } = target;
   const fail = (exit, error) => ({ ok: false, exit, error });
@@ -208,6 +209,23 @@ export function deploy({ target, restart = restartFor(), platform = process.plat
   if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) return fail(1, `rev-parse HEAD returned ${JSON.stringify(sha)}`);
   const short = g(['rev-parse', '--short=7', sha]);
   if (short.code !== 0 || !/^[0-9a-f]{7}$/.test(short.stdout.trim())) return fail(1, `rev-parse --short=7 failed: ${JSON.stringify(short.stdout.trim())}`);
+
+  // FM-4 idempotent redeploy: the unit is ALREADY ACTIVE on the target sha
+  // (last deploy-history entry = this sha) → arming another restart only
+  // kills the caller's own run a second time; crash-resume would re-run
+  // deploy, self-kill again, and bounce into the crash cap. No-op exit 0,
+  // NO history append — verify-factory checks the ORIGINAL restart's
+  // boot+poll markers against its ts. Unit INACTIVE → arm the guard anyway
+  // (its bootstrap revives a dead unit). FACTORY_DEPLOY_FORCE=1 bypasses
+  // (real config change landing on an unchanged sha).
+  const last = readHistory(clone).filter((e) => e.action === 'deploy' || e.action === 'rollback').slice(-1)[0];
+  if (last && last.sha === sha && !env.FACTORY_DEPLOY_FORCE) {
+    const check = unitActive ?? (platform === 'linux' ? () => unitActiveLinux({}) : () => unitActiveDarwin({}));
+    if (check().active) {
+      out(`DEPLOYED ${short.stdout.trim()} sha=${sha} clone=${clone} restart skipped — unit already active on this sha since ${last.ts}`);
+      return { ok: true, exit: 0, sha, short: short.stdout.trim(), clone, via: 'restart skipped (unit active on this sha)' };
+    }
+  }
 
   const r = restart({});
   if (!r.ok) return fail(1, `daemon restart failed: ${r.error}`);

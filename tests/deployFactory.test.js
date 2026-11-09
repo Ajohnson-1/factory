@@ -408,3 +408,121 @@ test('restartFor: darwin/linux branch, null elsewhere', () => {
   assert.equal(typeof restartFor('linux'), 'function');
   assert.equal(restartFor('freebsd'), null);
 });
+
+// --- FM-4 idempotent same-sha redeploy ----------------------------------------
+
+function seededClone(sha, extra = []) {
+  const dir = mkdtempSync(join(tmpdir(), 'deploy-factory-'));
+  mkdirSync(join(dir, '.git'));
+  mkdirSync(join(dir, 'data'), { recursive: true });
+  const lines = [{ ts: '2026-11-09T00:00:00.000Z', sha, short: sha.slice(0, 7), action: 'deploy', restart: 'launchd-guard pid 1' }, ...extra]
+    .map((e) => JSON.stringify(e));
+  appendFileSync(join(dir, HISTORY_REL), lines.join('\n') + '\n');
+  return dir;
+}
+
+test('deploy: same sha + unit active → restart skipped, no history append, exit 0', () => {
+  const clone = seededClone(FULL);
+  try {
+    const git = fakeGit(OK_HEAD);
+    let restarts = 0;
+    const lines = [];
+    const res = deploy({
+      target: { ok: true, repo: REG.repos.factory, clone, branch: 'master' },
+      restart: () => { restarts++; return { ok: true, via: 'x' }; },
+      git,
+      unitActive: () => ({ active: true, detail: 'running pid=99' }),
+      env: {},
+      out: (s) => lines.push(s),
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.exit, 0);
+    assert.equal(restarts, 0);
+    assert.match(res.via, /restart skipped/);
+    assert.match(lines.join('\n'), new RegExp(`DEPLOYED ${SHORT} sha=${FULL}.*restart skipped`));
+    const hist = readHistory(clone);
+    assert.equal(hist.length, 1); // no append — the ORIGINAL restart ts stays verify's restartAt
+    assert.equal(hist[0].ts, '2026-11-09T00:00:00.000Z');
+    // ff-pull still runs (git steps up to rev-parse, no more)
+    assert.deepEqual(git.keys().slice(-1)[0], `rev-parse --short=7 ${FULL}`);
+    assert.ok(!git.keys().includes('log --oneline -20'));
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test('deploy: same sha + unit INACTIVE → restart still armed (bootstrap revives dead unit)', () => {
+  const clone = seededClone(FULL);
+  try {
+    let restarts = 0;
+    const res = deploy({
+      target: { ok: true, repo: REG.repos.factory, clone, branch: 'master' },
+      restart: () => { restarts++; return { ok: true, via: 'launchd-guard pid 2' }; },
+      git: fakeGit(OK_HEAD),
+      unitActive: () => ({ active: false, detail: '113 could not find service' }),
+      env: {},
+      out: () => {},
+    });
+    assert.equal(res.ok, true);
+    assert.equal(restarts, 1);
+    assert.equal(readHistory(clone).length, 2);
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test('deploy: different target sha → restart armed regardless of active unit', () => {
+  const clone = seededClone(FULL2);
+  try {
+    let restarts = 0;
+    const res = deploy({
+      target: { ok: true, repo: REG.repos.factory, clone, branch: 'master' },
+      restart: () => { restarts++; return { ok: true, via: 'y' }; },
+      git: fakeGit(OK_HEAD),
+      unitActive: () => ({ active: true, detail: 'running' }),
+      env: {},
+      out: () => {},
+    });
+    assert.equal(res.ok, true);
+    assert.equal(restarts, 1);
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test('deploy: FACTORY_DEPLOY_FORCE=1 restarts even when already active on the sha', () => {
+  const clone = seededClone(FULL);
+  try {
+    let restarts = 0;
+    const res = deploy({
+      target: { ok: true, repo: REG.repos.factory, clone, branch: 'master' },
+      restart: () => { restarts++; return { ok: true, via: 'forced' }; },
+      git: fakeGit(OK_HEAD),
+      unitActive: () => ({ active: true, detail: 'running' }),
+      env: { FACTORY_DEPLOY_FORCE: '1' },
+      out: () => {},
+    });
+    assert.equal(res.ok, true);
+    assert.equal(restarts, 1);
+    assert.equal(readHistory(clone).length, 2);
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test('deploy: empty history → full path (first deploy ever), unit never consulted', () => {
+  const clone = tmpClone();
+  try {
+    const res = deploy({
+      target: { ok: true, repo: REG.repos.factory, clone, branch: 'master' },
+      restart: () => ({ ok: true, via: 'z' }),
+      git: fakeGit(OK_HEAD),
+      unitActive: () => { throw new Error('must not consult unit with empty history'); },
+      env: {},
+      out: () => {},
+    });
+    assert.equal(res.ok, true);
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
