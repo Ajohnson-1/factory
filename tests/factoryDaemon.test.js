@@ -110,6 +110,12 @@ describe('buildRunPrompt', () => {
     expect(prompt).toContain('do not touch any other card')
   })
 
+  it('forbids ending a headless session with pending subagents (FM-6 exit-0-no-verdict class)', () => {
+    expect(prompt).toContain('HEADLESS')
+    expect(prompt).toContain('NO next turn')
+    expect(prompt).toContain('NEVER spawn one asynchronously and end the session')
+  })
+
   it('names the branch after the card', () => {
     expect(prompt).toContain('factory/6ae4b88307df4b89018e8d7f')
   })

@@ -235,6 +235,7 @@ export function buildRunPrompt(card, { repo = null } = {}) {
   const repoContext = ctxRepo ? repoContextBlock(ctxRepo, { cardId: card.id, factoryRoot: ROOT }) : null;
   return [
     `You are the software factory scheduler for exactly one Trello card: ${card.id} "${card.name}".`,
+    `You run HEADLESS (omp -p): there is NO next turn and nothing auto-delivers to you later. Every stage subagent must COMPLETE inside this session — block on each result (wait for it) before continuing; NEVER spawn one asynchronously and end the session, and NEVER end the session before this card's pipeline reaches Done or a spec'd park. Ending with stage comments missing counts as a crash.`,
     `Read docs/factory.md first and follow the board contract exactly.`,
     `The card has already been moved Ready -> Plan; do not touch any other card and do not drain the board.`,
     `Run the full pipeline for this one card now:`,
