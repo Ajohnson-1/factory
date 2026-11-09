@@ -103,8 +103,8 @@ import { loadRegistry, boardIds, repoForCard, repoContextBlock, worktreeFor } fr
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const STATE_DIR = resolve(ROOT, 'data/factory-daemon');
 const PID_FILE = join(STATE_DIR, 'daemon.pid');
-export const LABEL = 'com.ajohnson.factory-daemon';
-const PLIST_PATH = join(process.env.HOME ?? '', 'Library/LaunchAgents', `${LABEL}.plist`);
+export const LABEL = 'com.ajjohnson.factory-daemon';
+export const PLIST_PATH = join(process.env.HOME ?? '', 'Library/LaunchAgents', `${LABEL}.plist`);
 
 const [, , cmd = 'run', ...args] = process.argv;
 
@@ -881,6 +881,10 @@ async function run({ registry = undefined } = {}) {
   }
 
   log(`watching "Ready" on ${ctxs.length} board(s) (${ctxs.map((c) => c.board).join(', ')}) every ${pollMs}ms, cap ${cap}, agent "${ompBin}"`);
+  // First-successful-poll marker per board (verify-factory.js greps it after a
+  // self-deploy restart: unit active + this line = the new daemon really
+  // reaches Trello). One line per boot per board — quiet steady state kept.
+  const polledOk = new Set();
   for (;;) {
     try {
       // Drain crash-recovery resumes deferred for lack of a slot (same
@@ -898,6 +902,10 @@ async function run({ registry = undefined } = {}) {
         const cards = await trelloLib.getBoardCards(undefined, { board: ctx.board });
         for (const c of (cards ?? []).filter((c) => c.idList === ctx.readyList.id)) {
           ready.push({ board: ctx.board, cardId: c.id, card: c });
+        }
+        if (!polledOk.has(ctx.board)) {
+          polledOk.add(ctx.board);
+          log(`[poll] board ${ctx.board} poll ok — first successful poll since boot`);
         }
       }
       const started = new Set(runs.keys());

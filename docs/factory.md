@@ -185,6 +185,40 @@ and worktree bootstrap recipe. Since FM-3 the committed config is split:
   registered checkout or worktree. `init` ensures `To Do` alongside the
   stage lists.
 
+## Deploy drivers (per-repo)
+
+Every registry entry names a deploy driver (`deploy.driver`); the
+`[DEPLOY]`/`[VERIFY:*]`/`[ROLLBACK]` comment contract is IDENTICAL across
+drivers — only the runners differ. The routed repo's exact command lines land
+in every run's REPO CONTEXT block (rendered by `deployCommands`).
+
+| driver | repo | build | deploy | verify | rollback |
+|---|---|---|---|---|---|
+| `docker-ssh` | discord-bot | `deploy.js build master` (host-side image) | `deploy.js deploy <sha>` (compose up + `.deploy-history`) | `verify-deploy.js` (probes → JSON verdict) | `deploy.js rollback` (second-to-last history entry) |
+| `self` | factory | none — pushing to master IS the artifact | `deploy-factory.js deploy` (ff-pull runtime clone + detached daemon restart) | `verify-factory.js` (unit active + a board poll logged after the restart → JSON verdict) | `deploy-factory.js rollback` (checkout previous sha + restart) |
+
+The `self` driver (FM-4, docs/factory-migration.md §4.5): the deploy runs as
+a child of the daemon it restarts, so the restart is **armed, not
+completed** — macOS hands bootout+bootstrap to a detached guard in its own
+session (the `bootstrapGuard` precedent, `scripts/lib/factory-launchd.js`);
+Linux arms `systemd-run --user --on-active=2s systemctl --user restart
+factory-daemon.service` (the FM-5 box path). If the SIGTERM cascade kills the
+run mid-deploy, crash recovery resumes the card and the deploy is idempotent
+(ff-pull of the same sha = no-op; a guard re-arm is harmless). The runtime
+clone is `deploy.runtimeClone` (default `repoDir`); a dirty clone fails
+closed (exit 2, never clobbers local work). `verify-factory.js` proves the
+new daemon really reaches Trello: a `watching "Ready"` boot marker AND a
+`[poll] board <id> poll ok — first successful poll since boot` line, both
+stamped after the deploy-history entry; stdout is ONLY the verdict JSON
+(same contract as `verify-deploy.js`). Deploy history is append-only JSONL
+at `<clone>/data/factory-deploy-history.jsonl`; rollbacks bounce
+deterministically between the last two shas. Until the FM-6 cutover the
+installed launchd job still runs the discord-bot checkout — a `self` restart
+cycles THAT job; FM-6 points the plist at the factory runtime clone this
+driver pulls. Knobs: `FACTORY_DEPLOY_CLONE` (override the runtime clone),
+`FACTORY_VERIFY_TIMEOUT_MS` (default 180000), `FACTORY_VERIFY_INTERVAL_MS`
+(default 5000).
+
 ## Isolation — one worktree per card
 
 The factory spans out: cards run **concurrently** (`FACTORY_MAX_PARALLEL`,
@@ -707,12 +741,14 @@ node scripts/factory.js wait <card> [--since <ISO8601>] [--timeout <ms>] [--inte
 1. **Records the question on the card** — posts `[ASK] <question>` (the tag is
    auto-prefixed; `-` reads the question from stdin). The card comment is the
    durable record and audit trail.
-2. **Pings Andrew on Discord** (best-effort, never blocks the wait): bot DM to
-   the owner via Discord REST (`POST /users/@me/channels` + channel send), using
-   `BOT_TOKEN`/`DISCORD_BOT_TOKEN` and `FACTORY_DISCORD_USER_ID` (fallback:
-   `config/config.json` `superUserId`). If `FACTORY_DISCORD_WEBHOOK` is set it
-   overrides the DM path (plain webhook POST) — use it when the bot cannot open
-   a DM with you.
+2. **Pings Andrew on Discord** (best-effort, never blocks the wait).
+   Resolution order: `FACTORY_DISCORD_WEBHOOK` overrides everything (plain
+   webhook POST); else `FACTORY_CHANNEL_ID` posts `{content}` straight to
+   that channel — the factory bot's own server/channel (the bot needs Send
+   Messages there; `FACTORY_SERVER_ID` names the guild it was invited to,
+   no owner id needed); else bot DM via `POST /users/@me/channels` + channel
+   send, using `BOT_TOKEN`/`DISCORD_BOT_TOKEN` and
+   `FACTORY_DISCORD_USER_ID` (fallback: `config/config.json` `superUserId`).
 3. **Blocks until answered** — polls card comments every `--interval` ms
    (default `FACTORY_ASK_POLL_MS` or 30 s) and prints the EARLIEST **human
    reply** dated after the `[ASK]` comment as JSON on stdout, exit 0. A comment
@@ -954,7 +990,7 @@ node scripts/factory.js done-watch [Done] [--interval <ms>] [--once]
 hand only for diagnostics (`--once`), NEVER alongside the live daemon;
 `--once` does exactly one poll cycle and prints the JSON result. Each arrival sends one message
 `✅ Done: <card title> — <url>` (same identity plumbing as the ask ping:
-bot DM or `FACTORY_DISCORD_WEBHOOK` override) and logs a `DONE <id> <name>`
+`FACTORY_DISCORD_WEBHOOK` → `FACTORY_CHANNEL_ID` → bot DM) and logs a `DONE <id> <name>`
 line.
 
 **Dedup / restart semantics** (same philosophy as `watch`, but stateful):
@@ -1270,8 +1306,9 @@ state, just its one summary comment + optional owner ping).
 
 Alongside the board comment the pass also DMs the owner the same headline
 (`📊 <headline>` via `sendOwnerPing` — the ask/done-ping identity plumbing:
-`BOT_TOKEN` DM to `FACTORY_DISCORD_USER_ID` / config `superUserId`,
-`FACTORY_DISCORD_WEBHOOK` override). **Best-effort by contract:** the send
+`FACTORY_DISCORD_WEBHOOK` → `FACTORY_CHANNEL_ID` (bot send to the factory
+channel) → `BOT_TOKEN` DM to `FACTORY_DISCORD_USER_ID` / config
+`superUserId`). **Best-effort by contract:** the send
 happens only after a successful board post + state advance, and any Discord
 failure lands in `report.errors` and changes nothing else — the run exits 0
 and the window watermark stays advanced (reporting to the board is the
@@ -1418,9 +1455,12 @@ Interval: `--interval` ms, default `FACTORY_RESUME_POLL_MS` →
 (default `ZHkVYBN1`). Key/token from <https://trello.com/account>.
 
 Ask-protocol extras (all optional; see `docs/factory.md` "Asking a human"):
-`FACTORY_DISCORD_USER_ID` (owner ping target; default = config `superUserId`),
-`FACTORY_DISCORD_WEBHOOK` (ping override), `FACTORY_ASK_TIMEOUT_MS` (default
-3600000), `FACTORY_ASK_POLL_MS` (default 30000). The DM ping reuses `BOT_TOKEN`.
+`FACTORY_DISCORD_USER_ID` (owner DM target; default = config `superUserId`),
+`FACTORY_CHANNEL_ID` (channel ping target — beats the DM; the factory bot's
+server, `FACTORY_SERVER_ID` records which guild the bot was invited to and
+is not used for the send), `FACTORY_DISCORD_WEBHOOK` (ping override, beats
+everything), `FACTORY_ASK_TIMEOUT_MS` (default 3600000), `FACTORY_ASK_POLL_MS`
+(default 30000). Every ping path reuses `BOT_TOKEN`/`DISCORD_BOT_TOKEN`.
 `FACTORY_DONE_POLL_MS` (default `FACTORY_POLL_MS` or 15000) sets the
 `done-watch` Done-list poll interval — see "Pinging on Done"; the Done ping
 reuses the same Discord identity vars, no new required credentials.

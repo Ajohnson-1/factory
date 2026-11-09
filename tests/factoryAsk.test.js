@@ -581,6 +581,66 @@ test('7d. sendOwnerPing: non-OK replies and throws → {error}, never throws', a
 });
 
 // Extra: parseFlags unit coverage (used by the CLI wiring below).
+test('7e. FACTORY_CHANNEL_ID posts straight to the channel (no DM, beats owner id)', async () => {
+  const calls = [];
+  const res = await sendOwnerPing({
+    text: 'deployed',
+    env: { BOT_TOKEN: 'tok', FACTORY_CHANNEL_ID: 'chan9', FACTORY_DISCORD_USER_ID: '42' },
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200 };
+    },
+  });
+  assert.deepEqual(res, { sent: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://discord.com/api/v10/channels/chan9/messages');
+  assert.equal(calls[0].init.headers.Authorization, 'Bot tok');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { content: 'deployed' });
+});
+
+test('7f. FACTORY_CHANNEL_ID without a bot token is a named error (no DM fallback)', async () => {
+  const res = await sendOwnerPing({
+    text: 'x',
+    env: { FACTORY_CHANNEL_ID: 'chan9', FACTORY_DISCORD_USER_ID: '42' },
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl: async () => {
+      throw new Error('no network expected');
+    },
+  });
+  assert.match(res.error, /bot token/i);
+  assert.match(res.error, /FACTORY_CHANNEL_ID/);
+});
+
+test('7g. FACTORY_DISCORD_WEBHOOK still overrides the channel branch', async () => {
+  const calls = [];
+  const res = await sendOwnerPing({
+    text: 'x',
+    env: { FACTORY_DISCORD_WEBHOOK: 'https://discord.com/api/webhooks/1/abc', BOT_TOKEN: 'tok', FACTORY_CHANNEL_ID: 'chan9' },
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return { ok: true, status: 200 };
+    },
+  });
+  assert.deepEqual(res, { sent: true });
+  assert.deepEqual(calls, ['https://discord.com/api/webhooks/1/abc']);
+});
+
+test('7h. channel send non-OK → {error} naming channel + status', async () => {
+  const res = await sendOwnerPing({
+    text: 'x',
+    env: { BOT_TOKEN: 'tok', FACTORY_CHANNEL_ID: 'chan9' },
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl: async () => ({ ok: false, status: 403 }),
+  });
+  assert.match(res.error, /channel chan9 send -> HTTP 403/);
+});
+
 test('8a. parseFlags splits value/boolean flags from positionals', () => {
   const { flags, positional } = parseFlags([
     CARD,

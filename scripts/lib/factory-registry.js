@@ -76,6 +76,9 @@ export function validateRegistry(raw) {
     if (!DEPLOY_DRIVERS.includes(r.deploy.driver)) {
       throw bad(at('deploy.driver'), `must be one of ${DEPLOY_DRIVERS.join('|')} (got ${JSON.stringify(r.deploy.driver)})`);
     }
+    if (r.deploy.runtimeClone !== undefined && (typeof r.deploy.runtimeClone !== 'string' || !r.deploy.runtimeClone)) {
+      throw bad(at('deploy.runtimeClone'), 'must be a non-empty string when present');
+    }
     if (r.worktreeBootstrap !== undefined) {
       if (!Array.isArray(r.worktreeBootstrap) || r.worktreeBootstrap.some((s) => typeof s !== 'string')) {
         throw bad(at('worktreeBootstrap'), 'must be an array of strings when present');
@@ -87,7 +90,10 @@ export function validateRegistry(raw) {
       worktreeRoot: expandTilde(r.worktreeRoot ?? `~/${name}-factory-wt`),
       baseBranch: r.baseBranch,
       board: r.board,
-      deploy: { ...r.deploy },
+      deploy: {
+        ...r.deploy,
+        ...(r.deploy.runtimeClone ? { runtimeClone: expandTilde(r.deploy.runtimeClone) } : {}),
+      },
       worktreeBootstrap: r.worktreeBootstrap ?? [],
     };
   }
@@ -258,17 +264,16 @@ export function worktreeFor(repo, cardId) {
  * The repo's exact deploy/verify command lines (docs/factory-migration.md
  * §4.5). docker-ssh = the existing runners unchanged; self = no build (the
  * push to master IS the artifact), `git pull --ff-only` + a detached daemon
- * restart, previous-sha rollback + restart, verify = unit active + a board
- * poll logged after the restart (scripts/deploy-factory.js + verify-factory.js
- * are FM-4's job — until then these are the literal steps).
+ * restart, previous-sha rollback + restart, verify = the daemon unit active
+ * with a successful board poll logged after the restart.
  */
 export function deployCommands(repo) {
   if (repo.deploy?.driver === 'self') {
     return [
       'build: none — pushing to ' + repo.baseBranch + ' IS the artifact',
-      'deploy: node scripts/deploy-factory.js deploy (git pull --ff-only origin ' + repo.baseBranch + ' in the runtime clone + detached daemon restart; FM-4)',
-      'rollback: node scripts/deploy-factory.js rollback (checkout the previous sha + restart; FM-4)',
-      'verify: node scripts/verify-factory.js (unit active + a board poll logged after the restart; FM-4)',
+      'deploy: node scripts/deploy-factory.js deploy (git pull --ff-only origin ' + repo.baseBranch + ' in the runtime clone + detached daemon restart)',
+      'rollback (after [VERIFY:FAIL]): node scripts/deploy-factory.js rollback (checkout the previous sha + restart)',
+      'verify: node scripts/verify-factory.js (daemon unit active + a board poll logged after the restart)',
     ];
   }
   return [

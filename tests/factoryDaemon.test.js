@@ -1155,6 +1155,13 @@ describe('daemon stall-sweep wiring pins (card 6aebab9a65613358f4ca333a)', () =>
     expect(src).toMatch(/runBlockingChecksWatch\(\{[\s\S]*?board: ctx\.board,[\s\S]*?worktreeOf:[\s\S]*?gitFor/)
     expect(src).toMatch(/boardIds\(repos\)/)
   })
+
+  it('FM-4: the poll loop logs the first-successful-poll marker verify-factory greps (D6)', () => {
+    expect(src).toMatch(/polledOk\.add\(ctx\.board\)[\s\S]{0,120}first successful poll since boot/)
+    // verify-factory.js resolves the installed daemon's log via these exports
+    expect(src).toMatch(/export const LABEL = 'com\.ajjohnson\.factory-daemon'/)
+    expect(src).toMatch(/export const PLIST_PATH =/)
+  })
 })
 
 describe('superviseBlockingChecks', () => {

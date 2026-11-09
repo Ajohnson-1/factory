@@ -157,8 +157,12 @@ export function extractHumanReply(actions, { sinceDate, excludeCommentId, bot } 
 
 /**
  * Best-effort Discord ping to the factory owner. NEVER throws.
- * - `FACTORY_DISCORD_WEBHOOK` (process env or .env) overrides everything: one
+ * - `FACTORY_DISCORD_WEBHOOK` (env or .env) overrides everything: one
  *   plain webhook POST `{content}` — the escape hatch when a DM cannot be opened.
+ * - `FACTORY_CHANNEL_ID` (env or .env): post {content} straight to that
+ *   channel (POST /channels/<id>/messages) with the bot token — the factory
+ *   repo's own server/channel (FACTORY_SERVER_ID names the guild the bot was
+ *   invited to; it is not needed for the send). Needs a token, no owner id.
  * - Otherwise bot DM: POST /users/@me/channels {recipient_id} then
  *   POST /channels/<dm-id>/messages, Authorization `Bot <token>`.
  *   token  = DISCORD_BOT_TOKEN || BOT_TOKEN (env → .env → config/config.json)
@@ -189,6 +193,19 @@ export async function sendOwnerPing({
     }
     const token =
       env.DISCORD_BOT_TOKEN || fileEnv.DISCORD_BOT_TOKEN || env.BOT_TOKEN || fileEnv.BOT_TOKEN || cfg.BOT_TOKEN;
+    const channelId = env.FACTORY_CHANNEL_ID || fileEnv.FACTORY_CHANNEL_ID;
+    if (channelId) {
+      if (!token) {
+        return { error: `missing Discord bot token for FACTORY_CHANNEL_ID (BOT_TOKEN / DISCORD_BOT_TOKEN)` };
+      }
+      const chRes = await fetchImpl(`${DISCORD_API}/channels/${channelId}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bot ${token}` },
+        body: JSON.stringify({ content: text }),
+      });
+      if (!chRes.ok) return { error: `Discord channel ${channelId} send -> HTTP ${chRes.status}` };
+      return { sent: true };
+    }
     const userId =
       env.FACTORY_DISCORD_USER_ID ||
       fileEnv.FACTORY_DISCORD_USER_ID ||

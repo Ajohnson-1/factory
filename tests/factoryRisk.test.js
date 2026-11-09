@@ -179,7 +179,12 @@ test('always-human: every pattern hits high at 1 added line', () => {
     'scripts/verify-deploy.js',
     'scripts/prod-watch.js',
     'scripts/lib/deploy-ssh.js',
+    // FM-4 self-driver: factory's own deploy surface is as dangerous as the prod one
+    'scripts/deploy-factory.js',
+    'scripts/verify-factory.js',
     'config/config.json',
+    'config/factory-repos.json',
+    'factory/factory-repos.machine.json',
     '.github/workflows/ci.yml',
     'Dockerfile',
     'docker-compose.yml',
