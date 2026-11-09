@@ -303,6 +303,22 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
 
 ### FM-4 notes (recorded)
 
+**Acceptance trail (2026-11-09, canary card `6af145e01af67cdb31706fe2` /
+gqxigT8y, docs-only):** the full designed path ran live — dispatch (board
+default repo:factory) -> Plan/Implement/Review/Sec/QA -> CHECK:PASS -> merged
+tip 64b69b3 -> an operator docs-only push moved the deploy target to c1d145d ->
+`[DEPLOY] sha=c1d145d` (history entry 04:40:11Z, `launchd-guard pid 7878`) ->
+detached restart converged in ~6 s -> the run took SIGTERM (code 143) -> the
+ZERO-SILENCE boot sweep recovered it (`STALL-RECOVER at Deploy (silent 1 min)`,
+crash 2/3) -> stage-aware resume -> idempotent redeploy (`restart skipped`, no
+second restart) -> `[VERIFY:PASS]` verdict JSON (unit active + boot/poll
+markers after restartAt) at 04:45:19Z -> **Done**. Crash cap never reached.
+Canary #1 (`6af13b7d426ab6db2fc4b270`) had already proven deploy+restart
+convergence and exposed both f7d00a2 fixes; superseded with an operator note,
+held in To Do. After acceptance the launchd job was booted out of the factory
+GUI registration and re-installed from the discord-bot checkout (§7 steady
+state; the missing plist was rewritten fresh in the window).
+
 - **`self` driver landed as two scripts** (docs/factory-migration.md §4.5
   implemented verbatim): `scripts/deploy-factory.js` (deploy = ff-pull the
   runtime clone + arm a DETACHED daemon restart; rollback = checkout the
