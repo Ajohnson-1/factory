@@ -165,12 +165,22 @@ dispatcher rule means only one repo's daemon runs at a time).
    `scripts/factory-host-lib.sh`; extends the existing `provision-deploy-host.sh`
    idempotent-paste pattern; `PROVISION_MODE=test DESTDIR=<scratch>` runs the same
    flow rootless/offline for the self-check):
-   root: `loginctl enable-linger factory`;
-   factory user: node LTS tarball → `~/.local/node`; `npm i -g omp` (user prefix);
+   root: `loginctl enable-linger factory` + pre-create the factory-owned
+   runtime tree under root-owned `/opt` (`/opt/factory`, `/opt/repos`,
+   worktrees dirs; chown `factory:docker` — the factory user cannot mkdir
+   under `/opt`; the script does both idempotently);
+   factory user: node LTS tarball → `~/.local/node`; omp = pinned
+   sha256-verified release binary (`can1357/oh-my-pi` `omp-linux-x64` →
+   `~/.local/node/bin/omp`) — **not** `npm i -g omp` (the npm name is
+   squatted: `omp@1.0.0` installs no bin);
    full working clone of discord-bot → `/opt/repos/discord-bot` (separate from the
    `/opt/discord-bot` app dir — bind-mount state lives there); clone factory → `/opt/factory`.
-3. **GitHub push access:** grant write to the existing `factory_github_deploy_ed25519`
-   deploy key on **both** repos (it is currently read-only on the box); set
+3. **GitHub push access:** GitHub refuses to share one deploy key across
+   repos ("key is already in use"), so the factory repo uses a **dedicated**
+   key `factory_github_deploy_factory_ed25519` (write) wired on the box via
+   a `github.com-factory` ssh host alias + global git `insteadOf` rewrite of
+   the factory clone URL; the existing `factory_github_deploy_ed25519` keeps
+   discord-bot with write (verified this session: both repos fetch); set
    `git config user.name factory` (deploy-history actor) in both clones.
 4. **Secrets on the box:** `/home/factory/.env` — `TRELLO_KEY/TOKEN`, `BOT_TOKEN`,
    `DEPLOY_HOST/DEPLOY_KEY/…` and copy the private half of `factory_deploy_ed25519` to

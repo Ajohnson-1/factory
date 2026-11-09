@@ -50,13 +50,16 @@ const secrets = (key) => ({
   FACTORY_DEPLOY_HOST: 'box.example', FACTORY_SSH_PRIVKEY_FILE: key,
 })
 
-test('1. root session: linger marker + self-check gate PASS = exit 0', () => {
+test('1. root session: linger marker + /opt runtime dirs + self-check gate PASS = exit 0', () => {
   const s = scratch()
   const r = run(s.dest, { role: 'root' })
   assert.equal(r.status, 0, r.stdout + r.stderr)
   assert.match(r.stdout, /PASS linger enabled for factory user/)
-  assert.match(r.stdout, /SELF-CHECK: 1\/1 PASS/)
+  assert.match(r.stdout, /PASS runtime dirs under \/opt exist, owned by factory/)
+  assert.match(r.stdout, /SELF-CHECK: 2\/2 PASS/)
   assert.ok(existsSync(join(s.dest, 'state', 'linger')))
+  assert.ok(existsSync(join(s.dest, 'opt', 'factory')))
+  assert.ok(existsSync(join(s.dest, 'opt', 'repos')))
   rmSync(s.dest, { recursive: true, force: true })
 })
 

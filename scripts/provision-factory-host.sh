@@ -3,8 +3,9 @@
 # 6aee5f4d6e98279cb3ab3304; docs/factory-migration.md §6.1 steps 2-4).
 #
 # Two paste sessions, same idempotent pattern as provision-deploy-host.sh:
-#   ROOT console (step 2 root line):
-#     bash /root/provision-factory-host.sh   # uid 0 => enables user linger
+#   ROOT console (step 2 root line; enables linger + pre-creates the
+#   factory-owned runtime tree under root-owned /opt):
+#     bash /root/provision-factory-host.sh   # uid 0 => linger + /opt dirs
 #   FACTORY user session (steps 2-4 user lines):
 #     FACTORY_TRELLO_KEY=… FACTORY_TRELLO_TOKEN=… FACTORY_BOT_TOKEN=… \
 #     FACTORY_DEPLOY_HOST=… FACTORY_SSH_PRIVKEY_FILE=~/factory_deploy_ed25519 \
@@ -47,6 +48,15 @@ NODE_VERSION="${NODE_VERSION:-v22.14.0}"
 NODE_ARCH="${NODE_ARCH:-x64}"
 NODE_MIRROR="${NODE_MIRROR:-https://nodejs.org/dist}"
 
+# omp is NOT the npm package "omp" (a squatted name with no bin) — the
+# agent ships as a single release binary (can1357/oh-my-pi; same artifact
+# the Homebrew formula installs). Pinned + sha256-verified.
+OMP_VERSION="${OMP_VERSION:-v18.18.3}"
+OMP_BINARY="${OMP_BINARY:-omp-linux-${NODE_ARCH}}"
+OMP_SHA256="${OMP_SHA256:-8c9a178fed74ec1da21aafb7d28cd9839b3b0c9e7d607c86cc3b6177355729f4}"
+OMP_URL="${OMP_URL:-https://github.com/can1357/oh-my-pi/releases/download/$OMP_VERSION/$OMP_BINARY}"
+OMP_MIRROR_URL="${OMP_MIRROR_URL:-}"   # optional fallback (build.stencil.so URLs are build-scoped)
+
 HOMEDIR="$DESTDIR/home/$FACTORY_USER"
 SSHDIR="$HOMEDIR/.ssh"
 NODEHOME="$HOMEDIR/.local/node"
@@ -70,6 +80,30 @@ ensure_linger() {
     mkdir -p "$STATE"
     touch "$STATE/linger"
   fi
+}
+
+# /opt is root:root 755 on the box — the factory user cannot create the
+# runtime tree there. The root session pre-creates + owns it (pairs with
+# the existing root-owned /opt/discord-bot app dir).
+ensure_opt_dirs() {
+  local d
+  for d in "$FACTORY_DIR" "$REPOS_DIR" "$FACTORY_WORKTREES" "$DBOT_WORKTREES"; do
+    mkdir -p "$d"
+    if [ "$PROVISION_MODE" = live ]; then
+      chown "$FACTORY_USER:$FACTORY_GROUP" "$d"
+      chmod 775 "$d"
+    fi
+  done
+}
+chk_opt_dirs() {
+  local d
+  for d in "$FACTORY_DIR" "$REPOS_DIR" "$FACTORY_WORKTREES" "$DBOT_WORKTREES"; do
+    [ -d "$d" ] || return 1
+    if [ "$PROVISION_MODE" = live ] && [ "$(stat_user "$d")" != "$FACTORY_USER" ]; then
+      return 1
+    fi
+  done
+  return 0
 }
 
 # --- factory-user session (§6.1 steps 2-4) ----------------------------------
@@ -98,14 +132,27 @@ ensure_node() {
   fi
 }
 
-# omp on the user npm prefix (= ~/.local/node once step 2 landed).
+# omp on the user PATH: single release binary at ~/.local/node/bin/omp
+# (the dir the systemd unit PATH bakes). NOT `npm i -g omp` — that npm
+# name is squatted (omp@1.0.0, no bin); a leftover install is removed.
 ensure_omp() {
   if [ "$PROVISION_MODE" = live ]; then
-    if PATH="$NODEHOME/bin:$PATH" command -v omp >/dev/null 2>&1; then
+    if [ -x "$NODEHOME/bin/omp" ]; then
+      [ -d "$NODEHOME/lib/node_modules/omp" ] && PATH="$NODEHOME/bin:$PATH" npm uninstall -g omp >/dev/null 2>&1 || true
       return 0
     fi
-    PATH="$NODEHOME/bin:$PATH" npm install -g omp \
-      || echo 'WARN: npm i -g omp failed (registry reachable? node installed?) — the self-check will FAIL' >&2
+    [ -d "$NODEHOME/lib/node_modules/omp" ] && PATH="$NODEHOME/bin:$PATH" npm uninstall -g omp >/dev/null 2>&1 || true
+    curl -fsSL "$OMP_URL" -o "$HOMEDIR/omp.bin" \
+      || { [ -n "$OMP_MIRROR_URL" ] && curl -fsSL "$OMP_MIRROR_URL" -o "$HOMEDIR/omp.bin"; } \
+      || { echo 'WARN: omp binary download failed — the self-check will FAIL' >&2; return 0; }
+    if [ "$(sha256sum "$HOMEDIR/omp.bin" | cut -d" " -f1)" != "$OMP_SHA256" ]; then
+      rm -f "$HOMEDIR/omp.bin"
+      echo 'WARN: omp binary sha256 mismatch — the self-check will FAIL' >&2
+      return 0
+    fi
+    mkdir -p "$NODEHOME/bin"
+    mv "$HOMEDIR/omp.bin" "$NODEHOME/bin/omp"
+    chmod 0555 "$NODEHOME/bin/omp"
   else
     mkdir -p "$STATE"
     touch "$STATE/omp"
@@ -260,7 +307,9 @@ main() {
         require_root_linger
       fi
       ensure_linger
+      ensure_opt_dirs
       check 'linger enabled for factory user' chk_linger
+      check 'runtime dirs under /opt exist, owned by factory' chk_opt_dirs
       finish_checks
       ;;
     user)
