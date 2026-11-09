@@ -300,3 +300,45 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
   pipeline before the operator killed it; the card's `[DAEMON-CRASH]`
   comment is that SIGTERM's trail). Meta-cards being worked interactively
   MUST sit in `To Do`, not `Ready`.
+
+### FM-4 notes (recorded)
+
+- **`self` driver landed as two scripts** (docs/factory-migration.md §4.5
+  implemented verbatim): `scripts/deploy-factory.js` (deploy = ff-pull the
+  runtime clone + arm a DETACHED daemon restart; rollback = checkout the
+  previous sha from append-only JSONL history + restart; dirty clone fails
+  closed exit 2; restart-armed ≠ restart-done is deliberate — the deploy is
+  the child of the daemon it restarts, and crash recovery makes the kill
+  safe: ff-pull is a no-op, guard re-arm harmless) and
+  `scripts/verify-factory.js` (unit active + boot marker + the FIRST
+  SUCCESSFUL POLL marker stamped after the restart; stdout is only the
+  verdict JSON, mirroring `verify-deploy.js`). Platform branch on
+  `process.platform`: darwin detached launchd guard; linux
+  `systemd-run --user --on-active=2s` (the FM-5 unit).
+- **New daemon health marker:** `[poll] board <id> poll ok — first
+  successful poll since boot` logged once per boot per board; unit-active
+  alone never proves the daemon reaches Trello. `LABEL`/`PLIST_PATH` are now
+  exported; the verifier reads the LOG PATH out of the INSTALLED plist
+  (works whichever checkout owns the job) and scans timestamps ANYWHERE in
+  the line (the daemon format is `[factory-daemon <ISO>] …`).
+- **Registry:** `deploy.runtimeClone` validated + tilde-expanded (default
+  `repoDir`); `FACTORY_DEPLOY_CLONE` overrides for smokes. `deployCommands`
+  self lines are now the final command strings rendered into REPO CONTEXT.
+- **Risk:** `scripts/deploy-factory.js`, `scripts/verify-factory.js` and
+  `factory-repos*.json` added to ALWAYS_HUMAN (a deploy-tooling or
+  routing-config change is high tier even at 1 line).
+- **Discord notifications from the factory repo** (closes the FM-3 gap):
+  `sendOwnerPing` gained a `FACTORY_CHANNEL_ID` branch — resolution order
+  webhook → channel → DM owner id. The factory bot (ZeroClawChat) posts to
+  the factory server's channel; live smoke returned HTTP 403 on SEND
+  (channel GET 200 — view channel yes, Send Messages not yet granted) —
+  one operator permission flip remains.
+- **Environment findings (machine):** the launchd job was registered but
+  its PLIST FILE was missing on disk (survived only via the in-memory
+  KeepAlive registration — a reboot would have lost the daemon); FM-4's
+  acceptance install wrote a fresh plist and the steady-state daemon was
+  restored to the discord-bot checkout afterwards (§7). Tool sessions
+  outside the GUI bootstrap context cannot `launchctl print/bootout` the
+  job (113/5) — irrelevant in production where deploy runs UNDER the
+  daemon, but live smokes from a plain shell can only exercise the git +
+  history + verdict paths, not the restart convergence.
