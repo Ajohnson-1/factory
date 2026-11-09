@@ -342,3 +342,10 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
   job (113/5) — irrelevant in production where deploy runs UNDER the
   daemon, but live smokes from a plain shell can only exercise the git +
   history + verdict paths, not the restart convergence.
+
+- **Acceptance trail (`self` canary #2, this card):** the acceptance ran on
+  the laptop through the INSTALLED launchd daemon — deploy → detached
+  restart → boot orphan recovery → stage-aware resume → `[VERIFY:PASS]`;
+  evidence lives in this card's comment trail (`6af145e01af67cdb31706fe2`)
+  and `<clone>/data/factory-deploy-history.jsonl`. Steady-state daemon
+  ownership was restored to the discord-bot checkout (§7).
