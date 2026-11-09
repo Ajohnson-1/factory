@@ -434,7 +434,8 @@ export function latestStageTag(comments) {
  * list; the stuck-Verify trap: a card in Verify — or Deploy with the
  * contract's Verify move still pending — whose LAST stage tag is `[DEPLOY]`
  * (so no `[VERIFY:*]` ever followed) resumes at the Verify stage: the run
- * re-runs `scripts/verify-deploy.js` and posts `[VERIFY:PASS]`/`[VERIFY:FAIL]`
+ * re-runs the REPO CONTEXT verify line (routed repo's deploy driver) and posts
+ * `[VERIFY:PASS]`/`[VERIFY:FAIL]`
  * per the contract instead of replanning a finished implementation.
  * The rollback trap (card 6ae9676d2461fd41204b507e): a card in Verify/Deploy
  * whose LAST stage tag is `[ROLLBACK]` resumes at **Implement** — the
