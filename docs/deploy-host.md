@@ -349,8 +349,8 @@ is `/opt/discord-bot/config/config.json` (gitignored, bind-mounted — §2 day-2
 ssh):
 
 1. **Repoint the config:** set `memoryEmbeddingHost` and `vmlxHost` to
-   `http://192.168.0.159:8123/v1` (leave `sushiHost` on 145:12345 — chat is
-   untouched).
+   `http://192.168.0.159:8123/v1` (chat `sushiHost` moved to
+   `http://192.168.0.126:12345/v1` on 2026-11-09 — the sushi server left 145).
 2. **Embedder-identity band re-check (gate — before any restart):** the dedupe
    bands are embedder-specific — `service/ai/memory/README.md` ("Changing the
    embedding model safely") records the §8.2 measurement and states the 0.95
