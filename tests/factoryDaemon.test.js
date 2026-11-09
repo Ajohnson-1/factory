@@ -25,6 +25,8 @@ import {
   STALL_EXIT_CODE,
 } from '../scripts/factory-daemon.js'
 import { ensureBootstrapped } from '../scripts/lib/factory-launchd.js'
+import { install as daemonInstall, uninstall as daemonUninstall, status as daemonStatus } from '../scripts/factory-daemon.js'
+import { detectServiceManager } from '../scripts/lib/factory-platform.js'
 
 describe('planDispatch (FM-2: board-keyed entries {board, cardId}, global cap)', () => {
   const E = (board, cardId) => ({ board, cardId })
@@ -1277,5 +1279,59 @@ describe('superviseBlockingChecks', () => {
     await expect(promise).resolves.toBeUndefined()
     expect(n).toBe(2)
     expect(logLines.some((l) => l.includes('crashed') && l.includes('a bare string'))).toBe(true)
+  })
+})
+
+describe('FM-5 install/status/uninstall platform dispatch (docs/factory-migration.md D7)', () => {
+  const mkSystemd = () => {
+    const calls = []
+    const rec = (name, result) => (...args) => { calls.push({ name, args }); return result }
+    return {
+      calls,
+      installDaemon: rec('installDaemon', { installed: true, manager: 'systemd', unit: 'factory-daemon.service', unitFile: '/scratch/factory-daemon.service', envFile: '/scratch/factory-env.conf', start: 'started' }),
+      uninstallDaemon: rec('uninstallDaemon', { uninstalled: true, manager: 'systemd', units: ['factory-daemon.service'] }),
+      daemonStatus: rec('daemonStatus', { manager: 'systemd', units: [{ unit: 'factory-daemon.service', installed: true, active: 'active', sub: 'running', unitFileState: 'enabled' }] }),
+    }
+  }
+  const count = (systemd, name) => systemd.calls.filter((c) => c.name === name).length
+  let printed
+  let realLog
+  beforeEach(() => {
+    printed = []
+    realLog = console.log
+    console.log = (...a) => printed.push(a.map(String).join(' '))
+  })
+  afterEach(() => { console.log = realLog })
+
+  it('linux install delegates to the systemd unit installer (launchd untouched)', async () => {
+    const systemd = mkSystemd()
+    await daemonInstall({ platform: 'linux', systemd })
+    expect(count(systemd, 'installDaemon')).toBe(1)
+    expect(printed.some((l) => l.includes('"unit":"factory-daemon.service"'))).toBe(true)
+  })
+
+  it('linux uninstall delegates to systemd unit removal', async () => {
+    const systemd = mkSystemd()
+    await daemonUninstall({ platform: 'linux', systemd })
+    expect(count(systemd, 'uninstallDaemon')).toBe(1)
+    expect(printed.some((l) => l.includes('"uninstalled":true'))).toBe(true)
+  })
+
+  it('linux status delegates to systemd unit status', async () => {
+    const systemd = mkSystemd()
+    await daemonStatus({ platform: 'linux', systemd })
+    expect(count(systemd, 'daemonStatus')).toBe(1)
+    expect(printed[0]).toMatch(/"manager": "systemd"/)
+  })
+
+  it('unsupported platform: status prints the fail-closed message, never throws', async () => {
+    const systemd = mkSystemd()
+    await expect(daemonStatus({ platform: 'win32', systemd })).resolves.toBeUndefined()
+    expect(printed.join('\n')).toMatch(/unsupported platform "win32"/)
+    expect(count(systemd, 'daemonStatus')).toBe(0)
+  })
+
+  it('darwin dispatches to launchd with zero probing — the launchd suites above are the UNCHANGED proof', () => {
+    expect(detectServiceManager({ platform: 'darwin', env: {} })).toBe('launchd')
   })
 })

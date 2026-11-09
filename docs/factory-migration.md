@@ -161,8 +161,10 @@ dispatcher rule means only one repo's daemon runs at a time).
 
 1. **Trello:** add the token member `ompbot` as a member of the softwarefactory board
    (today 401 — verified this session).
-2. **Console paste** (extends the existing `provision-deploy-host.sh` idempotent-paste
-   pattern; new `provision-factory-host.sh` + factory-user steps run by SSH):
+2. **Console paste** — `scripts/provision-factory-host.sh` (+ shared helpers
+   `scripts/factory-host-lib.sh`; extends the existing `provision-deploy-host.sh`
+   idempotent-paste pattern; `PROVISION_MODE=test DESTDIR=<scratch>` runs the same
+   flow rootless/offline for the self-check):
    root: `loginctl enable-linger factory`;
    factory user: node LTS tarball → `~/.local/node`; `npm i -g omp` (user prefix);
    full working clone of discord-bot → `/opt/repos/discord-bot` (separate from the
@@ -173,7 +175,19 @@ dispatcher rule means only one repo's daemon runs at a time).
 4. **Secrets on the box:** `/home/factory/.env` — `TRELLO_KEY/TOKEN`, `BOT_TOKEN`,
    `DEPLOY_HOST/DEPLOY_KEY/…` and copy the private half of `factory_deploy_ed25519` to
    `/home/factory/.ssh/` (ssh-to-self works: public half already in `authorized_keys`);
-   `factory-repos.local.json` with box paths (D2).
+   `factory-repos.local.json` with box paths (D2). `provision-factory-host.sh` writes
+   the `.env` (0600, fixed key order = byte-stable re-runs) and installs the key from
+   `FACTORY_SSH_PRIVKEY_FILE` (skip-if-identical).
+
+The systemd units themselves (`factory-daemon.service`; `factory-metrics` /
+`factory-sweep` / `prod-watch` service+timer pairs; 0600 `data/factory-env.conf` from
+the repo `.env`) are written on Linux by `install` via
+`scripts/lib/factory-platform-systemd.js` (dispatch `scripts/lib/factory-platform.js`;
+launchd stays the default on macOS). From-box prod-watch transport preflight:
+`node scripts/probe-factory-box.js` (exit 0 = ssh-to-self + classifier work; zero
+board writes). FM-5 verified on the macOS gate host with unit-render +
+scratch-DESTDIR assertions (no Linux box in this environment); the live enable/active
+checks and one manual run per timer land at cutover (§6.2, FM-6).
 
 ### 6.2 Cutover runbook (FM-6)
 

@@ -94,6 +94,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as trelloLib from './lib/trello.js';
 import { runDoneWatch } from './lib/factory-done-ping.js';
 import { ensureBootstrapped, launchctl } from './lib/factory-launchd.js';
+import { detectServiceManager } from './lib/factory-platform.js';
+import * as platformSystemd from './lib/factory-platform-systemd.js';
 import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending } from './lib/factory-comment-resume.js';
 import { bootStallSweep, superviseStallSweep, runStallSweepWatch } from './lib/factory-stall-sweep.js';
 import { runBlockingChecksWatch } from './lib/factory-blocking-checks.js';
@@ -935,10 +937,21 @@ async function run({ registry = undefined } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// install / uninstall / status (launchd)
+// install / uninstall / status (launchd default; systemd user units on
+// linux — FM-5 platform branch, docs/factory-migration.md D7)
 // ---------------------------------------------------------------------------
 
-async function install() {
+// Platform branch (FM-5, D7): linux → systemd USER units via
+// lib/factory-platform-systemd.js (`factory-daemon.service` — the exact
+// name deploy-factory.js restartLinux + verify-factory.js pin); darwin →
+// the launchd path below, byte-identical and still the default here.
+export async function install({ platform = process.platform, systemd = platformSystemd } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    const r = systemd.installDaemon();
+    log(`systemd: ${r.unit} ${r.start} (${r.unitFile})`);
+    console.log(JSON.stringify(r));
+    return;
+  }
   const nodePath = process.execPath;
   mkdirSync(STATE_DIR, { recursive: true });
   mkdirSync(dirname(PLIST_PATH), { recursive: true });
@@ -971,7 +984,16 @@ function bootstrapGuard() {
   return child;
 }
 
-async function uninstall() {
+export async function uninstall({ platform = process.platform, systemd = platformSystemd } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    // disable --now first, unit files after — the same convergence argument
+    // as the unlink-before-bootout ordering below (systemd branch:
+    // lib/factory-platform-systemd.js uninstallUnits).
+    const r = systemd.uninstallDaemon();
+    log(`systemd: removed ${r.units.join(', ')} + env file`);
+    console.log(JSON.stringify(r));
+    return;
+  }
   // Unlink before bootout so a SIGTERM cascade mid-uninstall converges toward
   // "uninstalled" (a surviving loaded job exits at session end) instead of
   // leaving a plist that re-bootstraps itself at the next login.
@@ -984,16 +1006,27 @@ async function uninstall() {
   await launchctl(['bootout', `gui/${process.getuid()}/${LABEL}`]).catch((e) => log(`bootout: ${e.message}`));
 }
 
-async function status() {
+export async function status({ platform = process.platform, systemd = platformSystemd } = {}) {
+  let mgr = 'launchd';
   try {
-    const out = await new Promise((res, rej) =>
-      execFile('launchctl', ['print', `gui/${process.getuid()}/${LABEL}`], { encoding: 'utf8' }, (e, so) => (e ? rej(e) : res(so))),
-    );
-    const pid = out.match(/^\s*pid\s*=\s*(\d+)/m)?.[1];
-    const state = out.match(/^\s*state\s*=\s*(\S+)/m)?.[1];
-    console.log(pid ? `launchd job running (state=${state}, pid ${pid})` : `launchd job installed, not running (state=${state ?? 'unknown'})`);
-  } catch {
-    console.log('not installed (no launchd job)');
+    mgr = detectServiceManager({ platform });
+  } catch (e) {
+    console.log(e.message);
+    return;
+  }
+  if (mgr === 'systemd') {
+    console.log(JSON.stringify(systemd.daemonStatus(), null, 2));
+  } else {
+    try {
+      const out = await new Promise((res, rej) =>
+        execFile('launchctl', ['print', `gui/${process.getuid()}/${LABEL}`], { encoding: 'utf8' }, (e, so) => (e ? rej(e) : res(so))),
+      );
+      const pid = out.match(/^\s*pid\s*=\s*(\d+)/m)?.[1];
+      const state = out.match(/^\s*state\s*=\s*(\S+)/m)?.[1];
+      console.log(pid ? `launchd job running (state=${state}, pid ${pid})` : `launchd job installed, not running (state=${state ?? 'unknown'})`);
+    } catch {
+      console.log('not installed (no launchd job)');
+    }
   }
   if (existsSync(PID_FILE)) {
     const pid = Number(readFileSync(PID_FILE, 'utf8').trim());

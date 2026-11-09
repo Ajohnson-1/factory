@@ -18,6 +18,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as sweep from './lib/factory-sweep.js';
 import { launchctl } from './lib/factory-launchd.js';
+import { detectServiceManager } from './lib/factory-platform.js';
+import * as platformSystemd from './lib/factory-platform-systemd.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const LABEL = sweep.LABEL;
@@ -78,11 +80,17 @@ async function cmdSweep(flags, cfg, { dryRun }) {
 // prod-watch's bootout-then-bootstrap shape; no detached bootstrap-guard
 // needed: a one-shot calendar job is not the daemon's child, so a run that
 // installs mid-flight cannot SIGTERM-kill its own bootstrap.
-async function cmdInstall(flags, cfg) {
+// FM-5 platform branch: linux → factory-sweep.service + daily OnCalendar
+// timer (lib/factory-platform-systemd.js); darwin launchd path unchanged.
+export async function cmdInstall(flags, cfg, { platform = process.platform, systemd = platformSystemd } = {}) {
   const hour = flags.hour !== undefined ? Number(flags.hour) : cfg.hour;
   const minute = flags.minute !== undefined ? Number(flags.minute) : cfg.minute;
   if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
     return die('--hour must be 0-23 and --minute 0-59');
+  }
+  if (detectServiceManager({ platform }) === 'systemd') {
+    out(systemd.installSweep({ hour, minute }));
+    return 0;
   }
   mkdirSync(dirname(PLIST_PATH), { recursive: true });
   mkdirSync(LOG_DIR, { recursive: true });
@@ -99,7 +107,11 @@ async function cmdInstall(flags, cfg) {
   return 0;
 }
 
-async function cmdUninstall() {
+export async function cmdUninstall({ platform = process.platform, systemd = platformSystemd } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    out(systemd.uninstallUnits({ units: [systemd.UNITS.sweep.timer, systemd.UNITS.sweep.service] }));
+    return 0;
+  }
   const uid = process.getuid();
   await launchctl(['bootout', `gui/${uid}/${LABEL}`]).catch((e) => log(`bootout: ${e.message}`));
   rmSync(PLIST_PATH, { force: true });
@@ -107,7 +119,25 @@ async function cmdUninstall() {
   return 0;
 }
 
-async function cmdStatus(cfg) {
+export async function cmdStatus(cfg, { platform = process.platform, systemd = platformSystemd } = {}) {
+  let mgr = 'launchd';
+  try {
+    mgr = detectServiceManager({ platform });
+  } catch (e) {
+    out({ action: 'error', error: e.message });
+    return 1;
+  }
+  if (mgr === 'systemd') {
+    const u = systemd.statusUnits({ units: [systemd.UNITS.sweep.timer, systemd.UNITS.sweep.service] });
+    out({
+      manager: 'systemd',
+      units: u.units,
+      schedule: systemd.sweepCalendar({ hour: cfg.hour, minute: cfg.minute }),
+      env: { FACTORY_SWEEP_DAYS: cfg.days, FACTORY_SWEEP_MAX_FILES: cfg.maxFiles, FACTORY_SWEEP_MAX_FINDINGS: cfg.maxFindings },
+      logs: { journal: `journalctl --user -u ${systemd.UNITS.sweep.service}` },
+    });
+    return 0;
+  }
   const uid = process.getuid();
   let launchd = 'not loaded';
   try {

@@ -40,6 +40,8 @@ import { deployConfig } from './lib/deploy-config.js';
 import { sendOwnerPing } from './lib/factory-ask.js';
 import * as trello from './lib/trello.js';
 import { launchctl } from './lib/factory-launchd.js';
+import { detectServiceManager } from './lib/factory-platform.js';
+import * as platformSystemd from './lib/factory-platform-systemd.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const LABEL = 'com.discordbot.prodwatch';
@@ -298,23 +300,46 @@ export function plistXml({ nodePath = process.execPath, intervalSec = 300 } = {}
 `;
 }
 
-async function cmdInstall() {
+// FM-5 platform branch (docs/factory-migration.md D7): linux → systemd
+// user pair prod-watch.service + 300 s timer (from-box probe: §4.6,
+// scripts/probe-factory-box.js preflight); darwin launchd path unchanged.
+export async function cmdInstall({ platform = process.platform, systemd = platformSystemd, intervalSec = 300 } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    console.log(JSON.stringify(systemd.installProdWatch({ intervalSec })));
+    return 0;
+  }
   mkdirSync(LOG_DIR, { recursive: true });
-  writeFileSync(PLIST_PATH, plistXml());
+  writeFileSync(PLIST_PATH, plistXml({ intervalSec }));
   await launchctl(['bootout', `gui/${process.getuid()}/${LABEL}`]).catch(() => {});
   await launchctl(['bootstrap', `gui/${process.getuid()}`, PLIST_PATH]);
-  console.log(JSON.stringify({ installed: true, label: LABEL, plist: PLIST_PATH, intervalSec: 300 }));
+  console.log(JSON.stringify({ installed: true, label: LABEL, plist: PLIST_PATH, intervalSec }));
   return 0;
 }
 
-async function cmdUninstall() {
+export async function cmdUninstall({ platform = process.platform, systemd = platformSystemd } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    console.log(JSON.stringify(systemd.uninstallUnits({ units: [systemd.UNITS.prodWatch.timer, systemd.UNITS.prodWatch.service] })));
+    return 0;
+  }
   await launchctl(['bootout', `gui/${process.getuid()}/${LABEL}`]).catch((e) => log(`bootout: ${e.message}`));
   rmSync(PLIST_PATH, { force: true });
   console.log(JSON.stringify({ installed: false, label: LABEL }));
   return 0;
 }
 
-async function cmdStatus() {
+export async function cmdStatus({ platform = process.platform, systemd = platformSystemd } = {}) {
+  let mgr = 'launchd';
+  try {
+    mgr = detectServiceManager({ platform });
+  } catch (e) {
+    console.log(JSON.stringify({ error: e.message }));
+    return 1;
+  }
+  if (mgr === 'systemd') {
+    const u = systemd.statusUnits({ units: [systemd.UNITS.prodWatch.timer, systemd.UNITS.prodWatch.service] });
+    console.log(JSON.stringify({ manager: 'systemd', units: u.units, intervalSec: 300, state: readState() }, null, 2));
+    return 0;
+  }
   const uid = process.getuid();
   let launchd = 'not loaded';
   try {

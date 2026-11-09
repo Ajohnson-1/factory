@@ -31,6 +31,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { DEFAULT_INTERVAL_MS, REPORT_DIR, STATE_PATH, runMetricsReport } from './lib/factory-metrics.js';
 import { launchctl } from './lib/factory-launchd.js';
+import { detectServiceManager } from './lib/factory-platform.js';
+import * as platformSystemd from './lib/factory-platform-systemd.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const LABEL = 'com.discordbot.factory-metrics';
@@ -63,17 +65,27 @@ export function plistXml({ nodePath = process.execPath, intervalSec = INTERVAL_S
 `;
 }
 
-async function cmdInstall({ plistPath = PLIST_PATH, uid = process.getuid() } = {}) {
+export async function cmdInstall({ plistPath = PLIST_PATH, uid = process.getuid(), platform = process.platform, systemd = platformSystemd, intervalSec = INTERVAL_SEC } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    // FM-5 linux branch: factory-metrics.service + 6 h .timer
+    // (docs/factory-migration.md D7/§4.6); darwin launchd path unchanged.
+    console.log(JSON.stringify(systemd.installMetrics({ intervalSec })));
+    return 0;
+  }
   mkdirSync(REPORT_DIR(), { recursive: true });
   mkdirSync(dirname(plistPath), { recursive: true });
-  writeFileSync(plistPath, plistXml());
+  writeFileSync(plistPath, plistXml({ intervalSec }));
   await launchctl(['bootout', `gui/${uid}/${LABEL}`]).catch(() => {});
   await launchctl(['bootstrap', `gui/${uid}`, plistPath]);
-  console.log(JSON.stringify({ installed: true, label: LABEL, plist: plistPath, intervalSec: INTERVAL_SEC }));
+  console.log(JSON.stringify({ installed: true, label: LABEL, plist: plistPath, intervalSec }));
   return 0;
 }
 
-async function cmdUninstall({ plistPath = PLIST_PATH, uid = process.getuid() } = {}) {
+export async function cmdUninstall({ plistPath = PLIST_PATH, uid = process.getuid(), platform = process.platform, systemd = platformSystemd } = {}) {
+  if (detectServiceManager({ platform }) === 'systemd') {
+    console.log(JSON.stringify(systemd.uninstallUnits({ units: [systemd.UNITS.metrics.timer, systemd.UNITS.metrics.service] })));
+    return 0;
+  }
   await launchctl(['bootout', `gui/${uid}/${LABEL}`]).catch((e) => log(`bootout: ${e.message}`));
   rmSync(plistPath, { force: true });
   console.log(JSON.stringify({ installed: false, label: LABEL }));
@@ -88,19 +100,31 @@ function readLatestReport() {
   }
 }
 
-async function cmdStatus({ plistPath = PLIST_PATH, uid = process.getuid(), report = readLatestReport() } = {}) {
+export async function cmdStatus({ plistPath = PLIST_PATH, uid = process.getuid(), report = readLatestReport(), platform = process.platform, systemd = platformSystemd } = {}) {
+  let state = null;
+  try {
+    state = JSON.parse(readFileSync(STATE_PATH(), 'utf8'));
+  } catch {
+    /* no state yet — first run pending */
+  }
+  let mgr = 'launchd';
+  try {
+    mgr = detectServiceManager({ platform });
+  } catch (e) {
+    console.log(JSON.stringify({ error: e.message }));
+    return 1;
+  }
+  if (mgr === 'systemd') {
+    const u = systemd.statusUnits({ units: [systemd.UNITS.metrics.timer, systemd.UNITS.metrics.service] });
+    console.log(JSON.stringify({ manager: 'systemd', units: u.units, intervalSec: INTERVAL_SEC, state, lastReport: report }, null, 2));
+    return 0;
+  }
   let launchd = 'not loaded';
   try {
     await launchctl(['print', `gui/${uid}/${LABEL}`]);
     launchd = 'loaded';
   } catch {
     /* print exits non-zero when unloaded */
-  }
-  let state = null;
-  try {
-    state = JSON.parse(readFileSync(STATE_PATH(), 'utf8'));
-  } catch {
-    /* no state yet — first run pending */
   }
   console.log(JSON.stringify({ label: LABEL, launchd, intervalSec: INTERVAL_SEC, plist: plistPath, state, lastReport: report }, null, 2));
   return 0;
