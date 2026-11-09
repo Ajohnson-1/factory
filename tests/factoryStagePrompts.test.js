@@ -376,7 +376,14 @@ describe('docs/review-guide (per-area review ground truth)', () => {
     walk(ROOT, '');
     let registry = null;
     try {
-      registry = loadRegistry({ env: {} });
+      // Effective registry, not committed-only: loadRegistry()'s env chain
+      // (FACTORY_REPOS_FILE override → committed config) is what the daemon
+      // and CLI use, and the override carries the machine-local sibling
+      // repoDirs (/opt/repos/discord-bot on the box). A committed-only
+      // compare made this guard red on the box — ~/GitHub/discord-bot does
+      // not exist there, so no sibling tree was walked and service/* map
+      // entries matched no file.
+      registry = loadRegistry();
     } catch {
       /* registry unreadable → ROOT-only walk; stale paths fail below */
     }

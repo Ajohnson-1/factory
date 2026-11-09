@@ -185,11 +185,19 @@ describe('buildRunPrompt', () => {
   const reg = loadRegistry({ env: {} })
   const BOT = reg.repos['discord-bot']
 
-  it('embeds the REPO CONTEXT block from the committed registry default (factory)', () => {
+  it('embeds the REPO CONTEXT block from the effective registry default (factory)', () => {
+    // buildRunPrompt's default repo resolves through loadRegistry()'s env
+    // chain (FACTORY_REPOS_FILE machine-local override → committed config);
+    // the expectation must read the SAME effective registry the prompt
+    // renders from — on the box the daemon exports FACTORY_REPOS_FILE
+    // (repoDir /opt/factory), so a committed-only compare failed every
+    // blocking-check gate there. Routed repos below stay committed-registry
+    // because they are passed to buildRunPrompt explicitly.
+    const eff = loadRegistry()
     const p = buildRunPrompt({ id: '6ae4b88307df4b89018e8d7f', name: 'X' })
     expect(p).toContain('REPO CONTEXT (repo registry: config/factory-repos.json')
     expect(p).toContain('- repo: factory')
-    expect(p).toContain(`- repoDir: ${reg.repos.factory.repoDir} (all git operations for this repo run here)`)
+    expect(p).toContain(`- repoDir: ${eff.repos.factory.repoDir} (all git operations for this repo run here)`)
     expect(p).toContain('- deploy driver: self')
     expect(p).toContain('- All factory CLI invocations (node scripts/factory.js …) run from the FACTORY repo checkout, not the card worktree.')
     expect(p).toContain('Worktree bootstrap per the REPO CONTEXT block below (branch factory/6ae4b88307df4b89018e8d7f cut from origin/master)')
