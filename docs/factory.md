@@ -758,7 +758,12 @@ node scripts/factory.js wait <card> [--since <ISO8601>] [--timeout <ms>] [--inte
    webhook POST); else `FACTORY_CHANNEL_ID` posts `{content}` straight to
    that channel — the factory bot's own server/channel (the bot needs Send
    Messages there; `FACTORY_SERVER_ID` names the guild it was invited to,
-   no owner id needed); else bot DM via `POST /users/@me/channels` + channel
+   no owner id needed). FM-6 per-board routing: when the ping belongs to a
+   card on `DISCORD_BOT_BOARD_ID` (default `ZHkVYBN1`) and
+   `DISCORD_BOT_CHANNEL_ID` is set, that channel replaces
+   `FACTORY_CHANNEL_ID` for it (done-ping poller + inline move pinger and
+   ask/risk pings all carry the card's board); else bot DM via
+   `POST /users/@me/channels` + channel
    send, using `BOT_TOKEN`/`DISCORD_BOT_TOKEN` and
    `FACTORY_DISCORD_USER_ID` (fallback: `config/config.json` `superUserId`).
 3. **Blocks until answered** — polls card comments every `--interval` ms
@@ -1470,7 +1475,10 @@ Ask-protocol extras (all optional; see `docs/factory.md` "Asking a human"):
 `FACTORY_DISCORD_USER_ID` (owner DM target; default = config `superUserId`),
 `FACTORY_CHANNEL_ID` (channel ping target — beats the DM; the factory bot's
 server, `FACTORY_SERVER_ID` records which guild the bot was invited to and
-is not used for the send), `FACTORY_DISCORD_WEBHOOK` (ping override, beats
+is not used for the send), `DISCORD_BOT_CHANNEL_ID` + optional
+`DISCORD_BOT_BOARD_ID` (FM-6 per-board routing: pings for that board —
+default `ZHkVYBN1` — go to this channel instead of `FACTORY_CHANNEL_ID`),
+`FACTORY_DISCORD_WEBHOOK` (ping override, beats
 everything), `FACTORY_ASK_TIMEOUT_MS` (default 3600000), `FACTORY_ASK_POLL_MS`
 (default 30000). Every ping path reuses `BOT_TOKEN`/`DISCORD_BOT_TOKEN`.
 `FACTORY_DONE_POLL_MS` (default `FACTORY_POLL_MS` or 15000) sets the

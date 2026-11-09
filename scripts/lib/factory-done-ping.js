@@ -196,7 +196,7 @@ export async function runDoneWatch({
     let pinged = 0;
     for (const c of diff.arrivals) {
       try {
-        const res = await notify({ text: `✅ Done: ${c.name} — ${c.url}` });
+        const res = await notify({ text: `✅ Done: ${c.name} — ${c.url}`, board });
         if (res?.sent) {
           diff.seen.seen[c.id] = doneListId; // advance only on confirmed delivery
           pinged += 1;
@@ -263,7 +263,7 @@ export async function pingDoneArrival({
   }
   let res;
   try {
-    res = await notify({ text: `✅ Done: ${card.name} — ${card.url}` });
+    res = await notify({ text: `✅ Done: ${card.name} — ${card.url}`, board });
   } catch (e) {
     log(`[done-ping] inline ping failed for ${card.id}: ${String(e?.message ?? e)}; poller will retry`);
     return { sent: false, error: String(e?.message ?? e) };

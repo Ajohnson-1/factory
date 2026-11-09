@@ -156,6 +156,21 @@ export function extractHumanReply(actions, { sinceDate, excludeCommentId, bot } 
 }
 
 /**
+ * FM-6: per-board Discord channel routing. A registered board may have its own
+ * channel: `DISCORD_BOT_CHANNEL_ID` (env or .env) receives the pings belonging
+ * to `DISCORD_BOT_BOARD_ID` (default: the discord-bot product board,
+ * `ZHkVYBN1`). Any other board — or no override configured — returns
+ * undefined, i.e. keep the default resolution (`FACTORY_CHANNEL_ID`, else the
+ * owner DM). Pure; injectable for tests.
+ */
+export function channelForBoard(board, { env = process.env, fileEnv = parseDotEnv() } = {}) {
+  const ch = env.DISCORD_BOT_CHANNEL_ID || fileEnv.DISCORD_BOT_CHANNEL_ID;
+  if (!ch || !board) return undefined;
+  const bid = env.DISCORD_BOT_BOARD_ID || fileEnv.DISCORD_BOT_BOARD_ID || 'ZHkVYBN1';
+  return board === bid ? String(ch).trim() : undefined;
+}
+
+/**
  * Best-effort Discord ping to the factory owner. NEVER throws.
  * - `FACTORY_DISCORD_WEBHOOK` (env or .env) overrides everything: one
  *   plain webhook POST `{content}` — the escape hatch when a DM cannot be opened.
@@ -172,8 +187,11 @@ export function extractHumanReply(actions, { sinceDate, excludeCommentId, bot } 
  * avoiding that module's multi-bot identity aborts.
  * → `{ sent: true }` | `{ error: string }`
  */
+
 export async function sendOwnerPing({
   text,
+  board = undefined, // FM-6: when set, channelForBoard() may override the channel
+  channelId = undefined, // explicit channel override (wins over board routing)
   fetchImpl = fetch,
   env = process.env,
   fileEnv = parseDotEnv(),
@@ -193,17 +211,17 @@ export async function sendOwnerPing({
     }
     const token =
       env.DISCORD_BOT_TOKEN || fileEnv.DISCORD_BOT_TOKEN || env.BOT_TOKEN || fileEnv.BOT_TOKEN || cfg.BOT_TOKEN;
-    const channelId = env.FACTORY_CHANNEL_ID || fileEnv.FACTORY_CHANNEL_ID;
-    if (channelId) {
+    const chan = channelId || channelForBoard(board, { env, fileEnv }) || env.FACTORY_CHANNEL_ID || fileEnv.FACTORY_CHANNEL_ID;
+    if (chan) {
       if (!token) {
         return { error: `missing Discord bot token for FACTORY_CHANNEL_ID (BOT_TOKEN / DISCORD_BOT_TOKEN)` };
       }
-      const chRes = await fetchImpl(`${DISCORD_API}/channels/${channelId}/messages`, {
+      const chRes = await fetchImpl(`${DISCORD_API}/channels/${chan}/messages`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', Authorization: `Bot ${token}` },
         body: JSON.stringify({ content: text }),
       });
-      if (!chRes.ok) return { error: `Discord channel ${channelId} send -> HTTP ${chRes.status}` };
+      if (!chRes.ok) return { error: `Discord channel ${chan} send -> HTTP ${chRes.status}` };
       return { sent: true };
     }
     const userId =
@@ -309,7 +327,7 @@ export async function askHuman({
     : `🏭 Factory needs you — ${brief} — reply with a comment on ${url}`;
   let discord;
   try {
-    discord = (await notify({ text: pingText })) ?? { sent: true };
+    discord = (await notify({ text: pingText, board })) ?? { sent: true };
   } catch (e) {
     discord = { error: String(e?.message ?? e) };
   }

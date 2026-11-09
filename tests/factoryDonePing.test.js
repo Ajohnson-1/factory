@@ -70,10 +70,13 @@ function fakeNotify(results = [{ sent: true }]) {
   const seq = [...results];
   const take = () => (seq.length > 1 ? seq.shift() : seq[0]);
   const texts = [];
+  const boards = []; // FM-6: ping routing needs the card's board for channel selection
   return {
     texts,
-    notify: async ({ text }) => {
+    boards,
+    notify: async ({ text, board }) => {
       texts.push(text);
+      boards.push(board);
       const r = take();
       if (r instanceof Error) throw r;
       return r;
@@ -847,4 +850,40 @@ test('24. FM-2: Done-ping state is board-scoped (default board = legacy filename
   const p = STATE_PATH('LLNG5MAm');
   assert.ok(p.endsWith('data/factory-done-ping.LLNG5MAm.json'));
   assert.notEqual(p, STATE_PATH());
+});
+
+// FM-6: both ping paths carry the card's BOARD so sendOwnerPing's
+// channelForBoard routing (DISCORD_BOT_CHANNEL_ID per board) can pick the
+// channel. The poller AND the inline (move → Done) path must pass it through.
+test('25. FM-6: Done pings carry the board (poller + inline)', async () => {
+  const t = fakeTrello({ cardsSeq: [[{ ...cardX, idList: DONE }]] });
+  const n = fakeNotify();
+  const s = store(stateOf({ [cardX.id]: REVIEW }));
+  await runDoneWatch({
+    t,
+    notify: n.notify,
+    readState: s.readState,
+    writeState: s.writeState,
+    sleep: async () => {},
+    log: () => {},
+    once: true,
+    board: 'ZHkVYBN1',
+  });
+  assert.equal(n.texts.length, 1);
+  assert.deepEqual(n.boards, ['ZHkVYBN1']);
+
+  const n2 = fakeNotify();
+  const s2 = store(stateOf({}));
+  const res = await pingDoneArrival({
+    card: { id: cardY.id, name: cardY.name, url: cardY.url },
+    doneListId: DONE,
+    board: 'ZHkVYBN1',
+    t: fakeTrello({ cardsSeq: [[cardY]] }),
+    notify: n2.notify,
+    readState: s2.readState,
+    writeState: s2.writeState,
+    log: () => {},
+  });
+  assert.deepEqual(res, { sent: true });
+  assert.deepEqual(n2.boards, ['ZHkVYBN1']);
 });

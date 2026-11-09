@@ -22,6 +22,7 @@ import {
   waitForHuman,
   extractHumanReply,
   sendOwnerPing,
+  channelForBoard,
   parseFlags,
 } from '../scripts/lib/factory-ask.js';
 
@@ -639,6 +640,70 @@ test('7h. channel send non-OK → {error} naming channel + status', async () => 
     fetchImpl: async () => ({ ok: false, status: 403 }),
   });
   assert.match(res.error, /channel chan9 send -> HTTP 403/);
+});
+
+// FM-6 per-board channel routing: DISCORD_BOT_CHANNEL_ID receives the pings
+// belonging to DISCORD_BOT_BOARD_ID (default ZHkVYBN1); everything else keeps
+// FACTORY_CHANNEL_ID. An explicit channelId argument wins over board routing.
+test('7i. board=ZHkVYBN1 + DISCORD_BOT_CHANNEL_ID sends to that channel', async () => {
+  const calls = [];
+  const res = await sendOwnerPing({
+    text: 'product done',
+    board: 'ZHkVYBN1',
+    env: { BOT_TOKEN: 'tok', FACTORY_CHANNEL_ID: 'chan9', DISCORD_BOT_CHANNEL_ID: 'chanProd' },
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl: async (url, init) => {
+      calls.push(url);
+      return { ok: true, status: 200 };
+    },
+  });
+  assert.deepEqual(res, { sent: true });
+  assert.deepEqual(calls, ['https://discord.com/api/v10/channels/chanProd/messages']);
+});
+
+test('7j. other boards keep FACTORY_CHANNEL_ID; explicit channelId wins', async () => {
+  const calls = [];
+  const env = { BOT_TOKEN: 'tok', FACTORY_CHANNEL_ID: 'chan9', DISCORD_BOT_CHANNEL_ID: 'chanProd' };
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200 };
+  };
+  const r1 = await sendOwnerPing({
+    text: 'factory done',
+    board: 'LLNG5MAm',
+    env,
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl,
+  });
+  assert.deepEqual(r1, { sent: true });
+  const r2 = await sendOwnerPing({
+    text: 'explicit',
+    board: 'ZHkVYBN1',
+    channelId: 'chanExplicit',
+    env,
+    fileEnv: {},
+    configDir: path.join(tmpdir(), 'factory-ask-does-not-exist'),
+    fetchImpl,
+  });
+  assert.deepEqual(r2, { sent: true });
+  assert.deepEqual(calls, [
+    'https://discord.com/api/v10/channels/chan9/messages',
+    'https://discord.com/api/v10/channels/chanExplicit/messages',
+  ]);
+});
+
+test('7k. channelForBoard: no override, no board, custom board id, fileEnv', () => {
+  assert.equal(channelForBoard('ZHkVYBN1', { env: {}, fileEnv: {} }), undefined);
+  assert.equal(channelForBoard(undefined, { env: { DISCORD_BOT_CHANNEL_ID: 'c' }, fileEnv: {} }), undefined);
+  assert.equal(channelForBoard('LLNG5MAm', { env: { DISCORD_BOT_CHANNEL_ID: 'c' }, fileEnv: {} }), undefined);
+  assert.equal(channelForBoard('ZHkVYBN1', { env: { DISCORD_BOT_CHANNEL_ID: ' c ' }, fileEnv: {} }), 'c');
+  assert.equal(
+    channelForBoard('ZZOther1', { env: { DISCORD_BOT_CHANNEL_ID: 'c', DISCORD_BOT_BOARD_ID: 'ZZOther1' }, fileEnv: {} }),
+    'c',
+  );
+  assert.equal(channelForBoard('ZHkVYBN1', { env: {}, fileEnv: { DISCORD_BOT_CHANNEL_ID: 'c' } }), 'c');
 });
 
 test('8a. parseFlags splits value/boolean flags from positionals', () => {
