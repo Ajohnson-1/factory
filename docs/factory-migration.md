@@ -333,6 +333,17 @@ the other repo, or `systemctl --user stop/start factory-daemon` on the box.
   the factory server's channel; live smoke returned HTTP 403 on SEND
   (channel GET 200 — view channel yes, Send Messages not yet granted) —
   one operator permission flip remains.
+- **Resume-trigger semantics (canary #2):** the comment-resume watcher answers
+  only HUMAN-member events — `untagged = human`, and a comment whose author is
+  the bot token-holder self-filters (`isBot`) even when untagged, so scheduler
+  tokens can never arm a resume (the scheduler never answers itself — by
+  design). A mid-deploy daemon restart therefore strands the card until a real
+  member comments or drags; FM-4 acceptance used an operator-dispatched resume
+  (identical agentArgs + `[RESUME]` ack) to close the window. A deploy-stage
+  agent also leaked an untagged comment fragment (`- --repo factory`) that
+  parked the boot sweep on "human comment owns the reply" — untagged garbage
+  from a run is indistinguishable from a human reply; contract wording keeps
+  stage comments on `factory.js comment` only.
 - **Environment findings (machine):** the launchd job was registered but
   its PLIST FILE was missing on disk (survived only via the in-memory
   KeepAlive registration — a reboot would have lost the daemon); FM-4's
