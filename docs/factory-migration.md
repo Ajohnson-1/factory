@@ -400,3 +400,7 @@ state; the missing plist was rewritten fresh in the window).
   evidence lives in this card's comment trail (`6af145e01af67cdb31706fe2`)
   and `<clone>/data/factory-deploy-history.jsonl`. Steady-state daemon
   ownership was restored to the discord-bot checkout (§7).
+
+## 9. Cutover log
+
+- 2026-11-09 - FM-6 cutover executed: box 192.168.0.157 is the sole dispatcher (systemd user unit factory-daemon.service enabled active); laptop launchd agents booted out, plist files kept as the rollback anchor.
