@@ -65,7 +65,7 @@ ensure_repo() {
     git -C "$dir" config user.name factory
   else
     mkdir -p "$dir/.git"
-    printf '[core]\n\tuser = factory\n' > "$dir/.git/config"
+    printf '[user]\n\tname = factory\n' > "$dir/.git/config"   # same shape as `git config user.name factory`
   fi
 }
 

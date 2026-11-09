@@ -208,7 +208,7 @@ chk_omp() {
   fi
 }
 chk_repo() { [ -d "$1/.git" ]; }
-chk_actor() { grep -q 'user = factory' "$1/.git/config"; }
+chk_actor() { grep -q 'name = factory' "$1/.git/config"; }  # `git config user.name factory` writes [user] + name = factory
 chk_actor_both() { chk_actor "$1" && chk_actor "$2"; }
 chk_dotenv() {
   [ -f "$ENV_FILE" ] && [ "$(stat_mode "$ENV_FILE")" = 600 ] \
@@ -219,8 +219,15 @@ chk_dotenv() {
     && grep -Fq "FACTORY_REPOS_FILE=$REGISTRY_FILE" "$ENV_FILE"
 }
 chk_registry() {
+  # Live: the pinned binary — node exists only under $NODEHOME/bin on the
+  # box (no global PATH export; cf. ensure_node/ensure_omp), so a bare
+  # `node` dies 127 under set -e. Test: host node (the stub can't run -e).
+  local node_bin=node
+  if [ "$PROVISION_MODE" = live ]; then
+    node_bin="$NODEHOME/bin/node"
+  fi
   [ -f "$REGISTRY_FILE" ] \
-    && node -e '
+    && "$node_bin" -e '
       const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
       const f = j.repos.factory, d = j.repos["discord-bot"];
       if (j.defaultRepo !== "factory") process.exit(1);

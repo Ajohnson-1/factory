@@ -212,7 +212,8 @@ export function installDaemon({
   }));
   const reload = run({ args: ['systemctl', '--user', 'daemon-reload'] });
   if (reload.code !== 0) throw new Error(`systemctl --user daemon-reload failed: ${(reload.stderr || reload.stdout).trim()}`);
-  run({ args: ['systemctl', '--user', 'enable', UNITS.daemon.service] });
+  const enabled = run({ args: ['systemctl', '--user', 'enable', UNITS.daemon.service] });
+  if (enabled.code !== 0) throw new Error(`systemctl --user enable ${UNITS.daemon.service} failed: ${(enabled.stderr || enabled.stdout).trim()}`);
   const active = run({ args: ['systemctl', '--user', 'is-active', UNITS.daemon.service] }).code === 0;
   let start;
   if (active) {

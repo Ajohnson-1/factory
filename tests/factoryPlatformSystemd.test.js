@@ -35,7 +35,7 @@ function writeRepoEnv (root, text) {
 }
 
 /** Scripted systemctl runner: `active` toggles is-active; records argv. */
-function mkRun ({ active = false, failProbe = false, failReload = false, calls = [] } = {}) {
+function mkRun ({ active = false, failProbe = false, failReload = false, failEnable = false, calls = [] } = {}) {
   return function run ({ args }) {
     calls.push(args)
     const joined = args.join(' ')
@@ -47,6 +47,9 @@ function mkRun ({ active = false, failProbe = false, failReload = false, calls =
     }
     if (joined.includes('daemon-reload')) {
       return failReload ? { code: 1, stdout: '', stderr: 'Reload failed.' } : { code: 0, stdout: '', stderr: '' }
+    }
+    if (joined.includes('enable')) {
+      return failEnable ? { code: 1, stdout: '', stderr: 'Failed to enable unit: Refused' } : { code: 0, stdout: '', stderr: '' }
     }
     return { code: 0, stdout: '', stderr: '' }
   }
@@ -250,6 +253,17 @@ test('14. host-fail-closed: broken user bus throws BEFORE any unit file is writt
 test('15. daemon-reload failure aborts install loudly (no half-installed enable)', () => {
   const s = mkScratch()
   assert.throws(() => sys.installDaemon({ root: s.root, unitDir: s.unitDir, envFile: s.envFile, run: mkRun({ failReload: true }) }), /daemon-reload failed/)
+})
+
+test('15b. enable failure aborts installDaemon loudly (fail-close parity with reload/start, review F3)', () => {
+  const s = mkScratch()
+  const calls = []
+  assert.throws(
+    () => sys.installDaemon({ root: s.root, unitDir: s.unitDir, envFile: s.envFile, run: mkRun({ failEnable: true, calls }) }),
+    /systemctl --user enable factory-daemon.service failed: Failed to enable unit: Refused/,
+  )
+  // a discarded enable code let the install proceed to start; fail-close must not
+  assert.ok(!calls.some(a => a.join(' ').includes('systemctl --user start')), 'start ran despite failed enable')
 })
 
 // ---------- status ----------

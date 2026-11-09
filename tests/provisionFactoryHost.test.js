@@ -14,7 +14,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawnSync as sync } from 'node:child_process'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, statSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -78,7 +78,7 @@ test('2. user session: all 8 self-checks PASS = exit 0; artifacts + modes', () =
   assert.ok(existsSync(join(s.dest, 'state', 'omp')))
   for (const dir of [join(s.dest, 'opt', 'repos', 'discord-bot'), factoryDir]) {
     assert.ok(existsSync(join(dir, '.git')), dir)
-    assert.match(readFileSync(join(dir, '.git', 'config'), 'utf8'), /user = factory/)
+    assert.match(readFileSync(join(dir, '.git', 'config'), 'utf8'), /name = factory/)
   }
   assert.ok(existsSync(join(s.dest, 'opt', 'factory-worktrees')))
   assert.ok(existsSync(join(s.dest, 'opt', 'repos', 'discord-bot-worktrees')))
@@ -148,5 +148,40 @@ test('6. --source-lib hook loads the library without running main', () => {
   })
   assert.equal(r.status, 0, r.stdout + r.stderr)
   assert.match(r.stdout, /LOADED/)
+  rmSync(s.dest, { recursive: true, force: true })
+})
+
+test('7. live-mode checks: chk_actor matches real `git config user.name` output; chk_registry uses the pinned $NODEHOME/bin/node', () => {
+  const s = scratch()
+  // F1 regression: `git config user.name factory` (live ensure_repo) writes
+  // `[user]` + `name = factory` — chk_actor must read the REAL git shape.
+  const clone = join(s.dest, 'opt', 'factory')
+  mkdirSync(clone, { recursive: true })
+  assert.equal(spawnSync('git', ['-C', clone, 'init', '-q'], { encoding: 'utf8' }).status, 0)
+  assert.equal(spawnSync('git', ['-C', clone, 'config', 'user.name', 'factory'], { encoding: 'utf8' }).status, 0)
+  // F2 regression: live mode resolves node via $NODEHOME/bin/node, not PATH.
+  const nodeBin = join(s.dest, 'home', 'factory', '.local', 'node', 'bin', 'node')
+  mkdirSync(join(nodeBin, '..'), { recursive: true })
+  symlinkSync(process.execPath, nodeBin)
+  const registry = join(clone, 'config', 'factory-repos.local.json')
+  mkdirSync(join(registry, '..'), { recursive: true })
+  const dbot = join(s.dest, 'opt', 'repos', 'discord-bot')
+  writeFileSync(registry, JSON.stringify({
+    defaultRepo: 'factory',
+    repos: {
+      factory: { repoDir: clone, board: 'LLNG5MAm', deploy: { driver: 'self' }, worktreeRoot: join(s.dest, 'opt', 'factory-worktrees') },
+      'discord-bot': { repoDir: dbot, board: 'ZHkVYBN1', deploy: { driver: 'docker-ssh' }, worktreeRoot: dbot + '-worktrees' },
+    },
+  }))
+  const live = { ...process.env, PROVISION_MODE: 'live', DESTDIR: s.dest }
+  const ok = spawnSync('/bin/bash', ['-c', `source '${SCRIPT}' --source-lib && chk_actor '${clone}' && chk_registry && echo CHECKS_PASS`], { encoding: 'utf8', env: live })
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr)
+  assert.match(ok.stdout, /CHECKS_PASS/)
+  // pinned path really is used: no node at $NODEHOME/bin/node → FAIL even
+  // though the host node is on PATH (bare `node` would have passed).
+  rmSync(nodeBin)
+  const gone = spawnSync('/bin/bash', ['-c', `source '${SCRIPT}' --source-lib && chk_registry && echo CHECKS_PASS`], { encoding: 'utf8', env: live })
+  assert.notEqual(gone.status, 0)
+  assert.ok(!/CHECKS_PASS/.test(gone.stdout))
   rmSync(s.dest, { recursive: true, force: true })
 })
