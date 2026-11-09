@@ -8,3 +8,6 @@ data/
 
 # Repo rule: this project is ESM via "type": "module", so .js is already an ES
 # module. Scratch probes landed as .mjs in discord-bot and drifted from the tree.
+
+# machine-local registry override (live copies live OUTSIDE the repo tree; FACTORY_REPOS_FILE)
+config/factory-repos.local.json
