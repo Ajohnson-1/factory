@@ -74,7 +74,7 @@ export function daemonLogPath({ plist = PLIST_PATH } = {}) {
 /** linux log reader: journal since the restart (last 500 lines cap — the
  *  markers land right after boot; a flooded journal still shows them). */
 export function journalLog({ run = defaultRunner, unit = UNIT, since } = {}) {
-  const r = run({ args: ['journalctl', '-u', unit, `--since=${since}`, '--no-pager', '-n', '500'] });
+  const r = run({ args: ['journalctl', '--user', '-u', unit, `--since=${since}`, '--no-pager', '-n', '500'] });
   return r.code === 0 ? r.stdout : '';
 }
 

@@ -260,7 +260,7 @@ test('linux branch reads journal since the restart (argv assertion)', async () =
   assert.equal(res.verdict, 'PASS');
   assert.deepEqual(res.verdictJson.unit, 'factory-daemon.service');
   const j = seen.find((a) => a[0] === 'journalctl');
-  assert.deepEqual(j, ['journalctl', '-u', 'factory-daemon.service', `--since=${RESTART_AT}`, '--no-pager', '-n', '500']);
+  assert.deepEqual(j, ['journalctl', '--user', '-u', 'factory-daemon.service', `--since=${RESTART_AT}`, '--no-pager', '-n', '500']);
 });
 
 test('rollback entries verify exactly like deploys (last entry decides)', async () => {
