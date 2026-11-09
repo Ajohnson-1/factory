@@ -26,7 +26,9 @@ const RESTART_AT = '2026-11-08T15:00:00.000Z';
 const TARGET = { ok: true, repo: { name: 'factory' }, clone: '/home/me/GitHub/factory', branch: 'master' };
 const HISTORY = [{ ts: RESTART_AT, sha: FULL, short: 'abcdef1', action: 'deploy', restart: 'launchd-guard pid 1' }];
 
-const stamped = (iso, s) => `${iso}Z ${s}`;
+// Daemon log format is `[factory-daemon <ISO>] <message>` — stamps anywhere
+// in the line must count (the scanner is not anchored to the line start).
+const stamped = (iso, s) => `[factory-daemon ${iso}.000Z] ${s}`;
 const bootLine = (iso = '2026-11-08T15:00:05') => stamped(iso, 'watching "Ready" on 1 board(s) (LLNG5MAm) every 15000ms, cap 1, agent "omp"');
 const pollLine = (iso = '2026-11-08T15:00:06') => stamped(iso, `[poll] board LLNG5MAm ${POLL_MARKER}`);
 

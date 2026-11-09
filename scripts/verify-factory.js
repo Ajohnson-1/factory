@@ -82,13 +82,15 @@ export function journalLog({ run = defaultRunner, unit = UNIT, since } = {}) {
  * Scan daemon log text for the post-restart proof: a boot marker line stamped
  * strictly after `restartAtIso`, followed by a poll-ok line (its own stamp, if
  * present, must also be after — unparseable stamps inherit "after the boot").
+ * Timestamps are found ANYWHERE in the line — the daemon format is
+ * `[factory-daemon <ISO>] <message>`, not a bare leading stamp.
  * @returns {{line:string}|{reason:string}}
  */
 export function pollLineAfter(text, restartAtIso) {
   let bootSeen = false;
   for (const raw of String(text).split('\n')) {
     const line = raw.trimEnd();
-    const ts = line.match(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z/)?.[0] ?? null;
+    const ts = line.match(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/)?.[0] ?? null;
     if (line.includes(BOOT_MARKER)) {
       if (ts && ts <= restartAtIso) continue; // boot from before the restart
       bootSeen = true;
