@@ -260,7 +260,12 @@ test('linux branch reads journal since the restart (argv assertion)', async () =
   assert.equal(res.verdict, 'PASS');
   assert.deepEqual(res.verdictJson.unit, 'factory-daemon.service');
   const j = seen.find((a) => a[0] === 'journalctl');
-  assert.deepEqual(j, ['journalctl', '--user', '-u', 'factory-daemon.service', `--since=${RESTART_AT}`, '--no-pager', '-n', '500']);
+  // "@<epoch>" — systemd 252 (the Debian 12 box) rejects the history ts
+  // format (fractional seconds / trailing "Z") outright: journalctl exits 1,
+  // journalLog returns '', and verify FAILs a healthy daemon after the full
+  // 180s window (card 6af1fa46fecb634350948a5d, 2026-11-09/10). Floor keeps
+  // the window ≥ as wide as the ISO instant.
+  assert.deepEqual(j, ['journalctl', '--user', '-u', 'factory-daemon.service', `--since=@${Math.floor(Date.parse(RESTART_AT) / 1000)}`, '--no-pager', '-n', '500']);
 });
 
 test('rollback entries verify exactly like deploys (last entry decides)', async () => {

@@ -72,9 +72,21 @@ export function daemonLogPath({ plist = PLIST_PATH } = {}) {
 }
 
 /** linux log reader: journal since the restart (last 500 lines cap — the
- *  markers land right after boot; a flooded journal still shows them). */
+ *  markers land right after boot; a flooded journal still shows them).
+ *
+ *  `since` arrives as the deploy history entry's ts (`2026-11-09T22:22:54.324Z`)
+ *  and systemd 252's parser (the Debian 12 box) REJECTS ISO 8601 carrying
+ *  fractional seconds or a trailing "Z" — journalctl exits 1, this function
+ *  returns '' per its contract, and verify burned the full 180s window
+ *  FAILing a healthy daemon whose boot+poll markers were in the journal all
+ *  along (card 6af1fa46fecb634350948a5d verify loop, 2026-11-09/10). "@<epoch>"
+ *  is the parser-stable dialect; floor keeps the window ≥ as wide as the ISO
+ *  instant (pollLineAfter still filters each line strictly > restartAt), and a
+ *  ts that doesn't parse at all passes through unchanged (previous behavior). */
 export function journalLog({ run = defaultRunner, unit = UNIT, since } = {}) {
-  const r = run({ args: ['journalctl', '--user', '-u', unit, `--since=${since}`, '--no-pager', '-n', '500'] });
+  const epoch = Date.parse(since);
+  const sinceArg = Number.isFinite(epoch) ? `@${Math.floor(epoch / 1000)}` : since;
+  const r = run({ args: ['journalctl', '--user', '-u', unit, `--since=${sinceArg}`, '--no-pager', '-n', '500'] });
   return r.code === 0 ? r.stdout : '';
 }
 
