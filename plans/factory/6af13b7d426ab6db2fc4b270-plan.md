@@ -89,3 +89,41 @@ deploy/verify/rollback command lines: `docker-ssh` for discord-bot prod,
 - Pre-FM-6 nuance (installed launchd job still runs the discord-bot checkout;
   a `self` restart cycles THAT job) is documented in docs/factory.md; the
   README points there rather than duplicating the caveat.
+
+---
+
+## Run 2 addendum — 2026-11-10 (idempotent re-verify, zero impl commits)
+
+Run 1 (2026-11-09) completed CHECK:PASS + deploy and died before posting
+`[DEPLOY]`; its commits 233b5e7/342c06a are already merged to master
+(`[HUMAN]` operator hold, 2026-11-09T03:58Z). This run re-executes the card
+from the fixed tip. The plan above stays as written; this addendum records
+run-2 facts only — no design change.
+
+**Deliverable state: already implemented and merged.** Re-verified against
+the current tip `origin/master` = `a09efef7ba07cef8f86b2d37e7d71d07682140dd`
+(branch tip == master; `git diff origin/master HEAD` is empty):
+
+- `README.md` exists with `# factory`, `## Deploys`, both driver subsections,
+  and the link to `docs/factory.md#deploy-drivers-per-repo`; the anchor
+  heading `## Deploy drivers (per-repo)` exists in docs/factory.md.
+- All 8 command bullets (4 docker-ssh + 4 self) are **character-exact**
+  against `deployCommands()` output in `scripts/lib/factory-registry.js`,
+  derived from the live registry at
+  `FACTORY_REPOS_FILE=/home/factory/factory-repos.local.json`
+  (`factory` → `self`, `discord-bot` → `docker-ssh`). Check: 8/8 equal, no
+  drift.
+
+**Run facts:** the run-1 worktree was destroyed by the 2026-11-10T13:34Z
+cleanup after the FM-6 self-deploy daemon restart; the scheduler rebuilt
+worktree + branch from `origin/master` `a09efef` at 2026-11-10T21:46Z
+(worktree dir birth time), so the branch diff vs master is empty.
+
+**Decision: zero implementation commits.** The requested change is fully in
+place; there is nothing to change. The only commit on this branch is this
+plan addendum (docs-only), keeping the branch a fast-forward of
+`origin/master`. Downstream: impl is a zero-diff no-op; review/QA/checks
+verify the empty diff plus the merged deliverable; deploy runs the `self`
+driver (`node scripts/deploy-factory.js deploy` from the factory checkout)
+and verify runs `node scripts/verify-factory.js` — which is exactly what
+this canary is meant to exercise end-to-end.
