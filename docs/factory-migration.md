@@ -199,20 +199,82 @@ board writes). FM-5 verified on the macOS gate host with unit-render +
 scratch-DESTDIR assertions (no Linux box in this environment); the live enable/active
 checks and one manual run per timer land at cutover (§6.2, FM-6).
 
-### 6.2 Cutover runbook (FM-6)
+### 6.2 Cutover runbook (FM-6) — EXECUTED 2026-11-09; status live-checked 2026-11-10
 
-1. Preflight on the box: `node scripts/factory.js status` green on **both** boards;
-   laptop daemon healthy, zero in-flight cards (drain first; C-M9/C-M11 finish pre-cutover).
-2. **Freeze laptop dispatcher:** `launchctl bootout` factory-daemon (plist kept = rollback
-   anchor). Same for prodwatch (both pollers would open duplicate incident cards).
-3. **Start box dispatcher:** `systemctl --user start factory-daemon` → sole dispatcher
-   (pid-lock proves it; board polls both boards).
-4. **Canary:** file a trivial docs-only card on softwarefactory (default repo = factory) →
-   full pipeline to Done including `self` deploy + daemon restart via `systemd-run`.
-5. One discord-bot product card end-to-end from the box (docker-ssh deploy + verify).
-6. Soak ≥7 days: ≥3 Done cards, zero `[PROD-WATCH]` incidents → then FM-7 cleanup +
-   uninstall the laptop agents (`factory-daemon`, `prodwatch`, metrics/sweep if present),
-   archive `data/factory-daemon` logs.
+Execution model (from the [OPS] cutover): machine transitions are
+operator-driven — box-side `systemctl --user` works over ssh with
+`XDG_RUNTIME_DIR=/run/user/$(id -u)` + `DBUS_SESSION_BUS_ADDRESS` exported;
+laptop `launchctl` needs a console GUI session (FM-4: non-GUI shells get
+113/5). A daemon-dispatched run NEVER issues a freeze/start pair — the run is
+a child of the daemon it would stop.
+
+- [x] **Step 1 — Preflight/drain** (2026-11-09T16:47Z, [OPS]): every in-flight
+  list empty on `ZHkVYBN1` + `LLNG5MAm` (board-API verified); box `status`
+  green on both boards.
+- [x] **Step 2 — Laptop dispatcher frozen** (2026-11-09T16:34Z, [OPS]):
+  `com.ajjohnson.factory-daemon` registration reclaimed with its transient
+  session (plist kept = rollback anchor); `com.discordbot.prodwatch` booted
+  out (plist kept). Caveat: one **ghost laptop daemon** (stale discord-bot job
+  in an unreachable launchd domain) needs a **Mac reboot** to clear; until then
+  it would double-dispatch `ZHkVYBN1`, so step 5 stays gated on the reboot.
+- [x] **Step 3 — Box dispatcher started** (2026-11-09T16:51:27Z, [OPS]):
+  `systemctl --user enable --now factory-daemon.service` over ssh → sole
+  dispatcher; journal shows boot + `poll ok` for `LLNG5MAm` and `ZHkVYBN1`.
+  Fix during start: `/opt/factory/.env` gained the missing
+  `FACTORY_SERVER_ID`/`FACTORY_CHANNEL_ID` and was CR-stripped (dotenv
+  tolerated CR bytes, raw sourcing 401-ed).
+- [x] **Step 4 — Canary Done on the box** (card `6af1fa46fecb634350948a5d`,
+  Done 2026-11-10): docs-only card ran the full pipeline on the box incl. the
+  first live Linux detached self-restart (`deploy-factory.js` →
+  `systemd-run … in 2s`, deploy-history entry `a09efef` 2026-11-10T13:32Z) →
+  `[VERIFY:PASS]` → Done.
+- [ ] **Step 5 — one discord-bot product card end-to-end from the box**
+  (docker-ssh deploy + verify): ⏳ **operator-owned** — create/dispatch only
+  after the Mac reboot clears the ghost daemon (step 2 caveat).
+- [ ] **Step 6 — Soak ≥7 days + uninstall:** ⏳ soak clock started
+  2026-11-09T16:51Z → ends **2026-11-16 ~17:00Z**. Evidence as of commit:
+  13 boots ↔ 13 `poll ok` per board (1:1, all deploy-armed restarts), zero
+  `[PROD-WATCH]` incident cards on `LLNG5MAm`, 2 Done cards completed on the
+  box since cutover (≥3 target counts naturally; the FM-6 card itself is
+  projected third). After the soak passes → FM-7 cleanup + remove the laptop
+  rollback anchors (jobs are already booted out):
+  `rm ~/Library/LaunchAgents/com.ajohnson.factory-daemon.plist`
+  `~/Library/LaunchAgents/com.discordbot.prodwatch.plist`
+  (+ `com.discordbot.factory-metrics` / `com.ajohnson.factory-sweep` plists if
+  present), archive `data/factory-daemon` logs.
+
+#### Rollback drill — box → laptop → box (once, inside the soak) ⏳ operator-owned
+
+Rehearses the §6.3 cutover rollback forward and back before the soak ends
+(target before 2026-11-16). Precondition: both boards drained (zero in-flight).
+Run interactively — never from a dispatched run (§7 invariant).
+
+1. Forward (box → laptop): box `systemctl --user disable --now
+   factory-daemon` and stop the satellite service+timer pairs
+   (`factory-metrics`, `factory-sweep`, `prod-watch`); laptop console:
+   `launchctl bootstrap gui/$(id -u)
+   ~/Library/LaunchAgents/com.ajohnson.factory-daemon.plist` (+ the prodwatch
+   plist); verify laptop `node scripts/factory.js status` green on both boards.
+2. Back (laptop → box): laptop `launchctl bootout
+   gui/$(id -u)/com.ajohnson.factory-daemon` (+ prodwatch); box
+   `systemctl --user enable --now factory-daemon`; verify boot + `poll ok` for
+   both boards in `journalctl --user -u factory-daemon.service`.
+3. Divergence handling: D8/§6.3 — done-ping re-baselines silently, resume
+   watermarks are event-id keyed (worst case one human-comment re-ack); the
+   board is the only shared state.
+4. Record the drill (timestamps + poll-ok evidence) as a `## 9` cutover-log
+   bullet; that bullet is the evidence flipping the card sub-step "rollback
+   rehearsed once".
+
+#### FM-6 acceptance tracking (as of this runbook commit)
+
+| Acceptance | Status | Owner |
+|---|---|---|
+| ≥7 days always-on on the box | ⏳ soak window ends 2026-11-16 ~17:00Z; boots↔poll-ok 1:1 so far | time |
+| ≥3 Done cards on the box | ⏳ 2 since cutover; FM-6 merge is projected 3rd | pipeline (flows naturally) |
+| laptop agents uninstalled | ⏳ jobs booted out; plist removal after soak; **Mac reboot first** (ghost daemon) | operator (FM-7) |
+| rollback rehearsed once (box→laptop→box) | ⏳ drill scheduled inside the soak window | operator (console) |
+| runbook merged | ✅ this commit, merged + self-deployed by the factory pipeline itself | done |
 
 ### 6.3 Rollback story
 
@@ -404,3 +466,6 @@ state; the missing plist was rewritten fresh in the window).
 ## 9. Cutover log
 
 - 2026-11-09 - FM-6 cutover executed: box 192.168.0.157 is the sole dispatcher (systemd user unit factory-daemon.service enabled active); laptop launchd agents booted out, plist files kept as the rollback anchor.
+- 2026-11-09 - cutover fixes during step-3 start: /opt/factory/.env completed (FACTORY_SERVER_ID/FACTORY_CHANNEL_ID) + CR-byte cleanup; ghost laptop daemon pending Mac reboot (gates the discord-bot product-card step).
+- 2026-11-10 - FM-6 canary 6af1fa46fecb634350948a5d Done on the box: first live Linux detached self-restart (systemd-run) converged; [VERIFY:PASS].
+- 2026-11-10 - FM-6 runbook committed (§6.2 executed status + rollback drill). Open operator items: rollback drill before 2026-11-16, Mac reboot (ghost laptop daemon), one discord-bot product card from the box, post-soak plist removal.
