@@ -53,6 +53,7 @@ import { repoContextBlock, worktreeFor } from './factory-registry.js';
 import {
   STAGE_SEED_LIST,
   CRASH_TAG,
+  RESTART_TAG,
   CRASH_TAIL_LINES,
   CRASH_TAIL_CHARS,
   MAX_CRASH_COMMENT_CHARS,
@@ -95,6 +96,7 @@ export const STAGE_TAGS = [
   '[HUMAN]',
   '[RESUME]',
   '[DAEMON-CRASH]',
+  '[DAEMON-RESTART]',
   '[METRICS]',
   // Blocking-checks gate verdicts (card 6ae9677239bb2697a13ea728;
   // docs/factory.md "Independent blocking checks"): posted by the daemon,
@@ -108,12 +110,12 @@ export const STAGE_TAGS = [
 ];
 
 /** Scheduler-bookkeeping tags — visible trail, NOT evidence of committed stage work. */
-const BOOKKEEPING_TAGS = ['[ASK]', '[HUMAN]', '[RESUME]', '[DAEMON-CRASH]', '[METRICS]'];
+const BOOKKEEPING_TAGS = ['[ASK]', '[HUMAN]', '[RESUME]', '[DAEMON-CRASH]', '[DAEMON-RESTART]', '[METRICS]'];
 
 /**
  * The verdict subset of `STAGE_TAGS`: tags that record a completed stage
  * decision ([PLAN]…[VERIFY:*], [ROLLBACK], [PROD-CLOSE]). [ASK]/[HUMAN]/
- * [RESUME]/[DAEMON-CRASH]/[METRICS] are scheduler bookkeeping — a card whose
+ * [RESUME]/[DAEMON-CRASH]/[DAEMON-RESTART]/[METRICS] are scheduler bookkeeping — a card whose
  * only comments are bookkeeping has committed NOTHING, so crash recovery
  * treats it like a fresh card (docs/factory.md "Auto-start daemon").
  */
@@ -136,6 +138,31 @@ export function hasStageVerdict(comments) {
 /** Prior `[DAEMON-CRASH]` comments — byte-compatible with the daemon's cap filter. */
 function countCrashComments(comments) {
   return (Array.isArray(comments) ? comments : []).filter((c) => textOf(c).startsWith(CRASH_TAG)).length;
+}
+
+/**
+ * CONSECUTIVE trailing `[DAEMON-RESTART]` comments — the restart-stop storm
+ * signal. Sorted newest-first by date like `latestStageTag` (Trello returns
+ * newest-first; fixtures vary), so this is the leading run of restart
+ * bookkeeping: ANY other comment between stops (a stage verdict, a crash, a
+ * human reply) breaks the streak — stops with no progress between them are
+ * what "the daemon keeps dying mid-run" looks like, while a card that
+ * self-deploys once an evening never accumulates one.
+ */
+export function countRestartStops(comments) {
+  const list = (Array.isArray(comments) ? comments : [])
+    .map((c, i) => ({ c, i, ms: msOf(c) }))
+    .sort((x, y) => {
+      const xm = Number.isFinite(x.ms) ? x.ms : Number.NEGATIVE_INFINITY;
+      const ym = Number.isFinite(y.ms) ? y.ms : Number.NEGATIVE_INFINITY;
+      return ym - xm || x.i - y.i;
+    });
+  let n = 0;
+  for (const { c } of list) {
+    if (!textOf(c).startsWith(RESTART_TAG)) break;
+    n += 1;
+  }
+  return n;
 }
 
 /**
@@ -176,13 +203,29 @@ function isInFlightList(listName) {
  *               under the human's feet while their answer is still owed.
  *               Evaluated AFTER the park cap so stall/ask loops still
  *               escalate to `needs-human` at the comment-derived cap.
+ *  - `restartStopped` (the self-deploy class, card 6af1fa46fecb634350948a5d)
+ *               — caller passes `sigtermStopped(runLogText)`: the run died to
+ *               a SIGTERM from the daemon's OWN (re)start (a `factory` run
+ *               deploys by restarting the daemon it runs under, so this stop
+ *               is EXPECTED). The crash cap is NEVER consulted — the card's
+ *               historical crash comments must not park every future
+ *               self-deploy; instead `countRestartStops` bounds the
+ *               CONSECUTIVE-stop storm with the same `crashRetries` cap
+ *               (daemon flap without progress → park like any other loop).
  *
  * @returns {{ mode: 'park'|'resume'|'requeue'|'hold', stage: string }}
  *   `stage` = resume target (or the current list name for park/hold, 'Plan'
  *   for requeue).
  */
-export function decideCrashRecovery({ comments, listName, crashRetries = 2, askPending = false } = {}) {
+export function decideCrashRecovery({ comments, listName, crashRetries = 2, askPending = false, restartStopped = false } = {}) {
   const name = String(listName ?? '').trim();
+  if (restartStopped) {
+    if (countRestartStops(comments) >= crashRetries) return { mode: 'park', stage: name };
+    if (askPending) return { mode: 'hold', stage: name };
+    if (!isInFlightList(name)) return { mode: 'hold', stage: name };
+    if (!hasStageVerdict(comments)) return { mode: 'requeue', stage: 'Plan' };
+    return { mode: 'resume', stage: deriveResumeStage({ listName: name, comments }) };
+  }
   if (countCrashComments(comments) >= crashRetries) return { mode: 'park', stage: name };
   if (askPending) return { mode: 'hold', stage: name };
   if (!isInFlightList(name)) return { mode: 'hold', stage: name };
@@ -202,23 +245,31 @@ export function decideCrashRecovery({ comments, listName, crashRetries = 2, askP
  * head (mirrors the [VERIFY:FAIL]-embeds-JSON precedent) and the assembled
  * comment is clamped to MAX_CRASH_COMMENT_CHARS, still keeping the tail's
  * end. Missing/empty/unreadable log text → exactly the exit-code-only head,
- * byte-identical — for EVERY mode.
+ * byte-identical — for EVERY mode. `restartStopped: true` renders the same
+ * mode shapes under `RESTART_TAG` with "run stopped by SIGTERM (daemon
+ * restart)" wording (the self-deploy class — invisible to the crash cap).
  */
-export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRetries = 2, logPath = '', logText = '', holdReason = '' } = {}) {
+export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRetries = 2, logPath = '', logText = '', holdReason = '', restartStopped = false } = {}) {
   const n = `${prior + 1}/${crashRetries + 1}`;
+  // Restart-stops (self-deploy class) post under RESTART_TAG — invisible to
+  // the crash cap — with the same mode shapes; crash wording stays byte-
+  // identical (`prior`/`n` carry restart counts when restartStopped).
+  const tag = restartStopped ? RESTART_TAG : CRASH_TAG;
+  const death = restartStopped ? 'run stopped by SIGTERM (daemon restart)' : `run exited ${code}`;
+  const unit = restartStopped ? 'restart' : 'crash';
   let head;
   if (mode === 'park') {
-    head = `${CRASH_TAG} run exited ${code} after ${prior} prior crash(es); parking needs-human where it stands${stage ? ` (${stage})` : ''}`;
+    head = `${tag} ${death} after ${prior} prior ${restartStopped ? 'restart-stop(s)' : 'crash(es)'}; parking needs-human where it stands${stage ? ` (${stage})` : ''}`;
   } else if (mode === 'resume') {
-    head = `${CRASH_TAG} run exited ${code}; stage-aware resume at ${stage} (crash ${n})`;
+    head = `${tag} ${death}; stage-aware resume at ${stage} (${unit} ${n})`;
   } else if (mode === 'hold' && holdReason === 'ask-pending') {
     // RC4 visibility (card 6aebab9a65613358f4ca333a): the pending [ASK] owns
     // the reply — this comment turns "waiting on a human" board-visible.
-    head = `${CRASH_TAG} run exited ${code}; a pending [ASK] owns the reply — left waiting on the human${stage ? ` (${stage})` : ''} (crash ${n})`;
+    head = `${tag} ${death}; a pending [ASK] owns the reply — left waiting on the human${stage ? ` (${stage})` : ''} (${unit} ${n})`;
   } else if (mode === 'hold') {
-    head = `${CRASH_TAG} run exited ${code}; card sits in ${stage || 'an unknown list'} — outside the in-flight pipeline, left untouched (crash ${n})`;
+    head = `${tag} ${death}; card sits in ${stage || 'an unknown list'} — outside the in-flight pipeline, left untouched (${unit} ${n})`;
   } else {
-    head = `${CRASH_TAG} run exited ${code}; re-queueing to Ready (crash ${n})`;
+    head = `${tag} ${death}; re-queueing to Ready (${unit} ${n})`;
   }
   const tail = crashTail(logText);
   if (!tail) return head;

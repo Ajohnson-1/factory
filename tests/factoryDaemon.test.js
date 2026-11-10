@@ -13,12 +13,14 @@ import {
   STAGE_PROMPT_FILES,
   DEFAULT_MAX_PARALLEL,
   CRASH_TAG,
+  RESTART_TAG,
   MAX_CRASH_RETRIES,
   CRASH_TAIL_LINES,
   CRASH_TAIL_CHARS,
   MAX_CRASH_COMMENT_CHARS,
   crashTail,
   crashCommentText,
+  sigtermStopped,
   handleRunCrash,
   exitCodeStr,
   isStallCode,
@@ -1096,6 +1098,119 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     expect(prompt).toContain(`Reuse the existing worktree and branch factory/${card.id} if present (git worktree at ${join('/srv/discord-bot-factory-wt', card.id)})`)
     expect(prompt).toContain(`cp .env ${join('/srv/discord-bot-factory-wt', card.id)}/`)
     expect(prompt).not.toContain('../discord-bot-factory-wt/') // no stale hard-coded path
+  })
+
+  // --- the self-deploy class (card 6af1fa46fecb634350948a5d) ---------------
+  // A `factory` run deploys by restarting the daemon it runs under; the
+  // daemon's shutdown forwards SIGTERM to the run, so EVERY self-deploy ends
+  // the same way — omp dies mid-Verify writing its `[Stopped by SIGTERM]` +
+  // `[Recovery]` block. That stop is EXPECTED: RESTART_TAG comments track it
+  // invisibly to the crash cap, the card resumes at once at its own stage.
+  const restartLog = '# dispatch 2026-11-10T05:17:40.000Z omp ["-p","--auto-approve","--max-time","12h"]\nWorking...\n\n[Stopped by SIGTERM]\n[Recovery]\n  Main: omp --resume 01a1c35b-3e57-754a-a523-ef0cbe7dfd17\n'
+  const cleanLog = '# dispatch 2026-11-10T05:17:40.000Z omp ["-p","--auto-approve","--max-time","12h"]\nWorking...\n'
+  const restartCmt = (date, n) => cmt(date, `${RESTART_TAG} run stopped by SIGTERM (daemon restart); stage-aware resume at Verify (restart ${n}/3)`)
+
+  it('sigtermStopped reads ONLY the last dispatch section', () => {
+    expect(sigtermStopped('')).toBe(false)
+    expect(sigtermStopped(cleanLog)).toBe(false)
+    expect(sigtermStopped(restartLog)).toBe(true)
+    // historical markers in older sections must not classify a fresh death
+    expect(sigtermStopped(`# dispatch 2026-11-09T22:02:04Z old\nWorking...\n[Stopped by SIGTERM]\n[Recovery]\n${cleanLog.trimEnd()}`)).toBe(false)
+    expect(sigtermStopped('[Stopped by SIGTERM]')).toBe(true) // headerless text → whole log
+    expect(sigtermStopped(undefined)).toBe(false)
+  })
+
+  it('SIGTERM stop ignores the crash cap: RESTART_TAG comment + stage-aware resume (canary repro at Verify)', async () => {
+    // The canary's exact shape: 2 prior [DAEMON-CRASH] (≥ cap 2) + [IMPL]
+    // verdict + card in Verify + SIGTERM-killed run log. Old behavior: park
+    // (crash 9, needs-human, 2026-11-10T05:17:52Z). New: resume at Verify.
+    const t = fakeT({
+      comments: [implVerdict, crashCmt('2026-11-03T02:00:00.000Z', 1), crashCmt('2026-11-03T03:00:00.000Z', 2)],
+      idList: VERIFY.id,
+    })
+    const spawned = []
+    await handleRunCrash({
+      readRunLog: () => restartLog,
+      card,
+      code: 'stalled (orphan, silent 0 min)',
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(t.calls.labelAdded).toEqual([]) // never parked
+    expect(t.calls.moves).toEqual([]) // committed stage work
+    expect(spawned).toHaveLength(1)
+    expect(spawned[0][1]).toContain('continue from Verify')
+    expect(t.calls.commentsWritten[0].text.split('\n')[0]).toBe(
+      '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); stage-aware resume at Verify (restart 1/3)',
+    ) // the Factor-9 log tail follows below the head
+    expect(t.calls.commentsWritten[0].text).toContain('[Stopped by SIGTERM]') // tail embedded for the resume
+  })
+
+  it('a CONSECUTIVE restart-stop storm parks needs-human (daemon flap = operator territory)', async () => {
+    const t = fakeT({
+      comments: [implVerdict, restartCmt('2026-11-03T04:00:00.000Z', 1), restartCmt('2026-11-03T05:00:00.000Z', 2)],
+      idList: IMPL.id,
+    })
+    const spawned = []
+    await handleRunCrash({
+      readRunLog: () => restartLog,
+      card,
+      code: 'stalled (orphan, silent 0 min)',
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]])
+    expect(spawned).toHaveLength(0)
+    expect(t.calls.commentsWritten[0].text.split('\n')[0]).toBe(
+      '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart) after 2 prior restart-stop(s); parking needs-human where it stands (Implement)',
+    )
+  })
+
+  it('progress between stops breaks the storm — self-deploy #2 after a [DEPLOY] still resumes', async () => {
+    const t = fakeT({
+      comments: [
+        implVerdict,
+        restartCmt('2026-11-03T04:00:00.000Z', 1),
+        cmt('2026-11-03T05:00:00.000Z', '[DEPLOY] sha=7d048ab — self driver'),
+      ],
+      idList: VERIFY.id,
+    })
+    const spawned = []
+    await handleRunCrash({
+      readRunLog: () => restartLog,
+      card,
+      code: 'stalled (orphan, silent 0 min)',
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(spawned).toHaveLength(1) // [DEPLOY]-last Verify resumes at Verify (trap inherited)
+    expect(spawned[0][1]).toContain('continue from Verify')
+    expect(t.calls.commentsWritten[0].text.split('\n')[0]).toBe(
+      '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); stage-aware resume at Verify (restart 1/3)',
+    )
+  })
+
+  it('crashCommentText restartStopped: identical shapes under RESTART_TAG', () => {
+    expect(crashCommentText(1, 0, { mode: 'requeue', crashRetries: 2, restartStopped: true })).toBe(
+      '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); re-queueing to Ready (restart 1/3)',
+    )
+    expect(crashCommentText('SIGTERM', 1, { mode: 'hold', stage: 'QA', crashRetries: 2, holdReason: 'ask-pending', restartStopped: true })).toBe(
+      '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); a pending [ASK] owns the reply — left waiting on the human (QA) (restart 2/3)',
+    )
+    // crash wording stays byte-identical when the flag is absent (existing
+    // byte tests above; this pins the default-off branch of the refactor)
+    expect(crashCommentText(1, 0, { mode: 'requeue', crashRetries: 2 })).toBe(
+      '[DAEMON-CRASH] run exited 1; re-queueing to Ready (crash 1/3)',
+    )
   })
 })
 

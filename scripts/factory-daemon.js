@@ -96,7 +96,7 @@ import { runDoneWatch } from './lib/factory-done-ping.js';
 import { ensureBootstrapped, launchctl } from './lib/factory-launchd.js';
 import { detectServiceManager } from './lib/factory-platform.js';
 import * as platformSystemd from './lib/factory-platform-systemd.js';
-import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending } from './lib/factory-comment-resume.js';
+import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending, countRestartStops } from './lib/factory-comment-resume.js';
 import { bootStallSweep, superviseStallSweep, runStallSweepWatch } from './lib/factory-stall-sweep.js';
 import { runBlockingChecksWatch } from './lib/factory-blocking-checks.js';
 import { askHuman } from './lib/factory-ask.js';
@@ -111,6 +111,13 @@ export const PLIST_PATH = join(process.env.HOME ?? '', 'Library/LaunchAgents', `
 const [, , cmd = 'run', ...args] = process.argv;
 
 export const CRASH_TAG = '[DAEMON-CRASH]';
+// The comment tag for EXPECTED run stops — a SIGTERM stop from the daemon's
+// own (re)start. The self-deploy class: a `factory` run deploys by restarting
+// the daemon it runs under, so its run ALWAYS dies at Deploy/Verify this way.
+// Invisible to the [DAEMON-CRASH] cap: restart-stops never burn the crash
+// retries (card 6af1fa46fecb634350948a5d — its 9th crash parked the canary
+// at Verify 12s after its own [DEPLOY], 2026-11-10T05:17Z).
+export const RESTART_TAG = '[DAEMON-RESTART]';
 export const MAX_CRASH_RETRIES = Number(process.env.FACTORY_CRASH_RETRIES || 2);
 // D1 (card 6aebab9a65613358f4ca333a): a run that exits 0 without advancing
 // its card is a STALL, not a success — it takes the same crash-recovery path
@@ -153,6 +160,22 @@ export function crashTail(text, { maxLines = CRASH_TAIL_LINES, maxChars = CRASH_
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
   const kept = lines.slice(-maxLines).join('\n');
   return kept.length > maxChars ? `… (trimmed)${kept.slice(-maxChars)}` : kept;
+}
+
+/**
+ * True when the run log's LAST dispatch section (`# dispatch` header lines
+ * are appended per spawn/resume) carries omp's SIGTERM stop block —
+ * `[Stopped by SIGTERM]` plus the `[Recovery] omp --resume …` lines omp
+ * prints as it dies: the run was killed by a daemon (re)start, not a fault.
+ * Only the section of the dispatch that was LIVE at stop time counts; older
+ * sections keep their historical markers untouched. Unreadable/empty text →
+ * false (the byte-identical legacy crash path).
+ */
+export const SIGTERM_STOP_MARKER = '[Stopped by SIGTERM]';
+export function sigtermStopped(logText) {
+  const s = String(logText ?? '');
+  const i = s.lastIndexOf('# dispatch');
+  return s.slice(i === -1 ? 0 : i).includes(SIGTERM_STOP_MARKER);
 }
 
 // The [DAEMON-CRASH] comment builder itself lives in the stage-aware resume
@@ -396,6 +419,10 @@ export async function superviseCommentWatch({
  *     at the current stage once a stage verdict exists (committed work is
  *     never redone); full Ready re-run ONLY before the first stage verdict;
  *     hold when the card already left the in-flight lists (Done/Ready/…).
+ *     Runs whose log ends in a SIGTERM stop block (`sigtermStopped` — the
+ *     self-deploy class: the daemon's own restart killed them) bypass the
+ *     crash cap and are tracked via `[DAEMON-RESTART]` comments instead;
+ *     `crashRetries` bounds their CONSECUTIVE-stop storm.
  *  5. Post `crashCommentText` — first token stays `[DAEMON-CRASH]`, so the
  *     comment-derived retry cap keeps surviving daemon restarts; the comment
  *     also embeds the run-log tail (`readRunLog` seam, default the real
@@ -431,7 +458,22 @@ export async function handleRunCrash({
 } = {}) {
   if (shuttingDown()) return; // daemon is stopping; leave the card where it is
   const comments = await t.getCardComments(card.id).catch(() => []);
-  const prior = comments.filter((c) => (c.data?.text ?? '').startsWith(CRASH_TAG)).length;
+  // The run log decides the class of death BEFORE any retry budget is read:
+  // a log whose last dispatch section ends in omp's SIGTERM stop block means
+  // the run died to the daemon's own (re)start — the self-deploy class, an
+  // EXPECTED stop. It is counted and commented under RESTART_TAG and never
+  // consults the [DAEMON-CRASH] cap (the cap comes from the card's whole
+  // history, so every future self-deploy would park once it is spent).
+  // A missing/unreadable log keeps the legacy crash path byte-identical.
+  const logPath = join(STATE_DIR, `${card.id}.log`);
+  let logText = '';
+  try {
+    logText = readRunLog(logPath);
+  } catch {}
+  const restartStopped = sigtermStopped(logText);
+  const prior = restartStopped
+    ? countRestartStops(comments)
+    : comments.filter((c) => (c.data?.text ?? '').startsWith(CRASH_TAG)).length;
   let listName = '';
   let degraded = false;
   try {
@@ -444,7 +486,7 @@ export async function handleRunCrash({
   const askPending = isAskPending(comments);
   const { mode, stage } = degraded
     ? { mode: 'hold', stage: listName }
-    : decideCrashRecovery({ comments, listName, crashRetries, askPending });
+    : decideCrashRecovery({ comments, listName, crashRetries, askPending, restartStopped });
   const holdReason = mode === 'hold' && !degraded && askPending ? 'ask-pending' : '';
   // D4 (card 6aebab9a65613358f4ca333a) — keep the healthy path silent: a
   // stall-family call (exit-0 exit / sweep orphan) that decides a plain
@@ -455,21 +497,17 @@ export async function handleRunCrash({
   // degraded hold posts (board-state uncertainty deserves the record); an
   // ask-pending hold posts (RC4 — turn "waiting on a human" board-visible).
   const silentHold = mode === 'hold' && !degraded && !askPending && isStallCode(code);
-  // Embed the run-log tail so the recovering run self-heals from real failure
-  // text, not just an exit number (Factor 9; [VERIFY:FAIL]-embeds-JSON
-  // precedent). A missing/unreadable log must NEVER block the comment or any
-  // recovery mode — crashCommentText falls back to the byte-identical
-  // exit-code-only head when logText is empty.
-  const logPath = join(STATE_DIR, `${card.id}.log`);
-  let logText = '';
-  try {
-    logText = readRunLog(logPath);
-  } catch {}
+  // (logPath/logText were read up-front: the log tail decides crash vs.
+  // restart-stop AND is embedded below so the recovering run self-heals from
+  // real failure text, not just an exit number — Factor 9; [VERIFY:FAIL]-
+  // embeds-JSON precedent. A missing/unreadable log NEVER blocks the comment
+  // or any recovery mode — crashCommentText falls back to the byte-identical
+  // exit-code-only head when logText is empty.)
   if (!silentHold) {
     await t
       .addComment(
         card.id,
-        crashCommentText(code, prior, { mode, stage, crashRetries, logPath: `data/factory-daemon/${card.id}.log`, logText, holdReason }),
+        crashCommentText(code, prior, { mode, stage, crashRetries, logPath: `data/factory-daemon/${card.id}.log`, logText, holdReason, restartStopped }),
       )
       .catch((e) => log(`crash comment failed: ${e.message}`));
   } else {

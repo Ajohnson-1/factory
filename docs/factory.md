@@ -37,7 +37,7 @@ toward the 3-bounce rule.
   the human's answer to it; `[RESUME]` is the comment listener's
   scheduler-bookkeeping ack when it picks a card back up at its current stage
   (see "Listening for human comments" — same class as the daemon's
-  `[DAEMON-CRASH]` and the metrics reporter's `[METRICS]` summary comment
+  `[DAEMON-CRASH]`/`[DAEMON-RESTART]` and the metrics reporter's `[METRICS]` summary comment
   (see "Metrics report"). `[CHECK:PASS]`/`[CHECK:FAIL]` are posted by the daemon's
   independent blocking-checks gate (scheduler bookkeeping, same class as
   `[DEPLOY]`; see "Independent blocking checks" under the daemon section) —
@@ -556,6 +556,26 @@ node scripts/factory-daemon.js uninstall
   the byte-identical exit-code-only comment, and a log-read failure never
   blocks the crash comment, the recovery respawn, the re-queue, or the
   needs-human parking.
+- **Restart-stop recovery — the self-deploy class (card
+  6af1fa46fecb634350948a5d).** When the routed repo is `factory` itself, the
+  Deploy step restarts the daemon that spawned the run, and the daemon's
+  shutdown forwards SIGTERM to its live run — every self-deploy ends the
+  same way: the run dies at Deploy/Verify before it can verify. This stop
+  is EXPECTED, not a crash. When the run log's LAST dispatch section ends
+  with omp's SIGTERM stop block (`[Stopped by SIGTERM]` + `[Recovery]`
+  lines), the daemon posts a `[DAEMON-RESTART]` comment instead of
+  `[DAEMON-CRASH]` and takes the SAME stage-aware decision (resume at the
+  card's list / Ready re-queue before the first verdict / hold outside the
+  pipeline) WITHOUT consulting the comment-derived crash cap — the card's
+  historical crash count would otherwise park every future self-deploy
+  forever. `[DAEMON-RESTART]` is scheduler bookkeeping invisible to the
+  `[DAEMON-CRASH]` counter. Storm guard: `FACTORY_CRASH_RETRIES`
+  CONSECUTIVE `[DAEMON-RESTART]` comments with nothing between them park
+  `needs-human` where the card stands — any progress comment (a verdict, a
+  crash, a human reply) breaks the streak; a bare streak means the daemon
+  itself is flapping. Recovery of a genuinely crashed run is unchanged,
+  byte-for-byte: an unreadable or marker-free log keeps the legacy
+  `[DAEMON-CRASH]` path.
 - **Stall recovery (card 6aebab9a65613358f4ca333a).** A run that exits 0
   WITHOUT advancing its card — dying at the `FACTORY_MAX_TIME` cap while
   blocked on something outside itself (a background gate, a verdict wait, a

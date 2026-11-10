@@ -26,6 +26,7 @@ import {
   isStageTagText,
   hasStageVerdict,
   decideCrashRecovery,
+  countRestartStops,
   crashCommentText,
   isAskPending,
   pickResumeTrigger,
@@ -887,7 +888,7 @@ test('33. docs Board-contract tag list stays in lockstep with STAGE_TAGS', () =>
 // 34. The verdict registry crash recovery reads: STAGE_TAGS minus scheduler
 // bookkeeping. Bookkeeping comments alone prove NOTHING was committed.
 test('34. STAGE_VERDICT_TAGS / hasStageVerdict: verdicts count, bookkeeping does not', () => {
-  const bookkeeping = ['[ASK]', '[HUMAN]', '[RESUME]', '[DAEMON-CRASH]', '[METRICS]'];
+  const bookkeeping = ['[ASK]', '[HUMAN]', '[RESUME]', '[DAEMON-CRASH]', '[DAEMON-RESTART]', '[METRICS]'];
   for (const tag of bookkeeping) assert.equal(STAGE_VERDICT_TAGS.includes(tag), false);
   for (const tag of [
     '[PLAN]', '[IMPL]', '[REVIEW:APPROVE]', '[REVIEW:CHANGES]', '[SEC:PASS]', '[SEC:FINDINGS]',
@@ -896,6 +897,7 @@ test('34. STAGE_VERDICT_TAGS / hasStageVerdict: verdicts count, bookkeeping does
   assert.equal(STAGE_VERDICT_TAGS.length, STAGE_TAGS.length - bookkeeping.length);
 
   assert.equal(hasStageVerdict([cmt('a', '2026-11-03T01:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember)]), false);
+  assert.equal(hasStageVerdict([cmt('a', '2026-11-03T01:00:00.000Z', '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); …', botMember)]), false);
   assert.equal(
     hasStageVerdict([
       cmt('a', '2026-11-03T01:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember),
@@ -1259,4 +1261,99 @@ test('48. FM-2: flagless callers stay byte-identical (undefined board, legacy pr
   assert.deepEqual(t.calls.listsOpts, [{ board: undefined }]);
   assert.ok(!sp.calls[0].prompt.includes('REPO CONTEXT'));
   assert.ok(sp.calls[0].prompt.includes(`git worktree at ../discord-bot-factory-wt/${STUCK_ID}`));
+});
+
+// ---- the self-deploy class (card 6af1fa46fecb634350948a5d) ------------------
+
+// 49. decideCrashRecovery restartStopped: a SIGTERM stop from the daemon's
+// OWN restart (a `factory` run restarting the daemon it lives under) is an
+// EXPECTED stop — the [DAEMON-CRASH] cap never parks it; instead the
+// CONSECUTIVE restart-stop streak parks at the same cap. Stage logic is
+// inherited unchanged (resume / requeue / hold / the Verify + ROLLBACK traps).
+test('49. decideCrashRecovery: restartStopped bypasses the crash cap; streak parks', () => {
+  const impl = cmt('v1', '2026-11-03T01:00:00.000Z', '[IMPL] evidence…', botMember);
+  const crash1 = cmt('k1', '2026-11-03T02:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember);
+  const crash2 = cmt('k2', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember);
+  const restart1 = cmt('r1', '2026-11-03T04:00:00.000Z', '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); stage-aware resume at Implement (restart 1/3)', botMember);
+  const deploy = cmt('d1', '2026-11-03T05:00:00.000Z', '[DEPLOY] sha=7d048ab — self driver', botMember);
+
+  // the canary shape: crash history AT the cap, verdict, in Verify — old
+  // behavior parked; restartStopped resumes at the card's stage.
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl, crash1, crash2], listName: 'Verify', crashRetries: 2, restartStopped: true }),
+    { mode: 'resume', stage: 'Verify' },
+  );
+  // stuck-Verify trap inherited: [DEPLOY]-last restart-stop → Verify
+  assert.deepEqual(
+    decideCrashRecovery({ comments: stuckComments().concat([deploy]), listName: 'Verify', crashRetries: 2, restartStopped: true }),
+    { mode: 'resume', stage: 'Verify' },
+  );
+  // bookkeeping-only trail (crashed in Plan before [PLAN]) → Ready requeue
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [restart1], listName: 'Plan', crashRetries: 2, restartStopped: true }),
+    { mode: 'requeue', stage: 'Plan' },
+  );
+  // hold: left the pipeline / ask pending
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl], listName: 'Done', crashRetries: 2, restartStopped: true }),
+    { mode: 'hold', stage: 'Done' },
+  );
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl], listName: 'QA', crashRetries: 2, askPending: true, restartStopped: true }),
+    { mode: 'hold', stage: 'QA' },
+  );
+  // storm: crashRetries CONSECUTIVE restart comments (cap = crashRetries) →
+  // park where it stands, even with an in-flight verdict.
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl, restart1, deploy, cmt('r2', '2026-11-03T06:00:00.000Z', '[DAEMON-RESTART] …', botMember)], listName: 'Implement', crashRetries: 2, restartStopped: true }),
+    { mode: 'resume', stage: 'Implement' },
+  );
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl, restart1, cmt('r2', '2026-11-03T06:00:00.000Z', '[DAEMON-RESTART] …', botMember)], listName: 'Implement', crashRetries: 2, restartStopped: true }),
+    { mode: 'park', stage: 'Implement' },
+  );
+  // a human reply between stops is progress too — breaks the streak
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [impl, restart1, cmt('h1', '2026-11-03T05:30:00.000Z', '[HUMAN] looks fine, continue', botMember), cmt('r2', '2026-11-03T06:00:00.000Z', '[DAEMON-RESTART] …', botMember)], listName: 'Implement', crashRetries: 2, restartStopped: true }),
+    { mode: 'resume', stage: 'Implement' },
+  );
+});
+
+// 50. countRestartStops: trailing CONSECUTIVE [DAEMON-RESTART] comments —
+// date-sorted (not array order); any other comment breaks the streak; the
+// flag-off crash path reads the card's [DAEMON-CRASH] history instead, so a
+// restart-stop never burns a crash retry.
+test('50. countRestartStops: consecutive newest-first, any other comment breaks', () => {
+  const r = (id, date) => cmt(id, date, '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); …', botMember);
+  assert.equal(countRestartStops([]), 0);
+  assert.equal(countRestartStops(undefined), 0);
+  assert.equal(countRestartStops([r('a', '2026-11-03T04:00:00.000Z')]), 1);
+  // oldest-first input order still counts both (date sort, not array order)
+  assert.equal(
+    countRestartStops([r('a', '2026-11-03T04:00:00.000Z'), r('b', '2026-11-03T05:00:00.000Z')]),
+    2,
+  );
+  // anything else in the trailing run breaks it
+  assert.equal(
+    countRestartStops([
+      cmt('x', '2026-11-03T05:30:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember),
+      r('b', '2026-11-03T05:00:00.000Z'),
+      r('a', '2026-11-03T04:00:00.000Z'),
+    ]),
+    0,
+  );
+  assert.equal(
+    countRestartStops([
+      r('c', '2026-11-03T06:00:00.000Z'),
+      cmt('v', '2026-11-03T05:30:00.000Z', '[DEPLOY] sha=abc', botMember),
+      r('b', '2026-11-03T05:00:00.000Z'),
+      r('a', '2026-11-03T04:00:00.000Z'),
+    ]),
+    1,
+  );
+  // and restart bookkeeping never enters the crash count (flag-off byte-compat)
+  assert.deepEqual(
+    decideCrashRecovery({ comments: [r('a', '2026-11-03T04:00:00.000Z'), r('b', '2026-11-03T05:00:00.000Z'), cmt('v1', '2026-11-03T01:00:00.000Z', '[IMPL] …', botMember)], listName: 'Implement', crashRetries: 2 }),
+    { mode: 'resume', stage: 'Implement' },
+  );
 });
