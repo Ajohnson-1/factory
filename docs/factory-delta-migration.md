@@ -83,8 +83,8 @@ The factory drives headless `omp -p` scheduler runs. Complete inventory (plan §
 | 1 | `scripts/factory-daemon.js:278-285` `agentArgs` | THE single argv builder | `['-p','--auto-approve','--max-time',FACTORY_MAX_TIME\|\|'12h','--max-cost',FACTORY_MAX_COST\|\|'100','--model',FACTORY_MODEL?,prompt]` |
 | 2 | `scripts/factory-daemon.js:633` | `ompBin = FACTORY_OMP_BIN \|\| 'omp'` (startup log `:932`; env docs `:79-80`) | binary knob already CLI-agnostic; argv is not |
 | 3 | `scripts/factory-daemon.js:746-789` `dispatch()` | Ready→Plan run; `# dispatch` header `:761`, `spawn` `:763`; exit/error → `crashRecovery` | exit code + stdout-to-log + stdin-ignored = the run contract |
-| 4 | `scripts/factory-daemon.js:792-820` `spawnResumeRun()` | stage-aware recovery (crash OR human comment), same argv `:795/:797`, resume watcher `:874` | same |
-| 5 | `scripts/lib/factory-comment-resume.js:607-624` `defaultSpawnRun` | CLI-standalone `resume-watch` default spawn | argv duplicated |
+| 4 | `scripts/factory-daemon.js:792-816` `spawnResumeRun()` | stage-aware recovery (crash OR human comment), same argv `:795/:797`, resume watcher `:874` | same |
+| 5 | `scripts/lib/factory-comment-resume.js:607-626` `defaultSpawnRun` | CLI-standalone `resume-watch` default spawn | argv duplicated |
 | 6 | `scripts/lib/factory-stall-sweep.js:181-199` `defaultSpawnRun` | CLI-standalone stall recovery | same argv; silence window = `FACTORY_MAX_TIME` + 15 min (`:19`) |
 | 7 | `scripts/lib/factory-eval.js:291-303` `defaultSpawn` + `:316-317` `spawnReviewerRun` | nightly reviewer replay (CLI `eval-run` → `scripts/factory.js:521,562`); captures **stdout** | stdout is the scoring input (`:293`: `omp -p` waits for stdin EOF) |
 | 8 | `scripts/factory.js:614/629/685/708-720` `ask`/`wait`/`risk`/`approve` | ask/approve paths — NO agent spawn | unaffected by a runner swap |
@@ -95,7 +95,12 @@ SIGTERM crash classification parses omp's death chatter (`[Stopped by SIGTERM]`,
 dispatch header JSON and omp's cost tail (`factory-metrics.js:497`
 `parseDispatchHeaders`, `COST_RE` `:106`, `extractCostSpent` `:526`);
 `buildRunPrompt` seeds the literal "You run HEADLESS (omp -p)…" (`:261`), pinned
-by `tests/factoryStagePrompts.test.js`; the service PATH lists `omp`
+by `tests/factoryDaemon.test.js:115-119` (which also pins the RISK GATE approve
+line `:161` and the REPO CONTEXT deploy lines `:190-205`; the `:251-255` source
+comment above `buildRunPrompt` misattributes this pin to
+`tests/factoryStagePrompts.test.js`, whose `buildRunPrompt` checks (`:428-434`)
+pin only the stage-doc references + the "override your harness role defaults"
+phrase); the service PATH lists `omp`
 (plist comment `:287`, systemd unit per `docs/factory-migration.md` §4.6); stage
 subagents are spawned *inside* the omp session — a delta-native move converts
 them to Delta subthreads/subagents ([threads](https://delta.dev/docs/agents/threads)).
@@ -274,7 +279,7 @@ own attested comment.
    Phase 1 runs stay omp-bounded (unchanged); Phase 3 must re-invent the bounds.
 9. **Concurrency**: Phase 2's per-run `thread mount` + `thread watch` sidecars
    add long-lived processes per card under `FACTORY_MAX_PARALLEL`; the daemon
-   `shutdown` (`:812+`) must TERM them (a dead mount's process doesn't keep
+   `shutdown` (`:818-831`) must TERM them (a dead mount's process doesn't keep
    Delta running — degradation is acceptable, but lingering mount checkouts
    need a cleanup command).
 10. **Per-repo share policy open**: `organization` visibility exposes code to
