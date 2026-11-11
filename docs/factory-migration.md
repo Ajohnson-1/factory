@@ -502,6 +502,16 @@ execution (discord-bot master `0885b59`, 2026-11-11):
   that read these vars now live in this repo. All other factory sections
   (TRELLO_*/FACTORY_*) dropped.
 
+## 8. Follow-on: agent runs on Zed Delta (studied, not scheduled)
+
+Card 6af3e8877d6b0932b1f0f14b studied moving the repos' agent runs to Zed Delta
+(https://zed.dev/blog/delta-public-beta): verdict + operator summary in
+`docs/factory-delta-migration.md` (full study:
+`plans/factory/6af3e8877d6b0932b1f0f14b-plan.md`). No gate change ships with
+the study: the sha-keyed board approval gate stays authoritative, Delta is a
+record/visibility surface (its review verdicts advisory), and the Phases 0–3
+migration is follow-up card candidates.
+
 ## 9. Cutover log
 
 - 2026-11-09 - FM-6 cutover executed: box 192.168.0.157 is the sole dispatcher (systemd user unit factory-daemon.service enabled active); laptop launchd agents booted out, plist files kept as the rollback anchor.
