@@ -430,7 +430,9 @@ export async function superviseCommentWatch({
  *     blocks any recovery mode — card 6ae96770782334e43c98b13d, Factor 9).
  *     D4 exception: a stall-family call deciding a plain left-the-pipeline
  *     hold posts NOTHING (healthy finish — done-watch already pinged it);
- *     ask-pending holds and degraded holds still post.
+ *     ask-pending holds on true-crash codes and degraded holds still post —
+ *     a stall-family call under a pending `[ASK]` is the wait itself and
+ *     posts NOTHING (card 6aee77a4db0dd0de45c77d7c).
  *  6. Apply the mode. The crashed run already freed its slot (`runs.delete`
  *     fires before this handler), so the immediate respawn is cap-neutral;
  *     `deferResume(entry)` absorbs the race where the comment watcher
@@ -495,21 +497,33 @@ export async function handleRunCrash({
   // a [DAEMON-CRASH] there would spam a trail per healthy run. Crash calls
   // (non-zero code / sig / spawn-failed) post byte-for-byte as ever; a
   // degraded hold posts (board-state uncertainty deserves the record); an
-  // ask-pending hold posts (RC4 — turn "waiting on a human" board-visible).
-  const silentHold = mode === 'hold' && !degraded && !askPending && isStallCode(code);
+  // ask-pending hold posts on TRUE-CRASH codes (RC4 — turn "waiting on a
+  // human" board-visible); a stall-family ask-pending hold is silent (card
+  // 6aee77a4db0dd0de45c77d7c, right below).
+  const silentHold = mode === 'hold' && !degraded && !askPending && isStallCode(code); // unchanged (D4)
+  // Card 6aee77a4db0dd0de45c77d7c — a stall while a blocking [ASK] is pending is
+  // the WAIT, not a failure: the pending [ASK] comment IS the board-visible
+  // "waiting on you" (the ask protocol already Discord-pings the owner). The
+  // report head + ≤4 KB run-log tail bury the ask the human must read (card
+  // 6aee5f4d6e98279cb3ab3304 comment 6af1ed5c4b3dd164aeeee2e0: park report 74 s
+  // into an approval wait). Every recovery DECISION is unchanged — park still
+  // applies needs-human, silently.
+  const waitingOnHuman = askPending && !degraded && !restartStopped && isStallCode(code);
   // (logPath/logText were read up-front: the log tail decides crash vs.
   // restart-stop AND is embedded below so the recovering run self-heals from
   // real failure text, not just an exit number — Factor 9; [VERIFY:FAIL]-
   // embeds-JSON precedent. A missing/unreadable log NEVER blocks the comment
   // or any recovery mode — crashCommentText falls back to the byte-identical
   // exit-code-only head when logText is empty.)
-  if (!silentHold) {
+  if (!silentHold && !waitingOnHuman) {
     await t
       .addComment(
         card.id,
         crashCommentText(code, prior, { mode, stage, crashRetries, logPath: `data/factory-daemon/${card.id}.log`, logText, holdReason, restartStopped }),
       )
       .catch((e) => log(`crash comment failed: ${e.message}`));
+  } else if (waitingOnHuman) {
+    log(`stall for ${card.id} (${code}) while a pending [ASK] owns the reply — crash comment suppressed (${mode}${stage ? ` at ${stage}` : ''})`);
   } else {
     log(`healthy exit for ${card.id} (${code}); card sits in ${stage || 'an unknown list'} — outside the pipeline, comment suppressed`);
   }

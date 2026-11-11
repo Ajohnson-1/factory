@@ -1008,7 +1008,7 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     )
   })
 
-  it('D2: a pending [ASK] holds the card waiting on its human — with a board-visible comment', async () => {
+  it('D2: a pending [ASK] holds the card waiting on its human — silently; the [ASK] IS the board-visible wait', async () => {
     const asked = [
       cmt('2026-11-03T02:00:00.000Z', '[ASK] re-approve the post-rebase sha?'),
       implVerdict,
@@ -1029,13 +1029,15 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     expect(spawned).toHaveLength(0) // a resume would run under the human's feet
     expect(t.calls.moves).toEqual([])
     expect(t.calls.labelAdded).toEqual([])
-    expect(t.calls.commentsWritten).toHaveLength(1) // RC4: waiting-on-you is board-visible
-    expect(t.calls.commentsWritten[0].text).toContain('a pending [ASK] owns the reply')
-    expect(t.calls.commentsWritten[0].text).toContain('(Verify)')
+    expect(t.calls.commentsWritten).toHaveLength(0) // card 6aee77a4db0dd0de45c77d7c: the pending [ASK] owns the trail — no stall report on top of it
     expect(logLines.some((l) => l.includes('pending [ASK] owns the reply'))).toBe(true)
   })
 
-  it('D2: at the crash cap the ask-pending card still parks (the cap out-ranks the hold)', async () => {
+  it('D2: at the crash cap the ask-pending card still parks — silently; the crash comment is suppressed while the [ASK] owns the trail', async () => {
+    // Example replay: card 6aee5f4d6e98279cb3ab3304 comment
+    // 6af1ed5c4b3dd164aeeee2e0 — pending [ASK] (15:56), 2 prior [DAEMON-CRASH]
+    // ⇒ park ⇒ stall report posted 74 s into an approval wait. Under the fix
+    // the park decision stands but the comment could not have posted.
     const asked = [
       cmt('2026-11-03T02:00:00.000Z', '[ASK] still waiting?'),
       crashCmt('2026-11-03T03:00:00.000Z', 1),
@@ -1043,9 +1045,64 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
       implVerdict,
     ]
     const t = fakeT({ comments: asked })
+    const spawned = []
+    const logLines = []
+    await handleRunCrash({ readRunLog: () => '', card, code: STALL_EXIT_CODE, t, readyList: READY, log: (m) => logLines.push(m), crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park beats ask-hold — decision unchanged
+    expect(t.calls.commentsWritten).toHaveLength(0) // only the comment is silenced
+    expect(t.calls.moves).toEqual([])
+    expect(spawned).toHaveLength(0)
+    expect(logLines.some((l) => l.includes('crash comment suppressed') && l.includes('pending [ASK] owns the reply'))).toBe(true)
+  })
+
+  it('a NON-ZERO crash under a pending [ASK] still posts the ask-pending hold comment byte-for-byte', async () => {
+    const asked = [
+      cmt('2026-11-03T02:00:00.000Z', '[ASK] Approval required — approve the deploy sha?'),
+      implVerdict,
+    ]
+    const t = fakeT({ comments: asked, idList: VERIFY.id })
+    await handleRunCrash({ readRunLog: () => '', card, code: 1, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: () => {} })
+    expect(t.calls.commentsWritten).toHaveLength(1) // a true failure is new information the [ASK] cannot carry
+    expect(t.calls.commentsWritten[0].text).toContain('a pending [ASK] owns the reply')
+    expect(t.calls.commentsWritten[0].text).toContain('(Verify)')
+  })
+
+  it("'spawn-failed' under a pending [ASK] posts — the non-stall family is never suppressed", async () => {
+    const asked = [cmt('2026-11-03T02:00:00.000Z', '[ASK] still waiting?'), implVerdict]
+    const t = fakeT({ comments: asked })
+    await handleRunCrash({ readRunLog: () => '', card, code: 'spawn-failed', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: () => {} })
+    expect(t.calls.commentsWritten).toHaveLength(1)
+  })
+
+  it('a sweep orphan stall at the cap under a pending [ASK] parks silently (the sweep-race mirror of the example comment)', async () => {
+    const asked = [
+      cmt('2026-11-09T15:56:02.821Z', '[ASK] Approval required — approve deploy 539e8a4?'),
+      crashCmt('2026-11-09T14:26:00.000Z', 1),
+      crashCmt('2026-11-09T14:38:00.000Z', 2),
+      implVerdict,
+    ]
+    const t = fakeT({ comments: asked, idList: VERIFY.id })
+    const spawned = []
+    await handleRunCrash({ readRunLog: () => '', card, code: 'stalled (orphan, silent 195 min)', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park decision stands
+    expect(t.calls.commentsWritten).toHaveLength(0) // comment 6af1ed5c4b3dd164aeeee2e0 could not have posted
+    expect(t.calls.moves).toEqual([])
+    expect(spawned).toHaveLength(0)
+  })
+
+  it('a SIGTERM restart-stop under a pending [ASK] posts [DAEMON-RESTART] — the excluded class stays byte-identical', async () => {
+    const asked = [cmt('2026-11-03T02:00:00.000Z', '[ASK] Approval required — approve the deploy sha?'), implVerdict]
+    const t = fakeT({ comments: asked })
+    await handleRunCrash({ readRunLog: () => restartLog, card, code: STALL_EXIT_CODE, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: () => {} })
+    expect(t.calls.commentsWritten).toHaveLength(1)
+    expect(t.calls.commentsWritten[0].text.startsWith(RESTART_TAG)).toBe(true)
+  })
+
+  it('a degraded hold with a pending [ASK] still posts the stall comment — board-state uncertainty deserves the record', async () => {
+    const asked = [cmt('2026-11-03T02:00:00.000Z', '[ASK] still waiting?'), implVerdict]
+    const t = fakeT({ comments: asked, getCardThrows: true })
     await handleRunCrash({ readRunLog: () => '', card, code: STALL_EXIT_CODE, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: () => {} })
-    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park beats ask-hold
-    expect(t.calls.commentsWritten[0].text).toContain('parking needs-human where it stands')
+    expect(t.calls.commentsWritten).toHaveLength(1) // degraded ⇒ !degraded fails ⇒ never suppressed
   })
 
   it('the healthy-exit silence NEVER leaks into sweep codes deciding resume (stall family posts)', async () => {

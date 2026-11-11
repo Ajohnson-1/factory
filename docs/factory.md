@@ -533,7 +533,9 @@ node scripts/factory-daemon.js uninstall
 - Dragging a `needs-human` card back to Ready re-runs it (label removed).
 - Crashed runs (non-zero exit / spawn failure — or an **exit 0 that left the
   card stranded in-flight**, a *stall*, see below) — **dispatch or resume** —
-  post a `[DAEMON-CRASH]` comment, then recover by the card's own log,
+  post a `[DAEMON-CRASH]` comment — except a stall-family stall while a
+  blocking `[ASK]` is pending, which stays silent (Stall recovery below;
+  card 6aee77a4db0dd0de45c77d7c) — then recover by the card's own log,
   stage-aware: once a stage **verdict** exists (`[PLAN]`…`[VERIFY:*]`,
   `[ROLLBACK]`, `[PROD-CLOSE]` — `[DAEMON-CRASH]`/`[RESUME]`/`[ASK]`
   bookkeeping alone is not a verdict), the daemon spawns a stage-aware
@@ -588,9 +590,16 @@ node scripts/factory-daemon.js uninstall
   in-flight lists (Done etc.) posts NO crash comment — the Done arrival is
   already pinged by done-watch — while non-zero crashes keep posting
   byte-for-byte. A pending `[ASK]` always decides `hold` (zero move, zero
-  spawn) with a visible `[DAEMON-CRASH] … a pending [ASK] owns the reply —
-  left waiting on the human` comment: "waiting on you" becomes board-visible
-  and no recovery ever restarts work under the human's feet.
+  spawn; at the cap the park still out-ranks it and applies `needs-human`
+  where the card stands) and no recovery ever restarts work under the
+  human's feet. Stall-family recovery posts **no** `[DAEMON-CRASH]` comment
+  while an ask is pending (card 6aee77a4db0dd0de45c77d7c): the pending
+  `[ASK]` comment IS the board-visible "waiting on you" — the ask protocol
+  already Discord-pings the owner — and a report head + run-log tail only
+  buries the ask the human must read. Non-zero crashes / `spawn-failed`
+  keep posting their crash comments byte-for-byte even under a pending ask
+  (new information the `[ASK]` cannot carry), and `[DAEMON-RESTART]` stops
+  and degraded holds still post.
 - The daemon also **boot-sweeps and supervises the STALL SWEEP** in-process
   (`scripts/lib/factory-stall-sweep.js`; CLI `factory.js stall-sweep`), the
   orphan-recovery twin of the comment watcher. At boot — replacing the old
@@ -1452,9 +1461,11 @@ and the resume retries next tick.
   6ae9676d0ee4189387157881, C-H4). The same pending-ask verdict (`isAskPending` in
   `scripts/lib/factory-comment-resume.js`) also **holds crash recovery and
   the stall sweep** (card 6aebab9a65613358f4ca333a): an in-flight card with
-  an unanswered `[ASK]` decides `hold` — zero move, zero spawn — and gets a
-  visible `[DAEMON-CRASH] … a pending [ASK] owns the reply` comment turning
-  "waiting on a human" board-visible.
+  an unanswered `[ASK]` decides `hold` — zero move, zero spawn — and
+  stall-family recovery posts no `[DAEMON-CRASH]` at all: the pending
+  `[ASK]` comment is the board-visible "waiting on a human" (card
+  6aee77a4db0dd0de45c77d7c); non-zero crashes under a pending ask still
+  post byte-for-byte.
 - **Live runs dedup silently:** a comment arriving while the card has a live
   run advances the watermark without ack/spawn — the live run owns the card
   (its stage-boundary reads + the ask protocol cover it).
