@@ -10,8 +10,8 @@ and migration state live in [docs/factory-migration.md](docs/factory-migration.m
 The full board-is-the-state contract (stages, tags, watermarks, ask protocol,
 risk gate) is [docs/factory.md](docs/factory.md). Stage prompts:
 [docs/factory-prompts/](docs/factory-prompts/). Factory work flows on the
-factory board `LLNG5MAm` (FM-3 flipped the registry); product cards keep
-flowing on `ZHkVYBN1` until the FM-6 cutover.
+factory board `LLNG5MAm` (FM-3 flipped the registry); product cards flow
+permanently on `ZHkVYBN1` (discord-bot).
 
 ## Repo registry
 
@@ -23,12 +23,14 @@ unknown/ambiguous → fail-closed `[ASK]`, never a guess), `detectRepo`
 polls every registered board (per-board lists + pollers, one global cap),
 and the run/resume prompts carry a REPO CONTEXT block with the exact
 worktree/bootstrap/deploy lines. The `factory` entry carries `LLNG5MAm`
-since FM-3; `discord-bot` stays on `ZHkVYBN1` until FM-6.
+since FM-3; `discord-bot` stays on `ZHkVYBN1` — product cards live there.
 
 ## Runtime rule
 
-The daemon runs from **exactly one repo checkout at a time** — until the FM-6
-cutover that is discord-bot's copy. See docs/factory-migration.md §7.
+The daemon runs from **exactly one repo checkout at a time** — since the FM-6
+cutover that is the box `/opt/factory` daemon (systemd user unit); the
+discord-bot factory copies were deleted at FM-7 (AGENTS.md pointer only).
+See docs/factory-migration.md §7.
 
 ## Dev loop
 

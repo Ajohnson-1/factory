@@ -151,9 +151,17 @@ drops factory tests; `.env.example` keeps bot keys, drops factory keys except th
 classifier note. `docs/deploy-host.md` moves to factory (runbook = factory-owned); discord-bot
 keeps a pointer line in AGENTS.md.
 
-**delete-from-discord-bot at FM-7:** everything in the first block (additive until then —
-discords-bot factory copies stay authoritative until the cutover soak passes; single
-dispatcher rule means only one repo's daemon runs at a time).
+**delete-from-discord-bot at FM-7 — EXECUTED 2026-11-11, discord-bot master
+`0885b59`:** the first block above deleted wholesale (8 scripts, 16 libs,
+15 docs, 22 tests + `eval/cases.jsonl` = 62 files, single commit), with the
+recorded exceptions of the "FM-7 deviations" section below: the three libs
+`deploy-config.js`/`deploy-ssh.js`/`factory-launchd.js` STAY (private deps of
+surviving bot scripts `g50ProdRead.js`/`local-embeddings.js`), `plans/factory/`
+history stays (docs-only records; `g50ProdRead.js` cites one), and
+`.env.example` keeps the `DEPLOY_*` block as the deploy-classifier note.
+`AGENTS.md` now carries the 5-line pointer; `package.json` ignores only the
+3 surviving `node:test` suites; the old rule (additive until the soak —
+discords-bot copies authoritative) is history.
 
 ## 6. Laptop → Proxmox migration plan
 
@@ -242,6 +250,10 @@ a child of the daemon it would stop.
   `~/Library/LaunchAgents/com.discordbot.prodwatch.plist`
   (+ `com.discordbot.factory-metrics` / `com.ajohnson.factory-sweep` plists if
   present), archive `data/factory-daemon` logs.
+  FM-7's discord-bot deletion executed 2026-11-11 at master `0885b59` (factory
+  copies gone; see §5 + the FM-7 deviations section). Laptop plist removal +
+  the Mac reboot (ghost daemon, step 2 caveat) remain operator-owned after the
+  soak — they touch only laptop state, not the deleted repo copies.
 
 #### Rollback drill — box → laptop → box (once, inside the soak) ⏳ operator-owned
 
@@ -298,22 +310,25 @@ live daemons — even from different checkouts on one machine — double-dispatc
 every Ready card (two spawns, racing list moves). D8 makes this the migration's
 only systemic hazard; every runbook step names the freeze/start pair.
 
-Current ownership during the migration (FM-1 → FM-6):
+Steady-state ownership (post-FM-6/FM-7):
 
-- **Laptop, discord-bot checkout** (`~/GitHub/discord-bot`) — authoritative
-  dispatcher until the FM-6 cutover soak passes. Until FM-7 the factory copies
-  in discord-bot stay in place; the daemon still runs from discord-bot.
-- **Laptop, factory checkout** (this repo) — inert until FM-6. `status`,
-  `init`, deploy runners, and the full test suite run here; do NOT
-  `install`/`launchctl bootstrap` the daemon from here while the discord-bot
-  daemon is loaded (`launchctl list | grep com.ajohnson.factory-daemon` must
-  show exactly one owner).
-- **Box** (`/opt/factory`, systemd user units) — becomes the sole dispatcher at
-  FM-6 §6.2 step 3; laptop agents get uninstalled at FM-7.
+- **Box** (`/opt/factory`, systemd user units) — THE dispatcher since the FM-6
+  cutover (2026-11-09): `factory-daemon.service` + the satellite
+  service/timer pairs. The only daemon that runs.
+- **discord-bot checkout** (`/opt/repos/discord-bot`) — factory copies are GONE
+  (deleted at FM-7, master `0885b59`; `AGENTS.md` carries the pointer only). No
+  daemon, no board CLI, no deploy runners live here anymore.
+- **This factory checkout** (laptop clone / `/opt/factory` = the deployed copy)
+  — source of truth for all factory tooling; `status`, `init`, deploy runners,
+  and the full test suite run here. Never `install`/bootstrap a daemon from a
+  clone while the box unit is active.
 
-Freeze/start pair (any machine transition): `launchctl bootout gui/$(id -u)/com.ajohnson.factory-daemon`
-(plist kept = rollback anchor) → `launchctl bootstrap gui/$(id -u) <plist>` in
-the other repo, or `systemctl --user stop/start factory-daemon` on the box.
+Freeze/start pair (any machine transition): box-primary —
+`systemctl --user stop/start factory-daemon` (needs
+`XDG_RUNTIME_DIR=/run/user/$(id -u)` + `DBUS_SESSION_BUS_ADDRESS` over ssh,
+§6.2); laptop fallback (rollback drill only) — `launchctl bootout
+gui/$(id -u)/com.ajohnson.factory-daemon` (plist kept = rollback anchor) →
+`launchctl bootstrap gui/$(id -u) <plist>`.
 
 ### FM-1 deviations from the §5 inventory (recorded)
 
@@ -463,9 +478,34 @@ state; the missing plist was rewritten fresh in the window).
   and `<clone>/data/factory-deploy-history.jsonl`. Steady-state daemon
   ownership was restored to the discord-bot checkout (§7).
 
+### FM-7 deviations (recorded)
+
+Deviations from "delete everything in the §5 first block", all recorded at
+execution (discord-bot master `0885b59`, 2026-11-11):
+
+- **Three libs STAY** (`D-7a`): `scripts/lib/deploy-config.js`,
+  `scripts/lib/deploy-ssh.js`, `scripts/lib/factory-launchd.js` are private
+  deps of surviving bot scripts — `g50ProdRead.js` (imports the first two)
+  and `local-embeddings.js` (imports the third for its launchd KeepAlive
+  plumbing); deleting them would break `tests/g50ProdRead.test.js` +
+  `tests/localEmbeddings.test.js`. Each carries a header comment pointing at
+  the factory repo's canonical copy. No factory MACHINERY (dispatchers, board
+  CLI, deploy runners, stage docs/tests) survives in discord-bot — these are
+  the same class as the grandfathered one-off `scripts/verify*`.
+- **`plans/factory/` history stays** (`D-7b`): 28 plan docs + the
+  rollout-verification doc are docs-only records of the discord-bot-board
+  era, not machinery; `scripts/g50ProdRead.js` still cites one of them.
+- **`.env.example` keeps the `DEPLOY_*` block** (`D-7c`): retitled to a
+  deploy-classifier note — `g50ProdRead.js` resolves `DEPLOY_HOST` etc. via
+  the kept `deploy-config.js`, and the app-tree log classifier
+  (`deploy-host-logs.sh`) ships from the deployed sha; the factory runners
+  that read these vars now live in this repo. All other factory sections
+  (TRELLO_*/FACTORY_*) dropped.
+
 ## 9. Cutover log
 
 - 2026-11-09 - FM-6 cutover executed: box 192.168.0.157 is the sole dispatcher (systemd user unit factory-daemon.service enabled active); laptop launchd agents booted out, plist files kept as the rollback anchor.
 - 2026-11-09 - cutover fixes during step-3 start: /opt/factory/.env completed (FACTORY_SERVER_ID/FACTORY_CHANNEL_ID) + CR-byte cleanup; ghost laptop daemon pending Mac reboot (gates the discord-bot product-card step).
 - 2026-11-10 - FM-6 canary 6af1fa46fecb634350948a5d Done on the box: first live Linux detached self-restart (systemd-run) converged; [VERIFY:PASS].
 - 2026-11-10 - FM-6 runbook committed (§6.2 executed status + rollback drill). Open operator items: rollback drill before 2026-11-16, Mac reboot (ghost laptop daemon), one discord-bot product card from the box, post-soak plist removal.
+- 2026-11-11 - FM-7 deletion executed: 62 factory files removed from discord-bot master `0885b59` (pushed; AGENTS.md 5-line pointer, test-script trim, `.env.example` DEPLOY_* classifier note; deviations D-7a/b/c recorded above). `npm test` post-deletion: failure set identical to the pre-deletion baseline (14 machine-state suites, better-sqlite3 bindings + missing per-bot config overlays), zero failures referencing deleted paths; `node --test` trio (crashUnhandledRejection/g50ProdRead/localEmbeddings) 25/25 pass. Deploy runners verified post-deletion from `/opt/factory`: `deploy.js build master` exit 0 → image `ghcr.io/ajohnson-1/discord-bot:sha-0885b59` built host-local on the deploy box; `verify-deploy.js` on the running sha: 5/6 checks pass (health×2, memory-boot-consistency, gateway-ready, logs-classifier all clean) — the one fail is `ai-hosts-probe` ECONNREFUSED, the embeddings gateway host 192.168.0.159:8123 down at verify time (machine-state, verified by direct probe; unrelated to the deletion — verify-deploy runs from this repo against the deploy host).
