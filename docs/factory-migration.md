@@ -257,11 +257,15 @@ a child of the daemon it would stop.
   `com.ajohnson.factory-sweep` plists were not present. Archiving the laptop
   `data/factory-daemon` logs stays operator-owned.
 
-#### Rollback drill — box → laptop → box (once, inside the soak) ⏳ operator-owned
+#### Rollback drill — box → laptop → box ❎ WAIVED 2026-11-12 (operator: forward-only)
 
-Rehearses the §6.3 cutover rollback forward and back before the soak ends
-(target before 2026-11-16). Precondition: both boards drained (zero in-flight).
-Run interactively — never from a dispatched run (§7 invariant).
+Operator decision 2026-11-12: **no rollback** — the box is the permanent
+dispatcher and the factory moves forward. The drill and the "rollback
+rehearsed once" acceptance clause are waived; the laptop anchors were deleted
+rather than kept (§9). The steps below stay as the documented fallback recipe
+for the day the box must actually be abandoned. Precondition when used: both
+boards drained (zero in-flight). Run interactively — never from a dispatched
+run (§7 invariant).
 
 1. Forward (box → laptop): box `systemctl --user disable --now
    factory-daemon` and stop the satellite service+timer pairs
@@ -289,7 +293,7 @@ Run interactively — never from a dispatched run (§7 invariant).
 | ≥7 days always-on on the box | ⏳ soak window ends 2026-11-16 ~17:00Z; boots↔poll-ok 1:1 so far | time |
 | ≥3 Done cards on the box | ⏳ 2 since cutover; FM-6 merge is projected 3rd | pipeline (flows naturally) |
 | laptop agents uninstalled | ✅ 2026-11-12 — plists deleted + jobs booted out; the reboot alone resurrects the ghost while the plist exists, deletion is the real fix (§9) | operator (FM-7) |
-| rollback rehearsed once (box→laptop→box) | ⏳ drill scheduled inside the soak window | operator (console) |
+| rollback rehearsed once (box→laptop→box) | ❎ waived 2026-11-12 — operator decision: forward-only, box is the permanent dispatcher (§9); recipe retained in §6.2 | operator (console) |
 | runbook merged | ✅ this commit, merged + self-deployed by the factory pipeline itself | done |
 
 ### 6.3 Rollback story
@@ -330,9 +334,10 @@ Steady-state ownership (post-FM-6/FM-7):
 Freeze/start pair (any machine transition): box-primary —
 `systemctl --user stop/start factory-daemon` (needs
 `XDG_RUNTIME_DIR=/run/user/$(id -u)` + `DBUS_SESSION_BUS_ADDRESS` over ssh,
-§6.2); laptop fallback (rollback drill only) — `launchctl bootout
-gui/$(id -u)/com.ajohnson.factory-daemon` (plist kept = rollback anchor) →
-`launchctl bootstrap gui/$(id -u) <plist>`.
+§6.2); the laptop has no resident daemon and no anchor (uninstalled
+2026-11-12, forward-only decision — §9). A laptop takeover, if ever needed,
+follows the §6.2 drill recipe: `node scripts/factory-daemon.js install`
+regenerates plist + job, `uninstall` removes them again.
 
 ### FM-1 deviations from the §5 inventory (recorded)
 
@@ -524,3 +529,4 @@ migration is follow-up card candidates.
 - 2026-11-10 - FM-6 runbook committed (§6.2 executed status + rollback drill). Open operator items: rollback drill before 2026-11-16, Mac reboot (ghost laptop daemon), one discord-bot product card from the box, post-soak plist removal.
 - 2026-11-11 - FM-7 deletion executed: 62 factory files removed from discord-bot master `0885b59` (pushed; AGENTS.md 5-line pointer, test-script trim, `.env.example` DEPLOY_* classifier note; deviations D-7a/b/c recorded above). `npm test` post-deletion: failure set identical to the pre-deletion baseline (14 machine-state suites, better-sqlite3 bindings + missing per-bot config overlays), zero failures referencing deleted paths; `node --test` trio (crashUnhandledRejection/g50ProdRead/localEmbeddings) 25/25 pass. Deploy runners verified post-deletion from `/opt/factory`: `deploy.js build master` exit 0 → image `ghcr.io/ajohnson-1/discord-bot:sha-0885b59` built host-local on the deploy box; `verify-deploy.js` on the running sha: 5/6 checks pass (health×2, memory-boot-consistency, gateway-ready, logs-classifier all clean) — the one fail is `ai-hosts-probe` ECONNREFUSED, the embeddings gateway host 192.168.0.159:8123 down at verify time (machine-state, verified by direct probe; unrelated to the deletion — verify-deploy runs from this repo against the deploy host).
 - 2026-11-12 - FM-7 post-soak review + laptop rollback-anchor uninstall: the day's Mac reboot re-bootstrapped the still-present discord-bot plists (factory-daemon KeepAlive + prod-watch StartInterval), and a second factory-repo `factory-daemon.js run` had been bootstrapped the same morning — three dispatchers racing the box. Owner DMs from NooNooBot (app `842506994865799169`) root-caused: the discord-bot ghost's `.env` carries no `FACTORY_CHANNEL_ID` / `DISCORD_BOT_CHANNEL_ID` / `FACTORY_DISCORD_WEBHOOK`, so `sendOwnerPing` fell back to the owner-DM path with the bot token; the box daemon and the factory-repo laptop daemon both had channel routing configured. Fix: `bootout`/`remove` all laptop jobs, delete `com.ajohnson.factory-daemon` + `com.discordbot.prodwatch` plists, kill stragglers (the daemon was mid-self-deploy of `6af60d6a85947225f6ed75a0`; its run logged the SIGTERM stop + `[Recovery]` block and the box daemon owns the handoff via stall-sweep/comment-resume — box verified active, sole dispatcher at `8af5f82` = origin/master). 48 untracked factory copies restored to the laptop discord-bot checkout were removed (`git clean`; checkout clean except the pre-existing dirty `yarn.lock`). `com.discordbot.factory-metrics` / `com.ajohnson.factory-sweep` plists were not present. Remaining operator items unchanged: rollback drill before 2026-11-16, one discord-bot product card from the box, archive laptop `data/factory-daemon` logs, soak ≥7 days / ≥3 Done.
+- 2026-11-12 - Operator decision: **forward-only**. No rollback drill — the box is the permanent dispatcher; laptop state is cleanup, not an anchor (both anchor plists deleted with the agents the same day). §6.2 drill runbook retained as the fallback recipe; the "rollback rehearsed once" acceptance clause recorded waived (§6.2 table + §7 steady-state text). Remaining operator items: one discord-bot product card from the box, archive laptop `data/factory-daemon` logs, soak ≥7 days / ≥3 Done (clock ends 2026-11-16).
