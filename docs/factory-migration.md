@@ -265,14 +265,16 @@ Run interactively — never from a dispatched run (§7 invariant).
 
 1. Forward (box → laptop): box `systemctl --user disable --now
    factory-daemon` and stop the satellite service+timer pairs
-   (`factory-metrics`, `factory-sweep`, `prod-watch`); laptop console:
-   `launchctl bootstrap gui/$(id -u)
-   ~/Library/LaunchAgents/com.ajohnson.factory-daemon.plist` (+ the prodwatch
-   plist); verify laptop `node scripts/factory.js status` green on both boards.
-2. Back (laptop → box): laptop `launchctl bootout
-   gui/$(id -u)/com.ajohnson.factory-daemon` (+ prodwatch); box
-   `systemctl --user enable --now factory-daemon`; verify boot + `poll ok` for
-   both boards in `journalctl --user -u factory-daemon.service`.
+   (`factory-metrics`, `factory-sweep`, `prod-watch`); laptop console — the
+   2026-11-12 uninstall deleted the anchor plists, so regenerate instead of
+   bootstrap: `cd ~/GitHub/factory && node scripts/factory-daemon.js install`
+   (writes the plist + bootstraps; a prodwatch plist pointing at the
+   factory-repo `scripts/prod-watch.js` if you want that leg too); verify
+   laptop `node scripts/factory.js status` green on both boards.
+2. Back (laptop → box): laptop `node scripts/factory-daemon.js uninstall`
+   (boots out + deletes the regenerated plists — restores the uninstalled
+   state); box `systemctl --user enable --now factory-daemon`; verify boot +
+   `poll ok` for both boards in `journalctl --user -u factory-daemon.service`.
 3. Divergence handling: D8/§6.3 — done-ping re-baselines silently, resume
    watermarks are event-id keyed (worst case one human-comment re-ack); the
    board is the only shared state.
