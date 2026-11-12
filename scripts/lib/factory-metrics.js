@@ -157,6 +157,26 @@ function firstCommentDate(comments) {
 }
 
 /**
+ * Ask-on-top invariant scorer (card 6af60d6a85947225f6ed75a0 — the
+ * regression signal for "a card waiting on a human shows its request as the
+ * NEWEST comment"). Over finite-dated items sorted ascending (never trust
+ * array order), the latest comment is human-facing ⇔ its FIRST line opens
+ * with `[ASK]` (pending ask top-of-card) OR its SECOND line starts with
+ * `needs you:` (park comment — first line cap record, second line the human
+ * action). No comments / latest undated → false (unprovable = violation,
+ * same fail-toward-signal rule as the ask protocol's scoring).
+ */
+export function askOnTopOk(comments) {
+  const items = (Array.isArray(comments) ? comments : [])
+    .map((c) => ({ c, ms: dateMsOf(c) }))
+    .filter((x) => Number.isFinite(x.ms))
+    .sort((x, y) => x.ms - y.ms);
+  if (!items.length) return false;
+  const lines = textOf(items[items.length - 1].c).split('\n');
+  return /^\[ASK\]/i.test(lines[0]) || /^needs you:/i.test(lines[1] ?? '');
+}
+
+/**
  * Per-card metric extraction over that card's full comment trail.
  * `since`/`until` are epoch ms bounds for the window; `me` is the bot
  * identity ({id, username} | null — null => identityDegraded).
@@ -362,6 +382,30 @@ export function computeMetrics({ cards, commentsByCard, me, sinceIso, untilIso, 
     ).length,
   };
 
+  // --- ask-on-top invariant (card 6af60d6a85947225f6ed75a0) ---
+  // Over every `needs-human` card: is its newest comment the human-facing
+  // request (pending [ASK] / park action line)? A card whose trail could not
+  // be fetched is EXCLUDED from scoring (never fabricate green or red — it
+  // rides `errors` from the reporting shell) and `ok` is null when the board
+  // has no needs-human cards at all (nothing to assert).
+  const askOnTopCards = cards.filter(
+    (c) => Array.isArray(c?.labels) && c.labels.some((l) => l?.name === 'needs-human'),
+  );
+  const askOnTopOffenders = [];
+  let askOnTopScored = 0;
+  for (const c of askOnTopCards) {
+    const trail = commentsByCard?.[c.id];
+    if (!Array.isArray(trail)) continue; // unfetched trail — excluded (D6)
+    askOnTopScored += 1;
+    if (!askOnTopOk(trail)) askOnTopOffenders.push(c.id);
+  }
+  const askOnTop = {
+    needsHumanCards: askOnTopCards.length,
+    scored: askOnTopScored,
+    ok: askOnTopCards.length === 0 ? null : askOnTopScored === askOnTopCards.length && askOnTopOffenders.length === 0,
+    offenders: askOnTopOffenders,
+  };
+
   // --- stage times p50/p95 across cards (both endpoints required) ---
   const stageKeys = ['planMs', 'implementMs', 'reviewMs', 'qaMs', 'deployMs', 'verifyMs', 'totalMs'];
   const stageTimes = {};
@@ -473,6 +517,7 @@ export function computeMetrics({ cards, commentsByCard, me, sinceIso, untilIso, 
       needsHumanLabeled: bounces.needsHumanLabeled,
     },
     bounces,
+    askOnTop,
     stageTimes,
     crashes,
     askLatency,
@@ -606,6 +651,12 @@ export function buildMetricsHeadline(r) {
   const b = r.bounces;
   const rd = r.reviewDisposition;
   const pw = r.prodWatch?.snapshot?.status ?? 'unknown';
+  const ao = r.askOnTop ?? {};
+  const aoState = ao.ok === null || ao.ok === undefined ? 'n/a' : ao.ok ? 'ok' : 'VIOLATED';
+  const aoOffenders =
+    Array.isArray(ao.offenders) && ao.offenders.length
+      ? `; offenders ${ao.offenders.slice(0, 3).join(',')}${ao.offenders.length > 3 ? ` +${ao.offenders.length - 3} more` : ''}`
+      : '';
   const stageBit = (k) => (r.stageTimes[k] ? `${k}:p50 ${Math.round(r.stageTimes[k].p50 / 60000)}m` : null);
   const stages = ['implementMs', 'reviewMs', 'qaMs'].map(stageBit).filter(Boolean).join(', ');
   return (
@@ -615,6 +666,7 @@ export function buildMetricsHeadline(r) {
     `findings fixed/dismissed/open ${rd.fixed}/${rd.dismissed}/${rd.open}; prod ${pw}; ` +
     `runs ${r.cost.runsInWindow} vs cap $${r.cost.maxCostCapUsd}` +
     (stages ? `; ${stages}` : '') +
+    `; needs-human ask-on-top ${aoState} (${ao.scored ?? 0}/${ao.needsHumanCards ?? 0}${aoOffenders})` +
     `; errors ${r.errors.length}`
   );
 }
@@ -683,11 +735,14 @@ export function buildMetricsSummary(r) {
     .filter((k) => st[k]?.n > 0)
     .map((k) => `${k.replace(/Ms$/, '')}: p50 ${mins(st[k].p50)} p95 ${mins(st[k].p95)} max ${mins(st[k].max)} (n=${st[k].n})`);
   const pw = r.prodWatch?.snapshot?.status ?? 'unknown';
+  const ao = r.askOnTop ?? {};
+  const aoState = ao.ok === null || ao.ok === undefined ? 'n/a' : ao.ok ? 'ok' : 'VIOLATED';
   const errs = Array.isArray(r.errors) ? r.errors : [];
   const lines = [
     `cards: ${r.cards?.onBoard ?? 0} on board; ${r.cards?.touchedInWindow ?? 0} touched in window; needs-human labeled ${b.needsHumanLabeled ?? 0}; comment-capped trails ${(Array.isArray(r.truncated) ? r.truncated : []).length}`,
     `bounces: ${b.cardsWithBounces ?? 0} cards (max netted lifetime ${b.maxBouncesLifetime ?? 0}; gate cap ${b.cap ?? '?'}; raw window tag tally ${b.windowTagTally ?? 0})`,
     `needs-human risk: ${risk.length ? capList(risk, (m) => `${clipText(m.name, SUMMARY_ITEM_MAX_CHARS)} (net ${m.bouncesLifetime ?? 0})`) : 'none'}`,
+    `ask-on-top (needs-human): ${aoState} — scored ${ao.scored ?? 0}/${ao.needsHumanCards ?? 0}${Array.isArray(ao.offenders) && ao.offenders.length ? `; offenders ${capList(ao.offenders, (id) => String(id))}` : ''}`,
     `top bounced: ${bounced.length ? capList(bounced, (m) => `${clipText(m.name, SUMMARY_ITEM_MAX_CHARS)} [net ${m.bouncesLifetime ?? 0}, pending ${m.pendingBounces ?? 0}, raw window ${m.windowTagTally ?? 0}]`) : 'none'}`,
     `stage times: ${stageBits.length ? stageBits.join('; ') : 'no complete stage intervals in window'}`,
     `crashes: ${r.crashes?.inWindow ?? 0} in window / ${r.crashes?.lifetime ?? 0} lifetime${crashCards.length ? `; top: ${capList(crashCards, (m) => `${clipText(m.name, SUMMARY_ITEM_MAX_CHARS)} (window ${m.window ?? 0}, lifetime ${m.lifetime ?? 0})`)}` : ''}`,
@@ -810,6 +865,21 @@ export async function runMetricsReport({
       }
     }
     commentsByCard[card.id] = full ?? [];
+  }
+
+  // Ask-on-top scoring (card 6af60d6a85947225f6ed75a0) must cover EVERY
+  // needs-human card, even one untouched in the window (parked long ago).
+  // `getCardComments(id, 1)` suffices: the API returns newest-first and the
+  // scorer re-sorts by parsed date. A fetch failure lands in `errors` and
+  // EXCLUDES the card from scoring — no fabricated green or red (D6).
+  for (const card of cards) {
+    if (!(Array.isArray(card?.labels) && card.labels.some((l) => l?.name === 'needs-human'))) continue;
+    if (card.id in commentsByCard) continue; // already fetched (touched in window)
+    try {
+      commentsByCard[card.id] = (await t.getCardComments(card.id, 1)) ?? [];
+    } catch (e) {
+      errors.push(`comments ${card.id}: ${e.message}`);
+    }
   }
 
   const report = computeMetrics({ cards, commentsByCard, me, sinceIso, untilIso, prodWatch, daemonLogs });

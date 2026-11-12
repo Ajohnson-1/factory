@@ -52,7 +52,7 @@ import * as trello from './trello.js';
 // that never deadlocks the gate — the sha watermark already recorded that
 // tip's verdict, and per the board contract the next check needs a new
 // commit AND a fresh [IMPL]→[QA:PASS] round, which post newer tags.
-import { isStageTagText, latestStageTag } from './factory-comment-resume.js';
+import { isStageTagText, latestStageTag, isAskPending, liftPendingAsk } from './factory-comment-resume.js';
 // ESM cycle with the daemon (daemon → this lib → daemon) is safe: crashTail
 // is a hoisted function declaration and is only dereferenced inside function
 // bodies (same pattern as STAGE_SEED_LIST in factory-comment-resume.js).
@@ -433,6 +433,17 @@ export async function tickBlockingChecks({
       // still mismatches, so the suite re-runs — at-least-once, spam-free).
       log(`[blocking-checks] verdict comment failed for ${card.id}: ${String(e?.message ?? e)}; will retry`);
       continue;
+    }
+    // Ask-on-top invariant (card 6af60d6a85947225f6ed75a0): the [CHECK:*]
+    // verdict just posted is DAEMON gate bookkeeping — it does not supersede
+    // a pending ask for lift purposes (D1), and it is exactly the noise the
+    // invariant lifts above. `comments` is the PRE-verdict list from the loop
+    // top; liftPendingAsk re-fetches (seeing the just-posted verdict), decides
+    // (dedups when the ask is already newest), and NEVER rejects — a failed
+    // lift logs and lets the loop continue (next bookkeeping post retries).
+    if (isAskPending(comments)) {
+      const r = await liftPendingAsk(card.id, { t, log });
+      if (r.lifted) log(`[blocking-checks] re-posted the pending [ASK] top-of-card for ${card.id}`);
     }
     summary.checked += 1;
     if (pass) {

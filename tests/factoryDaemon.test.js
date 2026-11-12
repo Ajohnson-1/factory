@@ -426,7 +426,7 @@ describe('crashCommentText', () => {
       1,
       MAX_CRASH_RETRIES,
       { mode: 'park' },
-      `[DAEMON-CRASH] run exited 1 after ${MAX_CRASH_RETRIES} prior crash(es); parking needs-human where it stands`,
+      `[DAEMON-CRASH] run exited 1 after ${MAX_CRASH_RETRIES} prior crash(es); parking needs-human where it stands\nneeds you: reply anything (e.g. "resume") to restart at the current stage.`,
     ],
     [
       're-queue',
@@ -452,11 +452,11 @@ describe('crashCommentText', () => {
     }
   })
 
-  it('keeps the [DAEMON-CRASH] tag first and the first line byte-identical when a tail is present', () => {
+  it('keeps the [DAEMON-CRASH] tag first and the head byte-identical when a tail is present', () => {
     for (const [, code, prior, shape, expected] of branches) {
       const text = crashCommentText(code, prior, { ...shape, logPath: 'data/factory-daemon/abc123.log', logText: 'TypeError: boom\n  at run' })
       expect(text.startsWith(`${CRASH_TAG} `)).toBe(true) // startsWith counting stays intact
-      expect(text.split('\n')[0]).toBe(expected) // append-after-first-line, never replace
+      expect(text.startsWith(expected)).toBe(true) // append-after-head, never replace (park heads are 2 lines — cap record first, action second — and the tail still rides BELOW both)
     }
   })
 
@@ -691,8 +691,17 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
   const implVerdict = cmt('2026-11-03T01:00:00.000Z', '[IMPL] evidence — commit abc123')
 
   // Fake board: every trello call the crash path makes, scripted + recorded.
-  const fakeT = ({ comments = [], idList = IMPL.id, getCardThrows = false, getListsThrows = false } = {}) => {
+  // `reflectWrites: true` (ask-on-top sequence tests, card 6af60d6a85947225f6ed75a0):
+  // addComment ALSO appends to the read list with a strictly newer date — a
+  // read-after-write board, so lifts see the crash/park/verdict comment they
+  // must lift above. DEFAULT behavior stays (writes INVISIBLE to reads) so
+  // every unrelated test stays byte-green.
+  const fakeT = ({ comments = [], idList = IMPL.id, getCardThrows = false, getListsThrows = false, reflectWrites = false } = {}) => {
     const calls = { comments: [], getCard: [], getLists: 0, listsOpts: [], commentsWritten: [], moves: [], labels: 0, labelAdded: [] }
+    let readMs = comments.reduce((mx, c) => {
+      const ms = Date.parse(c?.date ?? '')
+      return Number.isFinite(ms) && ms > mx ? ms : mx
+    }, 0)
     return {
       calls,
       getCardComments: async (id) => {
@@ -712,6 +721,10 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
       },
       addComment: async (id, text) => {
         calls.commentsWritten.push({ id, text })
+        if (reflectWrites) {
+          readMs += 60_000 // strictly newer than everything read so far
+          comments = [...comments, { id: `w-${comments.length}`, date: new Date(readMs).toISOString(), data: { text }, memberCreator: { id: 'botid' } }]
+        }
       },
       moveCard: async (id, listId) => {
         calls.moves.push([id, listId])
@@ -798,7 +811,7 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
   it('parks needs-human WHERE IT STANDS at the crash cap — no move, no spawn', async () => {
     const t = fakeT({ comments: [implVerdict, crashCmt('2026-11-03T02:00:00.000Z', 1), crashCmt('2026-11-03T03:00:00.000Z', 2)] })
     const spawned = []
-    await handleRunCrash({ readRunLog: () => '', card, code: 1, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    await handleRunCrash({ readRunLog: () => '', card, code: 1, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]), notify: async () => ({ sent: true }) })
     expect(t.calls.moves).toEqual([])
     expect(spawned).toHaveLength(0)
     expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]])
@@ -1047,9 +1060,12 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     const t = fakeT({ comments: asked })
     const spawned = []
     const logLines = []
-    await handleRunCrash({ readRunLog: () => '', card, code: STALL_EXIT_CODE, t, readyList: READY, log: (m) => logLines.push(m), crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    await handleRunCrash({ readRunLog: () => '', card, code: STALL_EXIT_CODE, t, readyList: READY, log: (m) => logLines.push(m), crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]), notify: async () => ({ sent: true }) })
     expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park beats ask-hold — decision unchanged
-    expect(t.calls.commentsWritten).toHaveLength(0) // only the comment is silenced
+    // Card 6af60d6a85947225f6ed75a0: the stall report stays silenced, but the
+    // ask-lift fires — crash comments newer than the ask bury it, so the ask
+    // is re-posted VERBATIM top-of-card. Invariant, not a regression.
+    expect(t.calls.commentsWritten).toEqual([{ id: card.id, text: '[ASK] still waiting?' }])
     expect(t.calls.moves).toEqual([])
     expect(spawned).toHaveLength(0)
     expect(logLines.some((l) => l.includes('crash comment suppressed') && l.includes('pending [ASK] owns the reply'))).toBe(true)
@@ -1083,11 +1099,136 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     ]
     const t = fakeT({ comments: asked, idList: VERIFY.id })
     const spawned = []
-    await handleRunCrash({ readRunLog: () => '', card, code: 'stalled (orphan, silent 195 min)', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    await handleRunCrash({ readRunLog: () => '', card, code: 'stalled (orphan, silent 195 min)', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]), notify: async () => ({ sent: true }) })
     expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park decision stands
-    expect(t.calls.commentsWritten).toHaveLength(0) // comment 6af1ed5c4b3dd164aeeee2e0 could not have posted
+    expect(t.calls.commentsWritten).toHaveLength(0) // comment 6af1ed5c4b3dd164aeeee2e0 could not have posted; the ask is ALREADY newest here → byte-dedup (D5), so the lift is a no-op too
     expect(t.calls.moves).toEqual([])
     expect(spawned).toHaveLength(0)
+  })
+
+  // ---- ask-on-top invariant sequences (card 6af60d6a85947225f6ed75a0) ----
+
+  it('true crash under a pending [ASK]: HEAD-ONLY hold record (no run-log tail), then the lifted ask is the LAST comment', async () => {
+    const asked = [
+      cmt('2026-11-03T02:00:00.000Z', '[ASK] Approval required — approve the deploy sha?'),
+      implVerdict,
+    ]
+    const t = fakeT({ comments: asked, idList: VERIFY.id, reflectWrites: true })
+    const pings = []
+    await handleRunCrash({
+      readRunLog: () => 'TypeError: kaboom\n  at run\nexit 1', // a REAL tail exists — and must NOT be posted
+      card,
+      code: 1,
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: () => {},
+      notify: async (p) => { pings.push(p); return { sent: true } },
+    })
+    expect(t.calls.commentsWritten.map((w) => w.text)).toEqual([
+      '[DAEMON-CRASH] run exited 1; a pending [ASK] owns the reply — left waiting on the human (Verify) (crash 1/3)',
+      '[ASK] Approval required — approve the deploy sha?',
+    ])
+    expect(t.calls.commentsWritten[0].text).not.toContain('run log tail') // RC4 amendment: tailless ask-pending hold
+    expect(t.calls.commentsWritten[1].text).toBe('[ASK] Approval required — approve the deploy sha?') // VERBATIM re-post, newest comment
+    expect(pings).toHaveLength(0) // no park → no DM
+  })
+
+  it('park under a STILL-PENDING ask: park comment first, needs-human label, lifted ask LAST', async () => {
+    const asked = [
+      implVerdict,
+      cmt('2026-11-03T02:00:00.000Z', '[ASK] approve the sha?'),
+      crashCmt('2026-11-03T03:00:00.000Z', 1),
+      crashCmt('2026-11-03T04:00:00.000Z', 2),
+    ]
+    const t = fakeT({ comments: asked, idList: IMPL.id, reflectWrites: true })
+    const pings = []
+    await handleRunCrash({
+      readRunLog: () => '',
+      card,
+      code: 1, // non-stall → the park comment itself posts
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: () => {},
+      notify: async (p) => { pings.push(p); return { sent: true } },
+    })
+    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]])
+    expect(t.calls.commentsWritten.map((w) => w.text)).toEqual([
+      '[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands (Implement)\nneeds you: reply anything (e.g. "resume") to restart at Implement.',
+      '[ASK] approve the sha?',
+    ]) // park lands FIRST, the ask-lift LAST — the ask ends top-of-card
+  })
+
+  it('park AFTER a superseded approval ask: action line last, superseded sentence, NO lift, ONE park DM with the card link', async () => {
+    const parkedCard = { ...card, url: 'https://trello.example/crash-card' }
+    const asked = [
+      implVerdict,
+      cmt(
+        '2026-11-03T02:00:00.000Z',
+        '[ASK] Approval required (risk tier medium: churn). Merge+Deploy of sha 539e8a4f2c1d is held until a human approves THIS sha. To approve, post a comment containing the sha, e.g. "[HUMAN] APPROVED 539e8a4f2c1d".',
+      ),
+      cmt('2026-11-03T03:00:00.000Z', '[REVIEW:CHANGES] f1 — bounce'), // supersedes the ask → no pending → no lift
+      crashCmt('2026-11-03T04:00:00.000Z', 1),
+      crashCmt('2026-11-03T05:00:00.000Z', 2),
+    ]
+    const t = fakeT({ comments: asked, idList: IMPL.id, reflectWrites: true })
+    const pings = []
+    await handleRunCrash({
+      readRunLog: () => '',
+      card: parkedCard,
+      code: 1,
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: () => {},
+      notify: async (p) => { pings.push(p); return { sent: true } },
+    })
+    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]])
+    expect(t.calls.commentsWritten).toHaveLength(1) // NO lift — the ask is superseded
+    expect(t.calls.commentsWritten[0].text.split('\n')).toEqual([
+      '[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands (Implement)',
+      'needs you: reply anything (e.g. "resume") to restart at Implement.',
+      'the earlier approval ask for sha 539e8a4f2c1d was superseded by [REVIEW:CHANGES]; a fresh approval ask will follow the re-run.',
+    ]) // the park comment is the LAST comment and it speaks human
+    expect(pings).toHaveLength(1)
+    expect(pings[0].text).toContain('Factory card parked needs-human: Crash test card — reply anything (e.g. "resume") to restart at Implement.')
+    expect(pings[0].text).toContain(parkedCard.url)
+    expect(pings[0].text).toContain('the earlier approval ask for sha 539e8a4f2c1d was superseded by [REVIEW:CHANGES].')
+    expect(pings[0].board).toBeUndefined()
+  })
+
+  it('park DM failure is recorded, NEVER thrown ({ error } result and a throwing notify alike)', async () => {
+    const mkComments = () => [implVerdict, crashCmt('2026-11-03T02:00:00.000Z', 1), crashCmt('2026-11-03T03:00:00.000Z', 2)]
+    const logA = []
+    await handleRunCrash({
+      readRunLog: () => '',
+      card,
+      code: 1,
+      t: fakeT({ comments: mkComments() }),
+      readyList: READY,
+      log: (m) => logA.push(m),
+      crashRetries: 2,
+      spawnResumeRun: () => {},
+      notify: async () => ({ error: 'Discord webhook -> HTTP 500' }),
+    })
+    expect(logA.some((l) => l.includes('park ping failed') && l.includes('HTTP 500'))).toBe(true)
+    const logB = []
+    await handleRunCrash({
+      readRunLog: () => '',
+      card,
+      code: 1,
+      t: fakeT({ comments: mkComments() }),
+      readyList: READY,
+      log: (m) => logB.push(m),
+      crashRetries: 2,
+      spawnResumeRun: () => {},
+      notify: async () => { throw new Error('notify exploded') }, // a fake may; sendOwnerPing never does
+    })
+    expect(logB.some((l) => l.includes('park ping failed') && l.includes('notify exploded'))).toBe(true)
   })
 
   it('a SIGTERM restart-stop under a pending [ASK] posts [DAEMON-RESTART] — the excluded class stays byte-identical', async () => {
@@ -1221,6 +1362,7 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
       log: noop,
       crashRetries: 2,
       spawnResumeRun: (c, p) => spawned.push([c, p]),
+      notify: async () => ({ sent: true }),
     })
     expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]])
     expect(spawned).toHaveLength(0)

@@ -29,6 +29,9 @@ import {
   countRestartStops,
   crashCommentText,
   isAskPending,
+  decideAskLift,
+  liftPendingAsk,
+  supersededApprovalAsk,
   pickResumeTrigger,
   mergeResumeEvents,
   latestStageTag,
@@ -39,6 +42,7 @@ import {
   runCommentResumeWatch,
 } from '../scripts/lib/factory-comment-resume.js';
 import { parseFlags } from '../scripts/lib/factory-ask.js';
+import { findApprovalComment } from '../scripts/lib/factory-risk.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FACTORY_JS = path.join(ROOT, 'scripts', 'factory.js');
@@ -1356,4 +1360,189 @@ test('50. countRestartStops: consecutive newest-first, any other comment breaks'
     decideCrashRecovery({ comments: [r('a', '2026-11-03T04:00:00.000Z'), r('b', '2026-11-03T05:00:00.000Z'), cmt('v1', '2026-11-03T01:00:00.000Z', '[IMPL] …', botMember)], listName: 'Implement', crashRetries: 2 }),
     { mode: 'resume', stage: 'Implement' },
   );
+});
+
+// ---- ask-on-top invariant (card 6af60d6a85947225f6ed75a0) -------------------
+
+// The approval-ask shape factory-risk.js approvalAskText produces (the sha is
+// quoted twice — display + reply instruction).
+const APPROVAL_ASK =
+  '[ASK] Approval required (risk tier medium: churn 512). Merge+Deploy of sha 539e8a4f2c1d is held until a human approves THIS sha. To approve, post a comment containing the sha, e.g. "[HUMAN] APPROVED 539e8a4f2c1d".';
+
+// 51. decideAskLift: the pending ask buried under daemon noise comes back
+// VERBATIM; answered / AGENT verdict / byte-dedup / no ask / undated → null;
+// DAEMON gate verdicts (DAEMON_GATE_TAGS) do NOT supersede for lift purposes
+// (D1); same-second comments neither answer nor supersede.
+test('51. decideAskLift: noise newer → verbatim ask; answered/agent-verdict/dedup/no-ask/undated → null; gate verdict lifts (D1)', () => {
+  const ask = cmt('a1', '2026-11-03T02:00:00.000Z', '[ASK] still waiting?', botMember);
+  // the pending ask is the newest comment → already top-of-card → null
+  assert.equal(decideAskLift([ask, cmt('v0', '2026-11-02T01:00:00.000Z', '[PLAN] p', botMember)]), null);
+  // crash / resume bookkeeping newer than the ask → lift the EXACT bytes
+  const crash = cmt('k1', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember);
+  assert.equal(decideAskLift([crash, ask]), '[ASK] still waiting?');
+  assert.equal(decideAskLift([cmt('r1', '2026-11-03T03:00:00.000Z', '[RESUME] ack', botMember), ask]), '[ASK] still waiting?');
+  // answered → null (no race with waitForHuman)
+  assert.equal(decideAskLift([cmt('h1', '2026-11-03T03:00:00.000Z', 'yes go ahead', HUMAN), ask]), null);
+  assert.equal(decideAskLift([cmt('h2', '2026-11-03T03:00:00.000Z', '[HUMAN] yes', botMember), ask]), null);
+  // an AGENT stage verdict supersedes → no lift (the pipeline moved on)
+  assert.equal(decideAskLift([cmt('v2', '2026-11-03T03:00:00.000Z', '[REVIEW:CHANGES] bounce', botMember), ask]), null);
+  // a DAEMON GATE verdict is bookkeeping noise → lift anyway (D1)
+  assert.equal(decideAskLift([cmt('g1', '2026-11-03T03:00:00.000Z', '[CHECK:FAIL] npm test exit 1', botMember), ask]), '[ASK] still waiting?');
+  assert.equal(decideAskLift([cmt('g2', '2026-11-03T03:00:00.000Z', '[CHECK:PASS] green at sha=abc', botMember), ask]), '[ASK] still waiting?');
+  // dedup (D5): the newest comment BYTE-equals the ask text (a prior lift re-post) → null
+  const rePosted = cmt('a2', '2026-11-03T04:00:00.000Z', '[ASK] still waiting?', botMember);
+  assert.equal(decideAskLift([rePosted, crash, ask]), null);
+  // no ask / undated ask → null
+  assert.equal(decideAskLift([cmt('v3', '2026-11-03T03:00:00.000Z', '[IMPL] x', botMember)]), null);
+  assert.equal(decideAskLift([{ id: 'x', data: { text: '[ASK] q' }, memberCreator: botMember }]), null);
+  // same-second comments after the ask neither answer nor supersede (fail toward pending)
+  assert.equal(decideAskLift([cmt('h3', '2026-11-03T02:00:00.000Z', 'hi', HUMAN), ask]), '[ASK] still waiting?');
+});
+
+// 52. liftPendingAsk: fetch throw → {lifted:false} + log; addComment throw →
+// same; happy → VERBATIM re-post + {lifted:true}; dedup → zero writes. NEVER
+// rejects (the watch-loop never-reject robustness).
+test('52. liftPendingAsk: read/post failures log + {lifted:false}, never reject; happy path re-posts VERBATIM', async () => {
+  const ask = cmt('a1', '2026-11-03T02:00:00.000Z', '[ASK] still waiting?', botMember);
+  const crash = cmt('k1', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] …', botMember);
+  const logs = [];
+  const log = (m) => logs.push(m);
+  const t1 = { getCardComments: async () => { throw new Error('429 rate limited'); }, addComment: async () => { throw new Error('must not post'); } };
+  assert.deepEqual(await liftPendingAsk('c1', { t: t1, log }), { lifted: false });
+  assert.ok(logs.some((l) => l.includes('ask-lift comment fetch failed') && l.includes('429')));
+  const t2 = { getCardComments: async () => [crash, ask], addComment: async () => { throw new Error('500 server'); } };
+  assert.deepEqual(await liftPendingAsk('c1', { t: t2, log }), { lifted: false });
+  assert.ok(logs.some((l) => l.includes('ask-lift re-post failed') && l.includes('500')));
+  const written = [];
+  const t3 = { getCardComments: async () => [crash, ask], addComment: async (id, text) => { written.push([id, text]); return { id: 'n1' }; } };
+  assert.deepEqual(await liftPendingAsk('c1', { t: t3, log }), { lifted: true });
+  assert.deepEqual(written, [['c1', '[ASK] still waiting?']]); // byte-identical, no trim
+  written.length = 0;
+  const t4 = { getCardComments: async () => [ask], addComment: async (id, text) => { written.push([id, text]); return { id: 'n1' }; } };
+  assert.deepEqual(await liftPendingAsk('c1', { t: t4, log }), { lifted: false }); // dedup — zero writes
+  assert.deepEqual(written, []);
+});
+
+// 53. supersededApprovalAsk: the card-28 park bookkeeping — verdict after a
+// sha-keyed approval ask → { sha, tag } (gate verdicts count too); answered
+// first → null; still pending → null; ask without a sha → null; bookkeeping
+// between ask and verdict is skipped.
+test('53. supersededApprovalAsk: verdict outranking a sha ask → {sha, tag}; answered/pending/no-sha → null', () => {
+  const approval = cmt('a1', '2026-11-03T02:00:00.000Z', APPROVAL_ASK, botMember);
+  assert.deepEqual(
+    supersededApprovalAsk([cmt('v1', '2026-11-03T03:00:00.000Z', '[REVIEW:CHANGES] f1 — bounce', botMember), approval]),
+    { sha: '539e8a4f2c1d', tag: '[REVIEW:CHANGES]' },
+  );
+  assert.deepEqual(
+    supersededApprovalAsk([cmt('g1', '2026-11-03T03:00:00.000Z', '[CHECK:FAIL] npm test exit 1', botMember), approval]),
+    { sha: '539e8a4f2c1d', tag: '[CHECK:FAIL]' }, // a gate verdict moved the pipeline on too
+  );
+  // a human answered FIRST → a later verdict is NOT supersession of the ask
+  assert.equal(
+    supersededApprovalAsk([
+      cmt('v1', '2026-11-03T04:00:00.000Z', '[REVIEW:CHANGES] f1', botMember),
+      cmt('h1', '2026-11-03T02:30:00.000Z', 'approved, go', HUMAN),
+      approval,
+    ]),
+    null,
+  );
+  assert.equal(supersededApprovalAsk([approval]), null); // nothing newer — still pending
+  assert.equal(
+    supersededApprovalAsk([
+      cmt('v1', '2026-11-03T03:00:00.000Z', '[REVIEW:CHANGES] f1', botMember),
+      cmt('a0', '2026-11-03T02:00:00.000Z', '[ASK] plain question, no sha here', botMember),
+    ]),
+    null,
+  ); // not an approval ask
+  // bookkeeping between the ask and the verdict keeps the walk going
+  assert.deepEqual(
+    supersededApprovalAsk([
+      cmt('v1', '2026-11-03T04:00:00.000Z', '[REVIEW:CHANGES] f1', botMember),
+      cmt('k1', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] boom', botMember),
+      approval,
+    ]),
+    { sha: '539e8a4f2c1d', tag: '[REVIEW:CHANGES]' },
+  );
+});
+
+// 54. crashCommentText shapes: ask-pending hold TAILLESS even with real log
+// text; park head = cap record FIRST + action SECOND + superseded THIRD (no
+// live sha needed — the fixture is quoted); park keeps its tail; resume/requeue
+// unchanged (D2).
+test('54. crashCommentText: ask-pending hold head-only; park speaks human (action + superseded lines); tails otherwise unchanged', () => {
+  assert.equal(
+    crashCommentText(1, 0, { mode: 'hold', stage: 'Verify', crashRetries: 2, holdReason: 'ask-pending', logPath: 'p.log', logText: 'TypeError: kaboom\nexit 1' }),
+    '[DAEMON-CRASH] run exited 1; a pending [ASK] owns the reply — left waiting on the human (Verify) (crash 1/3)',
+  ); // NO run-log tail section at all
+  const park = crashCommentText('spawn-failed', 2, { mode: 'park', stage: 'Review', crashRetries: 2, superseded: { sha: 'deadbeefcafe', tag: '[REVIEW:CHANGES]' } });
+  assert.deepEqual(park.split('\n'), [
+    '[DAEMON-CRASH] run exited spawn-failed after 2 prior crash(es); parking needs-human where it stands (Review)',
+    'needs you: reply anything (e.g. "resume") to restart at Review.',
+    'the earlier approval ask for sha deadbeefcafe was superseded by [REVIEW:CHANGES]; a fresh approval ask will follow the re-run.',
+  ]);
+  assert.deepEqual(
+    crashCommentText(1, 2, { mode: 'park', crashRetries: 2 }).split('\n'),
+    [
+      '[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands',
+      'needs you: reply anything (e.g. "resume") to restart at the current stage.',
+    ],
+  ); // D4: unreadable list name → 'the current stage'
+  const parkTail = crashCommentText(1, 2, { mode: 'park', stage: 'QA', crashRetries: 2, logPath: 'p.log', logText: 'boom line' });
+  assert.ok(parkTail.includes('--- run log tail (p.log')); // park keeps the tail (D2)
+  assert.ok(parkTail.includes('boom line'));
+  assert.ok(parkTail.startsWith('[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands (QA)\nneeds you:'));
+  const resume = crashCommentText(1, 0, { mode: 'resume', stage: 'QA', crashRetries: 2, logPath: 'p.log', logText: 'boom line' });
+  assert.ok(resume.includes('boom line')); // resume tail unchanged
+  const requeue = crashCommentText(1, 0, { mode: 'requeue', crashRetries: 2, logPath: 'p.log', logText: 'boom line' });
+  assert.ok(requeue.includes('boom line')); // requeue tail unchanged
+});
+
+// 55. SAFETY pins (card §"Safety"): a lift re-post keeps the ask PENDING for
+// recovery semantics; the ask protocol's author rules drop the bot's re-post
+// as a resume trigger; approvalGate's existing-comment scan reads the sha at
+// ANY date — a lift can neither fake nor strand an approval.
+test('55. safety pins: lift re-post keeps isAskPending true; author rules drop the re-post; sha accepted at any date', () => {
+  const approval = cmt('a1', '2026-11-03T02:00:00.000Z', APPROVAL_ASK, botMember);
+  const crash = cmt('k1', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] boom', botMember);
+  const rePost = cmt('a2', '2026-11-03T04:00:00.000Z', APPROVAL_ASK, botMember); // the lift's verbatim re-post
+  assert.equal(isAskPending([rePost, crash, approval]), true); // tagged [ASK] — the wait survives its own lift
+  assert.equal(pickResumeTrigger([rePost, crash, approval], { bot: BOT, watermark: null }), null); // bot-authored → author rule, never a trigger
+  const humanOk = cmt('h1', '2026-11-03T05:00:00.000Z', '539e8a4f2c1d approved', HUMAN);
+  assert.ok(findApprovalComment([rePost, crash, approval, humanOk], { sha: '539e8a4f2c1d99', bot: BOT })); // any-date scan, bot comments never qualify
+});
+
+// 56. ACCEPTANCE replay — the scripted card-28 trail (PLAN → IMPL → approval
+// ASK quoting a sha → true-crash hold under the ask → [REVIEW:CHANGES]
+// bounce → park at the cap) through the decision layer ends: pending-ask
+// phase → newest = the [ASK] VERBATIM with zero tail; parked phase → newest
+// comment line 1 cap record, line 2 the action, line 3 the superseded sha +
+// [REVIEW:CHANGES].
+test('56. ACCEPTANCE replay: card-28 trail — ask top-of-card zero-tail while waiting; park speaks action + superseded sha at the cap', () => {
+  const plan = cmt('p', '2026-11-12T17:00:00.000Z', '[PLAN] the plan', botMember);
+  const impl = cmt('i', '2026-11-12T17:30:00.000Z', '[IMPL] evidence', botMember);
+  const ask = cmt('a', '2026-11-12T18:09:00.000Z', APPROVAL_ASK, botMember);
+  const trail = [ask, impl, plan]; // Trello returns newest-first
+  // 18:21Z true crash under the pending ask → HOLD, head-only record, then the lift:
+  assert.equal(isAskPending(trail), true);
+  assert.deepEqual(decideCrashRecovery({ comments: trail, listName: 'Verify', crashRetries: 2, askPending: true }), { mode: 'hold', stage: 'Verify' });
+  const hold = crashCommentText(1, 0, { mode: 'hold', stage: 'Verify', crashRetries: 2, holdReason: 'ask-pending', logPath: 'data/factory-daemon/28.log', logText: 'TypeError: boom\nexit 1' });
+  assert.ok(!hold.includes('run log tail')); // zero tail (RC4 amendment)
+  const afterHold = [cmt('h', '2026-11-12T18:21:00.000Z', hold, botMember), ...trail]; // the head posts…
+  assert.equal(decideAskLift(afterHold), APPROVAL_ASK); // …and the ask is lifted back on top
+  const topped = [cmt('l', '2026-11-12T18:21:30.000Z', APPROVAL_ASK, botMember), ...afterHold];
+  assert.equal(isAskPending(topped), true); // recovery semantics unchanged by the lift
+  assert.equal(decideAskLift(topped), null); // dedup — repeated lifts are impossible
+  // 18:26Z [REVIEW:CHANGES] supersedes; crash cap burns → park:
+  const bounce = cmt('b', '2026-11-12T18:26:00.000Z', '[REVIEW:CHANGES] f1 — bounce', botMember);
+  const crash1 = cmt('k1', '2026-11-12T18:30:00.000Z', '[DAEMON-CRASH] run exited 1; stage-aware resume at Review (crash 1/3)', botMember);
+  const crash2 = cmt('k2', '2026-11-12T18:34:00.000Z', '[DAEMON-CRASH] run exited 1; stage-aware resume at Review (crash 2/3)', botMember);
+  const parkTrail = [crash2, crash1, bounce, ...topped];
+  assert.equal(isAskPending(parkTrail), false); // the bounce outranked the ask
+  assert.deepEqual(supersededApprovalAsk(parkTrail), { sha: '539e8a4f2c1d', tag: '[REVIEW:CHANGES]' });
+  assert.deepEqual(decideCrashRecovery({ comments: parkTrail, listName: 'Review', crashRetries: 2, askPending: false }), { mode: 'park', stage: 'Review' });
+  const parkText = crashCommentText('stalled (exit 0 with no verdict)', 2, { mode: 'park', stage: 'Review', crashRetries: 2, superseded: { sha: '539e8a4f2c1d', tag: '[REVIEW:CHANGES]' } });
+  const lines = parkText.split('\n');
+  assert.match(lines[0], /after 2 prior crash\(es\); parking needs-human where it stands \(Review\)/); // line 1: cap record
+  assert.equal(lines[1], 'needs you: reply anything (e.g. "resume") to restart at Review.'); // line 2: the action
+  assert.equal(lines[2], 'the earlier approval ask for sha 539e8a4f2c1d was superseded by [REVIEW:CHANGES]; a fresh approval ask will follow the re-run.'); // line 3: the stale approval
 });

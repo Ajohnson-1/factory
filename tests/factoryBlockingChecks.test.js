@@ -310,6 +310,7 @@ function tickHarness({
   const listsOpts = [];
   const boardOpts = [];
   const gitForCards = [];
+  let commentFetches = 0;
   const t = {
     calls: { addComment: [], moveCard: [], getCard: [] },
     async getLists(opts) {
@@ -323,7 +324,11 @@ function tickHarness({
       return cards;
     },
     async getCardComments(id) {
+      commentFetches += 1;
       if (fail.comments) throw new Error('comments exploded');
+      // Script the ASK-LIFT's refetch (the 2nd read of the tick) failing while
+      // the loop-top read stays healthy (card 6af60d6a85947225f6ed75a0).
+      if (fail.liftComments && commentFetches > 1) throw new Error('lift fetch exploded');
       return comments[id] ?? [];
     },
     async addComment(id, text) {
@@ -768,4 +773,84 @@ test('FM-2: flagless tick stays byte-identical (default git + legacy worktree pa
   assert.equal(summary.pass, 1);
   assert.equal(h.gitForCards.length, 0);
   assert.ok(h.runs[0].cwd.endsWith(path.join('discord-bot-factory-wt', CARD_ID)));
+});
+
+// ---------------------------------------------------------------------------
+// Ask-on-top lift after the verdict post (card 6af60d6a85947225f6ed75a0):
+// a [CHECK:*] gate verdict is daemon bookkeeping — it does NOT supersede a
+// pending ask (D1) — so every verdict post ends by re-posting the ask
+// VERBATIM top-of-card. No pending ask → exactly one comment (all existing
+// tick tests above pin that).
+// ---------------------------------------------------------------------------
+
+// Pending ask coexisting with the [QA:PASS] trigger: the approval [ASK] and
+// [QA:PASS] land in the SAME second — same-second comments neither answer nor
+// supersede the ask (fail toward pending), and [QA:PASS] (Trello's newest-first
+// slot 0) stays the latest stage tag, so the gate fires under the wait.
+const T = '2026-01-03T00:00:00.000Z';
+const askPendingComments = () => [
+  comment('[QA:PASS] green', T),
+  comment('[ASK] Approval required — merge sha deadbeefcafe?', T),
+  comment('[IMPL] evidence', '2026-01-01T00:00:00.000Z'),
+];
+
+test('tick re-posts the pending [ASK] top-of-card after the PASS verdict — VERBATIM, LAST', async () => {
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: askPendingComments() },
+    shas: { [`factory/${CARD_ID}`]: 'deadbeefcafe' },
+  });
+  const summary = await h.promise;
+  assert.equal(summary.checked, 1);
+  assert.equal(summary.pass, 1);
+  assert.equal(h.calls.addComment.length, 2);
+  assert.ok(h.calls.addComment[0].text.startsWith(CHECK_TAG_PASS));
+  assert.equal(h.calls.addComment[1].text, '[ASK] Approval required — merge sha deadbeefcafe?'); // the lift lands AFTER the verdict — ask ends newest
+  assert.ok(h.logs.some((l) => l.includes('re-posted the pending [ASK]')));
+});
+
+test('tick bounces on FAIL with a pending ask too: [CHECK:FAIL] then the lifted ask, then the move', async () => {
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: askPendingComments() },
+    shas: { [`factory/${CARD_ID}`]: 'cafe0001' },
+    runResults: [{ exit: 1, stdout: '', stderr: 'FAIL suite' }],
+  });
+  const summary = await h.promise;
+  assert.equal(summary.fail, 1);
+  assert.equal(summary.bounced, 1);
+  assert.equal(h.calls.addComment.length, 2);
+  assert.ok(h.calls.addComment[0].text.startsWith(CHECK_TAG_FAIL));
+  assert.equal(h.calls.addComment[1].text, '[ASK] Approval required — merge sha deadbeefcafe?');
+  assert.deepEqual(h.calls.moveCard, [{ cardId: CARD_ID, listId: LIST_IMPL }]);
+});
+
+test('tick lifts NOTHING when the ask was answered or superseded before the verdict', async () => {
+  const answered = [
+    comment('yes go ahead', '2026-01-03T00:30:00.000Z'), // untagged human reply answers
+    comment('[QA:PASS] green', T),
+    comment('[ASK] Approval required?', '2026-01-02T23:00:00.000Z'),
+    comment('[IMPL] evidence', '2026-01-01T00:00:00.000Z'),
+  ];
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: answered },
+    shas: { [`factory/${CARD_ID}`]: 'abcd0001' },
+  });
+  await h.promise;
+  assert.equal(h.calls.addComment.length, 1); // verdict only — no lift, no race with waitForHuman
+});
+
+test('a failing ask-lift NEVER rejects the tick: verdict lands, watermark advances, loop continues', async () => {
+  const h = tickHarness({
+    cards: [qaCard()],
+    comments: { [CARD_ID]: askPendingComments() },
+    shas: { [`factory/${CARD_ID}`]: 'deadbeefcafe' },
+    fail: { liftComments: true },
+  });
+  const summary = await h.promise; // awaits — the tick must resolve, not reject
+  assert.equal(summary.checked, 1); // the verdict post stands; the lift's refetch failed and was logged
+  assert.equal(summary.pass, 1);
+  assert.equal(h.calls.addComment.length, 1); // only the [CHECK:PASS]
+  assert.ok(h.logs.some((l) => l.includes('ask-lift comment fetch failed') && l.includes('lift fetch exploded')));
 });

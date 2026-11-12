@@ -597,9 +597,23 @@ node scripts/factory-daemon.js uninstall
   `[ASK]` comment IS the board-visible "waiting on you" — the ask protocol
   already Discord-pings the owner — and a report head + run-log tail only
   buries the ask the human must read. Non-zero crashes / `spawn-failed`
-  keep posting their crash comments byte-for-byte even under a pending ask
-  (new information the `[ASK]` cannot carry), and `[DAEMON-RESTART]` stops
-  and degraded holds still post.
+  still post under a pending ask (new information the `[ASK]` cannot
+  carry), but the ask-pending hold record is **head-only** — the run-log
+  tail is dropped (RC4 amendment, card 6af60d6a85947225f6ed75a0: it exists
+  for RESUMING runs, and this hold spawns none) — and every daemon
+  bookkeeping post that leaves an ask pending ends with the **ask-lift
+  re-post** (`liftPendingAsk` re-posts the pending `[ASK]` verbatim; the
+  `[CHECK:*]` gate verdict post does the same, since a daemon gate verdict
+  is bookkeeping noise, not supersession), so a waiting human's `[ASK]` is
+  ALWAYS the newest comment (re-posting is the only lift mechanism — edits
+  do not restamp; API-verified). A parked card now **speaks human**: the
+  park comment's FIRST line stays the cap record, its SECOND line names
+  the action (`needs you: reply anything (e.g. "resume") to restart at
+  <stage>`), a THIRD line names the superseded sha-keyed approval ask when
+  a verdict tag outranked one (`supersededApprovalAsk` reads the sha back
+  out of the ask text — comments remain the only state), and the owner gets
+  the same one-liner + card link as a `sendOwnerPing` DM (park was silent
+  before — card 13 parked 4× unnoticed; failure recorded, never thrown).
 - The daemon also **boot-sweeps and supervises the STALL SWEEP** in-process
   (`scripts/lib/factory-stall-sweep.js`; CLI `factory.js stall-sweep`), the
   orphan-recovery twin of the comment watcher. At boot — replacing the old
@@ -1310,6 +1324,20 @@ case-insensitive, matching the board contract):
   member ≠ bot (or `[HUMAN]`-tagged when identity resolution is degraded) —
   byte-for-byte the ask protocol's reply rule; + `unanswered` count. Timeouts
   are not board-observable beyond unanswered/late cases.
+- **Ask-on-top** (`askOnTop`, card 6af60d6a85947225f6ed75a0) — the
+  regression signal for the invariant "a card waiting on a human shows its
+  request as the NEWEST comment": over ALL `needs-human`-labeled cards, is
+  the newest comment human-facing — first line opens `[ASK]` (pending ask)
+  OR second line starts `needs you:` (park action line)? `needsHumanCards`
+  = the labeled population; `scored` = those whose trail could actually be
+  fetched (an unfetchable trail lands in `errors` and the card is EXCLUDED
+  — never a fabricated green or red; the reporting pass fetches the newest
+  comment even for cards untouched in the window); `offenders` = scored
+  cards whose top comment is forensic noise instead of the request; `ok` =
+  every scored card clean AND the population fully scored — `null` when the
+  board has zero needs-human cards (nothing to assert). Headline + summary
+  carry it; offenders render clipped to bounded lists like every other
+  signal line.
 - **`[REVIEW:CHANGES]` dispositions** — per round: `fixed` (new `[IMPL]` landed
   and a later `[REVIEW:APPROVE]` followed it), `dismissed` (intervening
   `[IMPL]` carries dismissal markers — `dismissed`/`won't fix`/`will not
@@ -1464,8 +1492,16 @@ and the resume retries next tick.
   an unanswered `[ASK]` decides `hold` — zero move, zero spawn — and
   stall-family recovery posts no `[DAEMON-CRASH]` at all: the pending
   `[ASK]` comment is the board-visible "waiting on a human" (card
-  6aee77a4db0dd0de45c77d7c); non-zero crashes under a pending ask still
-  post byte-for-byte.
+  6aee77a4db0dd0de45c77d7c); non-zero crashes under a pending ask post the
+  hold record **head-only** — no run-log tail (RC4 amendment, card
+  6af60d6a85947225f6ed75a0: the tail exists so a RESUMING run self-heals;
+  this hold spawns no resume, so the tail only buries the ask) — and every
+  daemon bookkeeping post that leaves an ask pending ends with the
+  **ask-lift re-post** (`liftPendingAsk`): the pending `[ASK]` is re-posted
+  VERBATIM so it is the card's NEWEST comment again — a human must never
+  scroll past forensic noise to find what they owe. Re-posting is the only
+  lift mechanism: a Trello comment EDIT does not restamp or move it
+  (API-verified 2026-11-12).
 - **Live runs dedup silently:** a comment arriving while the card has a live
   run advances the watermark without ack/spawn — the live run owns the card
   (its stage-boundary reads + the ask protocol cover it).

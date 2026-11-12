@@ -96,10 +96,10 @@ import { runDoneWatch } from './lib/factory-done-ping.js';
 import { ensureBootstrapped, launchctl } from './lib/factory-launchd.js';
 import { detectServiceManager } from './lib/factory-platform.js';
 import * as platformSystemd from './lib/factory-platform-systemd.js';
-import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending, countRestartStops } from './lib/factory-comment-resume.js';
+import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending, countRestartStops, liftPendingAsk, supersededApprovalAsk } from './lib/factory-comment-resume.js';
 import { bootStallSweep, superviseStallSweep, runStallSweepWatch } from './lib/factory-stall-sweep.js';
 import { runBlockingChecksWatch } from './lib/factory-blocking-checks.js';
-import { askHuman } from './lib/factory-ask.js';
+import { askHuman, sendOwnerPing } from './lib/factory-ask.js';
 import { loadRegistry, boardIds, repoForCard, repoContextBlock, worktreeFor } from './lib/factory-registry.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -457,6 +457,7 @@ export async function handleRunCrash({
   crashRetries = MAX_CRASH_RETRIES,
   shuttingDown = () => false,
   readRunLog = (path) => readFileSync(path, 'utf8'),
+  notify = sendOwnerPing, // park DM (card 6af60d6a85947225f6ed75a0) — same notify class as the ask protocol; failure recorded, never thrown
 } = {}) {
   if (shuttingDown()) return; // daemon is stopping; leave the card where it is
   const comments = await t.getCardComments(card.id).catch(() => []);
@@ -490,6 +491,11 @@ export async function handleRunCrash({
     ? { mode: 'hold', stage: listName }
     : decideCrashRecovery({ comments, listName, crashRetries, askPending, restartStopped });
   const holdReason = mode === 'hold' && !degraded && askPending ? 'ask-pending' : '';
+  // A park under an ANSWERED/superseded ask names the stale approval in the
+  // comment + DM (card 6af60d6a85947225f6ed75a0, the card-28 shape): the sha
+  // is read back out of the latest `[ASK]` text, the superseding verdict tag
+  // from the verdict that outranked it — comments remain the only state.
+  const superseded = mode === 'park' && !askPending ? supersededApprovalAsk(comments) : null;
   // D4 (card 6aebab9a65613358f4ca333a) — keep the healthy path silent: a
   // stall-family call (exit-0 exit / sweep orphan) that decides a plain
   // left-the-pipeline hold is the NORMAL finish (the run completed its
@@ -519,7 +525,7 @@ export async function handleRunCrash({
     await t
       .addComment(
         card.id,
-        crashCommentText(code, prior, { mode, stage, crashRetries, logPath: `data/factory-daemon/${card.id}.log`, logText, holdReason, restartStopped }),
+        crashCommentText(code, prior, { mode, stage, crashRetries, logPath: `data/factory-daemon/${card.id}.log`, logText, holdReason, restartStopped, superseded }),
       )
       .catch((e) => log(`crash comment failed: ${e.message}`));
   } else if (waitingOnHuman) {
@@ -531,6 +537,20 @@ export async function handleRunCrash({
     const parked = (await t.getLabels({ board })).find((l) => l.name === 'needs-human');
     if (parked) await t.addLabelToCard(card.id, parked.id).catch(() => {});
     log(`crash cap reached for ${card.id}; parked where it stands with needs-human${stage ? ` (${stage})` : ''}`);
+    // Park was SILENT to the owner (card 13 parked 4× before a human
+    // noticed, card 6af60d6a85947225f6ed75a0): DM the same one-liner the park
+    // comment carries + the card link. sendOwnerPing never throws; a
+    // `{ error }` result is recorded in the log — failure recorded, never
+    // thrown, never blocks the park.
+    const parkText =
+      `Factory card parked needs-human: ${card.name} — reply anything (e.g. "resume") to restart at ${stage || 'the current stage'}. ${card.url}` +
+      (superseded ? ` the earlier approval ask for sha ${superseded.sha} was superseded by ${superseded.tag}.` : '');
+    try {
+      const ping = await notify({ text: parkText, board });
+      if (ping && ping.error) log(`park ping failed: ${ping.error}`);
+    } catch (e) {
+      log(`park ping failed: ${String(e?.message ?? e)}`);
+    }
   } else if (mode === 'resume') {
     if (!spawnResumeRun) {
       log(`crash recovery wants a resume for ${card.id} at ${stage} but no spawn seam is wired; card untouched`);
@@ -557,6 +577,16 @@ export async function handleRunCrash({
         : `crashed run for ${card.id} (exit ${code}); card sits in ${stage || 'an unknown list'} — outside the pipeline, untouched`,
     );
   }
+  // Ask-on-top invariant (card 6af60d6a85947225f6ed75a0): every daemon
+  // bookkeeping post that leaves a `[ASK]` pending ends by re-posting that
+  // ask top-of-card — re-posting is the ONLY lift mechanism (Trello edits do
+  // not restamp; API-verified 2026-11-12). This runs AFTER the mode block, so
+  // a park under a still-pending ask lands park comment + `needs-human`
+  // FIRST and the ask LAST (card 13's 08:23Z park shape). `askPending` is the
+  // pre-fetch strict verdict; the fresh `decideAskLift` inside dedups
+  // (ask already newest → no post), honors answers, and treats a superseding
+  // AGENT verdict as a no-op (D1). Never rejects (liftPendingAsk's contract).
+  if (askPending) await liftPendingAsk(card.id, { t, log });
 }
 
 // ---------------------------------------------------------------------------

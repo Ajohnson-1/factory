@@ -31,6 +31,7 @@ import {
   buildMetricsSummary,
   computeCardMetrics,
   computeMetrics,
+  askOnTopOk,
   extractCostSpent,
   parseDispatchHeaders,
   percentile,
@@ -1071,4 +1072,106 @@ test('40. BOUNCE_TAGS mirror equals the curator list exactly — no drift', () =
   const m = computeCardMetrics(card('n'.repeat(24), 'Gate verdicts'), trail, W);
   assert.equal(m.bounces.windowTagTally, 1, 'raw tally counts exactly the [CHECK:FAIL]');
   assert.equal(m.bounces.lifetime, 1, 'netted gate (countBounces) counts it too');
+});
+
+// ---------------------------------------------------------------------------
+// 41-44. askOnTop — the ask-on-top invariant guardrail (card
+// 6af60d6a85947225f6ed75a0): a needs-human card's NEWEST comment must be the
+// human-facing request (`[ASK]` first line, or a park comment whose SECOND
+// line is the `needs you:` action).
+// ---------------------------------------------------------------------------
+
+test('41. askOnTopOk: [ASK] newest → true; park action line 2 → true; crash noise on top → false; empty/undated → false; array order never trusted', () => {
+  const ask = c(d(2, 5), '[ASK] approve sha abc1234?');
+  const parkTop = c(d(2, 6), '[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands (Implement)\nneeds you: reply anything (e.g. "resume") to restart at Implement.');
+  const noise = c(d(2, 7), '[DAEMON-CRASH] run exited 1; stage-aware resume at Implement (crash 1/3)\n\n--- run log tail (p.log, last ≤40 lines / ≤4000 chars) ---\nboom');
+  assert.equal(askOnTopOk([ask, c(d(2, 4), '[IMPL] evidence')]), true);
+  assert.equal(askOnTopOk([c(d(2, 4), '[IMPL] evidence'), ask]), true); // oldest-first input — dates decide, not array order
+  assert.equal(askOnTopOk([ask, parkTop].reverse()), true); // park newest → second line names the action
+  assert.equal(askOnTopOk([noise, ask]), false); // forensic noise buries the ask — the card-28 shape
+  assert.equal(askOnTopOk([]), false);
+  assert.equal(askOnTopOk([c('not-a-date', '[ASK] undated')]), false); // undated = unprovable = violation
+});
+
+test('42. computeMetrics.askOnTop: needsHumanCards/scored/ok/offenders roll-up; unfetched trails excluded; zero needs-human → ok:null', () => {
+  const good = card('g'.repeat(24), 'Waiting on ask', { labels: NEEDS_HUMAN });
+  const bad = card('b'.repeat(24), 'Buried ask', { labels: NEEDS_HUMAN });
+  const unpicked = card('u'.repeat(24), 'Trail unreadable', { labels: NEEDS_HUMAN });
+  const clean = card('c'.repeat(24), 'Done and clean');
+  const rep = computeMetrics({
+    cards: [good, bad, unpicked, clean],
+    commentsByCard: {
+      [a24('g')]: [c(d(2, 4), '[IMPL] evidence'), c(d(2, 5), '[ASK] approve sha?')],
+      [a24('b')]: [c(d(2, 5), '[ASK] approve sha?'), c(d(2, 6), '[DAEMON-CRASH] run exited 1; stage-aware resume at QA (crash 1/3)')],
+      // unpicked: no trail entry at all — the fetch failed; excluded, never guessed
+    },
+    me,
+    sinceIso: SINCE,
+    untilIso: UNTIL,
+    prodWatch: { status: 'up' },
+    daemonLogs: [],
+  });
+  assert.deepEqual(rep.askOnTop, {
+    needsHumanCards: 3,
+    scored: 2,
+    ok: false,
+    offenders: [a24('b')],
+  });
+  // all needs-human clean → ok:true
+  const ok = computeMetrics({
+    cards: [good, bad],
+    commentsByCard: {
+      [a24('g')]: [c(d(2, 5), '[ASK] approve sha?')],
+      [a24('b')]: [c(d(2, 5), '[DAEMON-CRASH] parked (Implement)\nneeds you: reply anything (e.g. "resume") to restart at Implement.')],
+    },
+    me, sinceIso: SINCE, untilIso: UNTIL, prodWatch: null, daemonLogs: [],
+  });
+  assert.deepEqual(ok.askOnTop, { needsHumanCards: 2, scored: 2, ok: true, offenders: [] });
+  // zero needs-human cards → null — never a fabricated green
+  const none = computeMetrics({ cards: [clean], commentsByCard: {}, me, sinceIso: SINCE, untilIso: UNTIL, prodWatch: null, daemonLogs: [] });
+  assert.deepEqual(none.askOnTop, { needsHumanCards: 0, scored: 0, ok: null, offenders: [] });
+});
+
+test('43. headline + summary carry the ask-on-top guardrail (n/a / ok / VIOLATED with offenders)', () => {
+  const bad = card('b'.repeat(24), 'Buried', { labels: NEEDS_HUMAN });
+  const rep = computeMetrics({
+    cards: [bad],
+    commentsByCard: { [a24('b')]: [c(d(2, 5), '[ASK] approve?'), c(d(2, 6), '[DAEMON-CRASH] noise')] },
+    me, sinceIso: SINCE, untilIso: UNTIL, prodWatch: { status: 'up' }, daemonLogs: [],
+  });
+  const line = buildMetricsHeadline(rep);
+  assert.ok(line.includes('needs-human ask-on-top VIOLATED (1/1'), line);
+  assert.ok(line.includes(`offenders ${a24('b')}`), line);
+  const summary = buildMetricsSummary(rep);
+  assert.ok(summary.includes('ask-on-top (needs-human): VIOLATED — scored 1/1'), summary);
+  const none = computeMetrics({ cards: [card('c'.repeat(24), 'Clean')], commentsByCard: {}, me, sinceIso: SINCE, untilIso: UNTIL, prodWatch: { status: 'up' }, daemonLogs: [] });
+  assert.ok(buildMetricsHeadline(none).includes('needs-human ask-on-top n/a (0/0)'));
+  const good = computeMetrics({
+    cards: [card('g'.repeat(24), 'Good', { labels: NEEDS_HUMAN })],
+    commentsByCard: { [a24('g')]: [c(d(2, 5), '[ASK] approve?')] },
+    me, sinceIso: SINCE, untilIso: UNTIL, prodWatch: { status: 'up' }, daemonLogs: [],
+  });
+  assert.ok(buildMetricsHeadline(good).includes('needs-human ask-on-top ok (1/1)'));
+  assert.ok(buildMetricsHeadline(good).includes('ask-on-top'), 'AC: the family name is in the headline (test 27 includes-style contract)');
+});
+
+test('44. runMetricsReport fetches the newest comment for UNTOUCHED needs-human cards and errors out unfetchable ones (no fabricated scoring)', async () => {
+  // A card parked long ago: its whole trail pre-dates the window.
+  const parked = card(a24('p'), 'Parked in September', { labels: NEEDS_HUMAN });
+  const oldTrail = [c('2025-12-20T00:00:00.000Z', '[IMPL] evidence'), c('2025-12-21T00:00:00.000Z', '[DAEMON-CRASH] run exited 1 after 2 prior crash(es); parking needs-human where it stands (QA)\nneeds you: reply anything (e.g. "resume") to restart at QA.')];
+  const t = fakeTrello({ cards: [parked], comments: { [a24('p')]: oldTrail } });
+  const st = store({ lastRun: SINCE });
+  const r = await runMetricsReport({ t, now: () => d(8, 0), noPost: true, readState: st.readState, writeState: st.writeState, ...noop });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.report.askOnTop, { needsHumanCards: 1, scored: 1, ok: true, offenders: [] }); // scored OFF the limit-1 newest-comment fetch
+
+  // Unfetchable trail → error entry, card EXCLUDED (D6 honesty): never a
+  // fabricated red, ok:false only because the population is unscored.
+  const broken = card('b'.repeat(24), 'Fetch fails', { labels: NEEDS_HUMAN });
+  const t2 = fakeTrello({ cards: [broken], comments: {}, errors: { [`comments:${a24('b')}`]: new Error('ETIMEDOUT') } });
+  const st2 = store({ lastRun: SINCE });
+  const r2 = await runMetricsReport({ t: t2, now: () => d(8, 0), noPost: true, readState: st2.readState, writeState: st2.writeState, ...noop });
+  assert.equal(r2.ok, true);
+  assert.deepEqual(r2.report.askOnTop, { needsHumanCards: 1, scored: 0, ok: false, offenders: [] });
+  assert.ok(r2.report.errors.some((e) => e.includes('ETIMEDOUT')));
 });

@@ -122,6 +122,22 @@ const BOOKKEEPING_TAGS = ['[ASK]', '[HUMAN]', '[RESUME]', '[DAEMON-CRASH]', '[DA
 export const STAGE_VERDICT_TAGS = STAGE_TAGS.filter((tag) => !BOOKKEEPING_TAGS.includes(tag));
 
 /**
+ * The daemon GATE verdicts (blocking-checks poller) — registered in
+ * `STAGE_TAGS` above, and the only `STAGE_VERDICT_TAGS` members the DAEMON
+ * itself posts rather than a stage agent. Crash-recovery DECISIONS keep
+ * treating them as superseding exactly like agent verdicts
+ * (`isAskPending` byte-green). The ask-on-top invariant (card
+ * 6af60d6a85947225f6ed75a0) owns the supersede-set difference:
+ * `decideAskLift` EXCLUDES these two from its supersede set — a gate
+ * verdict is bookkeeping noise over a waiting human, exactly what the
+ * invariant lifts above (accepted consequence: the re-posted ask makes
+ * `isAskPending` true again, so crash recovery holds conservatively until
+ * the human replies — the same semantics a live ask already gets, and
+ * `findApprovalComment` accepts the reply at any date).
+ */
+export const DAEMON_GATE_TAGS = ['[CHECK:PASS]', '[CHECK:FAIL]'];
+
+/**
  * True iff any comment opens with a stage VERDICT tag (case-insensitive).
  * Accepts raw strings or `{ data: { text } }` action items. Bookkeeping tags
  * alone never count — `hasStageVerdict([crashComment])` is false. Note this
@@ -248,8 +264,20 @@ export function decideCrashRecovery({ comments, listName, crashRetries = 2, askP
  * byte-identical — for EVERY mode. `restartStopped: true` renders the same
  * mode shapes under `RESTART_TAG` with "run stopped by SIGTERM (daemon
  * restart)" wording (the self-deploy class — invisible to the crash cap).
+ * Park heads (card 6af60d6a85947225f6ed75a0) stay a cap record FIRST line
+ * (the crash-cap filter reads the first token; metrics and every
+ * `startsWith(CRASH_TAG)` logic unaffected) and gain human-facing lines:
+ * a `needs you:` action second line, and — when `superseded` (from
+ * `supersededApprovalAsk`) names a sha-keyed approval ask a verdict tag
+ * superseded — a third sentence saying so. `superseded = null` (every other
+ * mode, and park under a still-pending ask) leaves the head 2 lines.
+ * TAILLESS exception (RC4 amendment, same card): `hold` +
+ * `holdReason === 'ask-pending'` returns the HEAD ONLY — the Factor-9
+ * run-log tail exists so a RESUMING run self-heals from failure text, and
+ * this hold spawns no resume: the tail serves nobody while burying the
+ * pending `[ASK]` the human must read.
  */
-export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRetries = 2, logPath = '', logText = '', holdReason = '', restartStopped = false } = {}) {
+export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRetries = 2, logPath = '', logText = '', holdReason = '', restartStopped = false, superseded = null } = {}) {
   const n = `${prior + 1}/${crashRetries + 1}`;
   // Restart-stops (self-deploy class) post under RESTART_TAG — invisible to
   // the crash cap — with the same mode shapes; crash wording stays byte-
@@ -260,6 +288,13 @@ export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRe
   let head;
   if (mode === 'park') {
     head = `${tag} ${death} after ${prior} prior ${restartStopped ? 'restart-stop(s)' : 'crash(es)'}; parking needs-human where it stands${stage ? ` (${stage})` : ''}`;
+    // Park speaks human (card 6af60d6a85947225f6ed75a0): the cap record stays
+    // the FIRST line; the second line names the action so a parked card's
+    // top-of-card comment is self-contained.
+    head += `\nneeds you: reply anything (e.g. "resume") to restart at ${stage || 'the current stage'}.`;
+    if (superseded) {
+      head += `\nthe earlier approval ask for sha ${superseded.sha} was superseded by ${superseded.tag}; a fresh approval ask will follow the re-run.`;
+    }
   } else if (mode === 'resume') {
     head = `${tag} ${death}; stage-aware resume at ${stage} (${unit} ${n})`;
   } else if (mode === 'hold' && holdReason === 'ask-pending') {
@@ -271,6 +306,11 @@ export function crashCommentText(code, prior, { mode = 'requeue', stage, crashRe
   } else {
     head = `${tag} ${death}; re-queueing to Ready (${unit} ${n})`;
   }
+  // RC4 amendment (card 6af60d6a85947225f6ed75a0): the ask-pending hold is
+  // HEAD ONLY — its run-log tail exists for RESUMING runs (Factor 9) and
+  // this hold spawns no resume, so the tail serves nobody while burying the
+  // pending `[ASK]`. Resume/requeue/park keep the tail unchanged (D2).
+  if (mode === 'hold' && holdReason === 'ask-pending') return head;
   const tail = crashTail(logText);
   if (!tail) return head;
   const header = `\n\n--- run log tail (${logPath}, last ≤${CRASH_TAIL_LINES} lines / ≤${CRASH_TAIL_CHARS} chars) ---\n`;
@@ -324,6 +364,53 @@ function isAskText(text) {
   return /^\[ASK\]/i.test(textOf(text).trim());
 }
 
+// Bracket-shape tag detection (NOT isStageTagText — its token regex never
+// matches the hyphenated [DAEMON-CRASH]/[PROD-CLOSE]; same literal-prefix
+// precedent as hasStageVerdict). Any bracketed tag = bot-side per the
+// factory-context.js curator's rule; untagged = human.
+const bracketTagOf = (text) =>
+  textOf(text).trimStart().match(/^\[[A-Z0-9_.-]+(?::[A-Z0-9_.-]+)?\]/i)?.[0]?.toUpperCase() ?? null;
+
+// Comments newest-first by parsed date; undated items sort last
+// (NEGATIVE_INFINITY), ties keep Trello's order (input index). Shared by the
+// pending-ask scans and supersededApprovalAsk — one ordering rule board-wide.
+function newestFirst(comments) {
+  return (Array.isArray(comments) ? comments : [])
+    .map((c, i) => ({ c, i, ms: msOf(c) }))
+    .sort((x, y) => {
+      const xm = Number.isFinite(x.ms) ? x.ms : Number.NEGATIVE_INFINITY;
+      const ym = Number.isFinite(y.ms) ? y.ms : Number.NEGATIVE_INFINITY;
+      return ym - xm || x.i - y.i; // newest first; ties keep Trello's order
+    });
+}
+
+/**
+ * The still-UNANSWERED latest dated `[ASK]` entry (`{ c, i, ms }`) or null —
+ * the shared core of `isAskPending` and `decideAskLift`. A later UNTAGGED
+ * comment or `[HUMAN]` relay ANSWERS the ask; a later comment where
+ * `supersedes(text)` holds supersedes it (the pipeline moved on); later
+ * bookkeeping leaves it pending. Same-second comments after the ask do NOT
+ * count (fail toward pending = fail toward zero-move). Undated latest ask →
+ * null (undated = unprovable).
+ */
+function findPendingAsk(comments, supersedes) {
+  const list = newestFirst(comments);
+  const ask = list.find(({ c }) => isAskText(c));
+  if (!ask || !Number.isFinite(ask.ms)) return null;
+  for (const { c, ms } of list) {
+    if (!Number.isFinite(ms) || ms <= ask.ms) continue;
+    const tag = bracketTagOf(c);
+    if (tag == null || tag === '[HUMAN]') return null; // human reply / relay answers the ask
+    if (supersedes(c)) return null; // stage progress supersedes the ask
+  }
+  return ask;
+}
+
+const verdictSupersedes = (c) => {
+  const t = textOf(c).trimStart().toUpperCase();
+  return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag));
+};
+
 /**
  * True when a blocking `[ASK]` on this card is still UNANSWERED (D2, card
  * 6aebab9a65613358f4ca333a): the latest `[ASK]` comment exists and no later
@@ -340,31 +427,88 @@ function isAskText(text) {
  * stall sweep both read this — one pending-ask definition on the board.
  */
 export function isAskPending(comments) {
-  const list = (Array.isArray(comments) ? comments : [])
-    .map((c, i) => ({ c, i, ms: msOf(c) }))
-    .sort((x, y) => {
-      const xm = Number.isFinite(x.ms) ? x.ms : Number.NEGATIVE_INFINITY;
-      const ym = Number.isFinite(y.ms) ? y.ms : Number.NEGATIVE_INFINITY;
-      return ym - xm || x.i - y.i; // newest first; ties keep Trello's order
-    });
-  const ask = list.find(({ c }) => isAskText(c));
-  if (!ask || !Number.isFinite(ask.ms)) return false;
-  // Bracket-shape tag detection (NOT isStageTagText — its token regex never
-  // matches the hyphenated [DAEMON-CRASH]/[PROD-CLOSE]; same literal-prefix
-  // precedent as hasStageVerdict). Any bracketed tag = bot-side per the
-  // factory-context.js curator's rule; untagged = human.
-  const bracketTag = (text) => textOf(text).trimStart().match(/^\[[A-Z0-9_.-]+(?::[A-Z0-9_.-]+)?\]/i)?.[0]?.toUpperCase() ?? null;
-  const verdictTag = (text) => {
-    const t = textOf(text).trimStart().toUpperCase();
-    return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag));
+  return findPendingAsk(comments, verdictSupersedes) !== null;
+}
+
+/**
+ * Ask-on-top invariant core (card 6af60d6a85947225f6ed75a0): when a pending
+ * `[ASK]` is NOT the card's newest comment, return the ask's VERBATIM text —
+ * re-posting is the only lift mechanism (a Trello comment EDIT does not
+ * restamp or move it; API-verified 2026-11-12). Null when nothing should
+ * post: no pending ask, answered/superseded, or the newest comment already
+ * byte-equals the ask text (dedup, D5 — repeated lifts are impossible while
+ * nothing newer lands). The supersede set differs from `isAskPending`'s by
+ * EXCLUDING `DAEMON_GATE_TAGS` (D1): daemon gate verdicts are exactly the
+ * bookkeeping noise to lift above; AGENT verdicts supersede — no lift.
+ */
+export function decideAskLift(comments) {
+  const agentVerdictSupersedes = (c) => {
+    const t = textOf(c).trimStart().toUpperCase();
+    return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag) && !DAEMON_GATE_TAGS.includes(tag));
   };
-  for (const { c, ms } of list) {
-    if (!Number.isFinite(ms) || ms <= ask.ms) continue;
-    const tag = bracketTag(c);
-    if (tag == null || tag === '[HUMAN]') return false; // human reply / relay answers the ask
-    if (verdictTag(c)) return false; // stage progress supersedes the ask
+  const ask = findPendingAsk(comments, agentVerdictSupersedes);
+  if (!ask) return null;
+  const askText = textOf(ask.c);
+  const latest = newestFirst(comments).find(({ ms }) => Number.isFinite(ms));
+  if (latest && textOf(latest.c) === askText) return null; // already top-of-card (D5)
+  return askText;
+}
+
+/**
+ * Lift the card's pending `[ASK]` top-of-card: fetch comments → decide →
+ * re-post VERBATIM. `{ lifted: true }` when the re-post landed, `{ lifted:
+ * false }` otherwise (no pending ask, deduped, or a failed read/post —
+ * logged, NEVER rejects: the watch-loop's never-reject robustness; Trello
+ * read-after-write lag degrades to "no lift this post, next bookkeeping post
+ * retries" — the same never-reject retry class).
+ */
+export async function liftPendingAsk(cardId, { t = trello, log = console.log } = {}) {
+  let comments;
+  try {
+    comments = await t.getCardComments(cardId);
+  } catch (e) {
+    log(`ask-lift comment fetch failed for ${cardId}: ${String(e?.message ?? e)} — next bookkeeping post retries`);
+    return { lifted: false };
   }
-  return true;
+  const askText = decideAskLift(comments);
+  if (askText === null) return { lifted: false };
+  try {
+    await t.addComment(cardId, askText);
+  } catch (e) {
+    log(`ask-lift re-post failed for ${cardId}: ${String(e?.message ?? e)} — next bookkeeping post retries`);
+    return { lifted: false };
+  }
+  return { lifted: true };
+}
+
+/**
+ * The superseded sha-keyed approval ask (card 6af60d6a85947225f6ed75a0, the
+ * card-28 shape: approval `[ASK]` quoting a sha → a later verdict tag moved
+ * the pipeline on → park). Scans newest-first like `isAskPending`; then
+ * walks comments NEWER than the latest dated `[ASK]` oldest-first: the first
+ * UNTAGGED/`[HUMAN]` comment means a human ANSWERED → null; the first
+ * `STAGE_VERDICT_TAGS` member (prefix match, INCLUDING `DAEMON_GATE_TAGS` —
+ * a gate verdict moved the pipeline on too) supersedes → `{ sha, tag }` with
+ * the sha read back out of the ask text (`approvalAskText` quotes it —
+ * comments remain the only state; no sha in the ask → not an approval ask →
+ * null). Bookkeeping tags (crash/restart/ask/resume/metrics) are skipped —
+ * keep walking. Nothing newer → null (the ask is still pending).
+ */
+export function supersededApprovalAsk(comments) {
+  const list = newestFirst(comments);
+  const ask = list.find(({ c }) => isAskText(c));
+  if (!ask || !Number.isFinite(ask.ms)) return null;
+  const newer = list.filter(({ ms }) => Number.isFinite(ms) && ms > ask.ms).reverse(); // oldest-first walk
+  for (const { c } of newer) {
+    const tag = bracketTagOf(c);
+    if (tag == null || tag === '[HUMAN]') return null; // a human answered the ask
+    const text = textOf(c).trimStart().toUpperCase();
+    const verdict = STAGE_VERDICT_TAGS.find((v) => text.startsWith(v));
+    if (!verdict) continue; // bookkeeping — keep walking
+    const m = textOf(ask.c).match(/\b[0-9a-f]{7,40}\b/i);
+    return m ? { sha: m[0], tag: verdict } : null; // no sha → not an approval ask
+  }
+  return null; // nothing newer — the ask is still pending
 }
 
 /**
