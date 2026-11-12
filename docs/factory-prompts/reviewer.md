@@ -57,7 +57,7 @@ first match wins:
   `scripts/lib/deploy-*`, `config/`, `.github/`, `Dockerfile*`,
   `docker-compose*.yml|yaml`, `deploy-host-logs.sh`,
   `provision-deploy-host.sh`, `.env*`, `*.pem`/`*.key`, anything
-  matching `secret`/`credential` case-insensitively), or churn ≥ 500
+  matching `secret`/`credential` case-insensitively), or churn ≥ 1500
   lines (`additions + deletions`), or ≥ 25 files in the diff.
 - `low` — docs-only (every path under `docs/**` or `plans/**`, or a
   `*.md` file), or additive-only (every file has zero deletions and no

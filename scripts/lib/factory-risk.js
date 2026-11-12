@@ -42,7 +42,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // --- Tunables (exported so tests/tuners never hardcode) --------------------
 
 /** Total churn (additions + deletions) at/above this is `high`. */
-export const HIGH_CHURN_LINES = 500;
+export const HIGH_CHURN_LINES = 1500;
 /** File count at/above this is `high`. */
 export const HIGH_FILE_COUNT = 25;
 

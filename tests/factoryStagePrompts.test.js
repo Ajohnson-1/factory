@@ -222,7 +222,7 @@ describe('stage-specific rules pinned in the docs', () => {
     expect(doc).toMatch(/\bmedium\b/);
     expect(doc).toMatch(/\bhigh\b/);
     expect(doc).toContain('config/'); // always-human anchor
-    expect(doc).toContain('500'); // churn threshold
+    expect(doc).toContain('1500'); // churn threshold
     expect(doc).toContain('25'); // file-count threshold
     expect(doc).toMatch(/does this diff solve the problem the card states/i);
   });
@@ -238,7 +238,7 @@ describe('stage-specific rules pinned in the docs', () => {
       expect(doc).toMatch(/\blow\b/);
       expect(doc).toMatch(/\bmedium\b/);
       expect(doc).toMatch(/\bhigh\b/);
-      expect(doc).toContain('500');
+      expect(doc).toContain('1500');
       expect(doc).toContain('25');
       return;
     }
@@ -253,7 +253,7 @@ describe('stage-specific rules pinned in the docs', () => {
       ['docs-only', [{ path: 'docs/a.md', additions: 10, deletions: 3 }], 'low'],
       ['additive-only', [{ path: 'src/a.js', additions: 10, deletions: 0 }], 'low'],
       ['always-human path', [{ path: 'config/app.json', additions: 1, deletions: 1 }], 'high'],
-      ['churn ≥ 500', [{ path: 'src/a.js', additions: 300, deletions: 220 }], 'high'],
+      ['churn ≥ 1500', [{ path: 'src/a.js', additions: 1000, deletions: 520 }], 'high'],
       ['mixed code edit', [{ path: 'src/a.js', additions: 10, deletions: 4 }], 'medium'],
     ];
     for (const [name, files, expected] of samples) {

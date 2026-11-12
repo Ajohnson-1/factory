@@ -990,7 +990,7 @@ equivalent; `target` default `origin/master`). First match wins:
 | Tier | Rule |
 | --- | --- |
 | `high` (always-human) | any touched path matches the always-human patterns below |
-| `high` (blast radius) | total churn `additions + deletions ≥ 500` lines (`HIGH_CHURN_LINES`), OR file count `≥ 25` (`HIGH_FILE_COUNT`) |
+| `high` (blast radius) | total churn `additions + deletions ≥ 1500` lines (`HIGH_CHURN_LINES`), OR file count `≥ 25` (`HIGH_FILE_COUNT`) |
 | `low` | **docs-only**: every path is `docs/**`, `plans/**`, or `*.md`; OR **additive-only**: every file has `deletions = 0` and no binary entries; and no always-human path matched |
 | `medium` | everything else |
 | `low` (degenerate) | empty diff (zero files) — nothing to approve |

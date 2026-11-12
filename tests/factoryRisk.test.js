@@ -128,7 +128,7 @@ test('classifyDiff: mixed code edit with deletions → medium', () => {
   assert.equal(r.tier, 'medium');
 });
 
-test('classifyDiff: churn ≥ 500 lines → high (blast radius)', () => {
+test('classifyDiff: churn ≥ 1500 lines → high (blast radius)', () => {
   const r = classifyDiff([{ path: 'src/a.js', additions: 300, deletions: HIGH_CHURN_LINES - 300 }]);
   assert.equal(r.tier, 'high');
   assert.match(r.reasons.join(' '), new RegExp(`churn ${HIGH_CHURN_LINES}`));
@@ -145,9 +145,9 @@ test('classifyDiff: file count ≥ 25 → high (blast radius)', () => {
   assert.match(r.reasons.join(' '), new RegExp(`${HIGH_FILE_COUNT} files`));
 });
 
-test('classifyDiff: churn 499 + 24 files with deletions → medium (edge)', () => {
+test('classifyDiff: churn 1499 + 24 files with deletions → medium (edge)', () => {
   const files = [
-    { path: 'src/big.js', additions: 452, deletions: 1 },
+    { path: 'src/big.js', additions: 1452, deletions: 1 },
     ...Array.from({ length: 23 }, (_, i) => ({ path: `src/f${i}.js`, additions: 1, deletions: 1 })),
   ];
   const total = files.reduce((s, f) => s + f.additions + f.deletions, 0);
