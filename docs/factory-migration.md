@@ -251,9 +251,11 @@ a child of the daemon it would stop.
   (+ `com.discordbot.factory-metrics` / `com.ajohnson.factory-sweep` plists if
   present), archive `data/factory-daemon` logs.
   FM-7's discord-bot deletion executed 2026-11-11 at master `0885b59` (factory
-  copies gone; see §5 + the FM-7 deviations section). Laptop plist removal +
-  the Mac reboot (ghost daemon, step 2 caveat) remain operator-owned after the
-  soak — they touch only laptop state, not the deleted repo copies.
+  copies gone; see §5 + the FM-7 deviations section). **Laptop rollback anchors
+  uninstalled 2026-11-12** (see the §9 review bullet): both plists deleted, jobs
+  booted out, stragglers killed; `com.discordbot.factory-metrics` /
+  `com.ajohnson.factory-sweep` plists were not present. Archiving the laptop
+  `data/factory-daemon` logs stays operator-owned.
 
 #### Rollback drill — box → laptop → box (once, inside the soak) ⏳ operator-owned
 
@@ -284,7 +286,7 @@ Run interactively — never from a dispatched run (§7 invariant).
 |---|---|---|
 | ≥7 days always-on on the box | ⏳ soak window ends 2026-11-16 ~17:00Z; boots↔poll-ok 1:1 so far | time |
 | ≥3 Done cards on the box | ⏳ 2 since cutover; FM-6 merge is projected 3rd | pipeline (flows naturally) |
-| laptop agents uninstalled | ⏳ jobs booted out; plist removal after soak; **Mac reboot first** (ghost daemon) | operator (FM-7) |
+| laptop agents uninstalled | ✅ 2026-11-12 — plists deleted + jobs booted out; the reboot alone resurrects the ghost while the plist exists, deletion is the real fix (§9) | operator (FM-7) |
 | rollback rehearsed once (box→laptop→box) | ⏳ drill scheduled inside the soak window | operator (console) |
 | runbook merged | ✅ this commit, merged + self-deployed by the factory pipeline itself | done |
 
@@ -519,3 +521,4 @@ migration is follow-up card candidates.
 - 2026-11-10 - FM-6 canary 6af1fa46fecb634350948a5d Done on the box: first live Linux detached self-restart (systemd-run) converged; [VERIFY:PASS].
 - 2026-11-10 - FM-6 runbook committed (§6.2 executed status + rollback drill). Open operator items: rollback drill before 2026-11-16, Mac reboot (ghost laptop daemon), one discord-bot product card from the box, post-soak plist removal.
 - 2026-11-11 - FM-7 deletion executed: 62 factory files removed from discord-bot master `0885b59` (pushed; AGENTS.md 5-line pointer, test-script trim, `.env.example` DEPLOY_* classifier note; deviations D-7a/b/c recorded above). `npm test` post-deletion: failure set identical to the pre-deletion baseline (14 machine-state suites, better-sqlite3 bindings + missing per-bot config overlays), zero failures referencing deleted paths; `node --test` trio (crashUnhandledRejection/g50ProdRead/localEmbeddings) 25/25 pass. Deploy runners verified post-deletion from `/opt/factory`: `deploy.js build master` exit 0 → image `ghcr.io/ajohnson-1/discord-bot:sha-0885b59` built host-local on the deploy box; `verify-deploy.js` on the running sha: 5/6 checks pass (health×2, memory-boot-consistency, gateway-ready, logs-classifier all clean) — the one fail is `ai-hosts-probe` ECONNREFUSED, the embeddings gateway host 192.168.0.159:8123 down at verify time (machine-state, verified by direct probe; unrelated to the deletion — verify-deploy runs from this repo against the deploy host).
+- 2026-11-12 - FM-7 post-soak review + laptop rollback-anchor uninstall: the day's Mac reboot re-bootstrapped the still-present discord-bot plists (factory-daemon KeepAlive + prod-watch StartInterval), and a second factory-repo `factory-daemon.js run` had been bootstrapped the same morning — three dispatchers racing the box. Owner DMs from NooNooBot (app `842506994865799169`) root-caused: the discord-bot ghost's `.env` carries no `FACTORY_CHANNEL_ID` / `DISCORD_BOT_CHANNEL_ID` / `FACTORY_DISCORD_WEBHOOK`, so `sendOwnerPing` fell back to the owner-DM path with the bot token; the box daemon and the factory-repo laptop daemon both had channel routing configured. Fix: `bootout`/`remove` all laptop jobs, delete `com.ajohnson.factory-daemon` + `com.discordbot.prodwatch` plists, kill stragglers (the daemon was mid-self-deploy of `6af60d6a85947225f6ed75a0`; its run logged the SIGTERM stop + `[Recovery]` block and the box daemon owns the handoff via stall-sweep/comment-resume — box verified active, sole dispatcher at `8af5f82` = origin/master). 48 untracked factory copies restored to the laptop discord-bot checkout were removed (`git clean`; checkout clean except the pre-existing dirty `yarn.lock`). `com.discordbot.factory-metrics` / `com.ajohnson.factory-sweep` plists were not present. Remaining operator items unchanged: rollback drill before 2026-11-16, one discord-bot product card from the box, archive laptop `data/factory-daemon` logs, soak ≥7 days / ≥3 Done.
