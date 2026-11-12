@@ -837,14 +837,18 @@ bot-identity lookup is degraded. Answering in Discord is fine too — then paste
 the answer as a comment on the card (the board stays the single
 source of truth for stage state).
 
-**Approval grammar**: for an approval-gate ask (risk-tier gate, deploy
-approval), a bare `Approved` (any casing, any wording that clearly approves)
-is sufficient — reply matching is by AUTHOR, never by SHA, so echoing the
-sha in the reply is OPTIONAL nicety, never a requirement. A reply that
-approves AND names open concerns ("Approved, but the prompt docs are
+**Approval grammar**: for a PLAIN ask (a stage ambiguity) a bare `Approved`
+(any casing, any wording that clearly approves) is sufficient — reply
+matching is by AUTHOR, never by SHA, so echoing the sha in the reply is
+OPTIONAL nicety, never a requirement. The **risk-tier gate is the
+exception**: its board approvals are sha-KEYED — the comment must mention
+the exact QA-passed sha ("Risk-tiered approval before Deploy"), and a bare
+`Approved` does NOT unlock it (a GitHub PR review at that sha does). A reply
+that approves AND names open concerns ("Approved, but the prompt docs are
 missing") is an approval with feedback: the resumed run treats the concerns
 as findings to address. Dragging the card forward past the gated stage is
-likewise a complete answer (see "Listening for human comments").
+likewise a complete answer for plain asks / resume-drags (see "Listening for
+human comments").
 
 **Not blocking the stage**: `ask --no-wait` posts + pings and returns
 immediately (`{ replied:false, noWait:true }`, exit 0). Later — same run, or a
@@ -1056,6 +1060,64 @@ node scripts/factory.js approve <card> <sha> [branch] [--timeout ms] [--interval
 diff (git-only, zero board writes) — informational; agents may check it early.
 Logic lives in `scripts/lib/factory-risk.js` (dependency-injectable, tested by
 `tests/factoryRisk.test.js`).
+
+### The PR as the mobile approval surface
+
+Typing a 40-char sha into a Trello comment on a phone is a bad approval
+gesture, and the `[ASK]` alone shows no diff. So when the gate must ask
+(medium/high with no approval yet) it ALSO — best-effort — pushes
+`factory/<id>` to origin and opens (or updates) a GitHub pull request
+(`scripts/lib/factory-pr.js`, REST via global `fetch` + `GITHUB_TOKEN`; no
+`gh` CLI needed), so the human's phone shows the REAL diff. The `[ASK]`
+question and the Discord ping lead with
+`Review the diff & approve from your phone: <prUrl>`; the PR body carries the
+tier + reasons, the QA sha, the numstat file table (`classifyDiff`'s
+per-path +A/−D), the Trello card link, and the contract sentence: approving
+at this commit approves merge+Deploy of sha X; a later push requires a fresh
+approval; or reply on the card with the sha. PR lookup keys on
+`head=<owner>:<branch>`; an open PR keyed to a different sha gets its body
+re-keyed (PATCH) plus one issue comment naming the new sha — a rebase's
+re-ask is visible on the PR too.
+
+- **Dual acceptance, never weakened.** The gate accepts EITHER source, each
+  keyed to the EXACT QA sha:
+  1. the board — a sha-keyed human comment, exactly the rules above; and
+  2. a GitHub PR **review approval** — qualifies only when the review is
+     `state === APPROVED`, its `commit_id` equals the gate's sha
+     (case-insensitive), and the reviewer login is in the approver allowlist
+     (`FACTORY_GITHUB_APPROVERS`; default: the repo owner parsed from the
+     origin remote — fail-closed single-approver with zero config). A review
+     at any other commit NEVER counts (a rebase re-keys the approval, the
+     same stale-sha rule as the board path); `CHANGES_REQUESTED` and
+     wrong-commit/non-allowlisted approvals are recorded in the result JSON
+     (`reviews`), never approve. Malformed review payloads fail closed:
+     unrecognized fields never approve.
+- **Mirror comment:** when the gate observes a qualifying PR approval it
+  posts the board comment `[HUMAN] APPROVED <sha> — GitHub PR #<n> review
+  approved by <login>` (comments are the state) and exits 0 with
+  `via: "github-pr-review"`. The mirror is bot-authored, so the board scan
+  ignores it — no self-approval, no double-count; the GitHub review stays
+  independently re-checkable on re-runs.
+- **Wait cadence:** with a live PR the single blocking wait becomes bounded
+  `FACTORY_ASK_POLL_MS` slices and each cycle re-checks the PR reviews (two
+  authenticated GETs). Wrong-sha replies AND wrong-sha / non-allowlisted
+  reviews advance the window — the ask is NEVER re-posted. Timeout semantics
+  are unchanged: exit 1 → `needs-human` park — and the PR STAYS OPEN: approve
+  it on the phone later, drag the card back to Ready, and the re-run's PR
+  approval scan mirrors the decision and exits 0 (late-approve recovery).
+  After the merge + `push origin master`, GitHub marks the PR merged
+  automatically (the head commits land on base).
+- **Everything PR-side is best-effort; everything gate-side stays strict.**
+  No token, `FACTORY_PR_APPROVALS=0`, push failure (one
+  `git fetch origin <branch>` + `git push --force-with-lease` retry after a
+  real non-fast-forward rejection, then degraded — only the factory writes
+  `factory/*` refs), or API error ⇒ the printed result JSON records
+  `pr: { degraded: true, error }`, the ask text is BYTE-IDENTICAL to the
+  sha-only template above, and exit semantics are untouched; a 5xx during
+  the wait degrades that cycle and self-heals next poll. Tier `low` performs
+  ZERO GitHub calls; an existing board approval short-circuits BEFORE the
+  PR machinery. `--auto-approve` stays an in-run omp tool permission, never
+  the human gate.
 
 ## Pinging on Done
 
@@ -1634,3 +1696,13 @@ credentials.
 `FACTORY_APPROVAL_TIMEOUT_MS` (default `FACTORY_ASK_TIMEOUT_MS` or 3600000)
 gates approval waits — see "Risk-tiered approval before Deploy"; no new
 required credentials.
+PR approval surface (all optional; see "The PR as the mobile approval
+surface"): `GITHUB_TOKEN` / `FACTORY_GITHUB_TOKEN` (a fine-grained PAT
+scoped to the factory + discord-bot repos with *pull requests: write* +
+*contents: read*; `FACTORY_GITHUB_TOKEN` wins; absent ⇒ sha-only mode,
+today's behavior, the gate never depends on it), `FACTORY_PR_APPROVALS=0`
+kill switch (zero PR calls), and `FACTORY_GITHUB_APPROVERS` (comma-separated
+GitHub logins allowed to approve via PR review; default = the repo owner
+parsed from the origin remote). The PR push rides the existing ssh deploy key
++ `insteadOf` rewrite (docs/factory-migration.md §3) — no new binaries, no
+new required credentials.

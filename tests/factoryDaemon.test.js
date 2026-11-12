@@ -163,6 +163,8 @@ describe('buildRunPrompt', () => {
     expect(prompt).toContain('needs-human')
     expect(prompt).toContain('leave the card in QA, do NOT merge')
     expect(prompt).toContain('only ever happens post-gate')
+    // card 6af61f32ed767688104029e0: the GitHub PR approval gesture is named
+    expect(prompt).toContain('(or a GitHub PR approval at that sha)')
   })
 
   it('re-keys the risk gate after a merge-guard re-gate rebase (post-rebase sha is the approved sha)', () => {

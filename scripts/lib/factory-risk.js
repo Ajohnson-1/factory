@@ -15,11 +15,29 @@
 // the QA sha and the deployed master sha are byte-identical — the comment
 // keys to the deployed sha too.
 //
+// The human approves from EITHER surface (card 6af61f32ed767688104029e0 —
+// "mobile friendly way to see what is changing"):
+//   1. the board — a sha-keyed human comment, exactly the rule above, and
+//   2. a GitHub PR review at the EXACT sha — when the gate must ask it
+//      best-effort pushes the branch and opens/updates a PR
+//      (scripts/lib/factory-pr.js) so the phone shows the real diff, puts the
+//      PR URL in the `[ASK]` + ping, and accepts Review → Approve (commit_id
+//      keyed like the board path; reviewer must be allowlisted). Observing it
+//      posts a bot-authored mirror comment `[HUMAN] APPROVED <sha> — GitHub
+//      PR #<n> …` (board shows the decision; the board scan drops bot
+//      comments, so no self-approval; the GitHub source stays independently
+//      re-checkable). Every PR-side failure — no token, kill switch
+//      FACTORY_PR_APPROVALS=0, push/API error — degrades to today's sha-only
+//      ask, byte-identical, recorded as `pr:{degraded:true,error}`.
+//
 // Waiting reuses the ask protocol (scripts/lib/factory-ask.js) verbatim:
 // `askHuman({ noWait: true })` posts `[ASK]` + pings Discord once, then a
 // loop of `waitForHuman` collects replies — each qualifying reply is
 // re-checked for the sha; a wrong-sha reply does NOT count and does NOT
-// re-post the ask (one ask post/ping, the wait window advances). Timeout →
+// re-post the ask (one ask post/ping, the wait window advances). With a live
+// PR the single blocking wait becomes bounded `intervalMs` slices and each
+// cycle also re-checks the PR reviews (wrong-sha reviews likewise never
+// re-post the ask). Timeout →
 // {approved:false, timedOut:true} → CLI exit 1 → the scheduler parks the
 // card `needs-human` in QA (NOT a bounce: the gate posts no
 // [REVIEW:CHANGES]/[QA:FAIL]/[VERIFY:FAIL], so bounce budget is untouched;
@@ -36,6 +54,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as trello from './trello.js';
 import { askHuman, waitForHuman, extractHumanReply, sendOwnerPing, envNum, isBotMember } from './factory-ask.js';
+import { ensurePr as defaultEnsurePr, checkPrApprovals as defaultCheckPrApprovals } from './factory-pr.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -79,12 +98,23 @@ export const approvalTimeoutDefault = () =>
 
 /** The `[ASK]` question template. Fixed shape: carries tier + reasons, the
  *  sha appears twice (display + reply instruction), and states the
- *  stale-sha rule (a rebase needs a NEW approval). */
-export const approvalAskText = ({ tier, reasons, sha }) =>
+ *  stale-sha rule (a rebase needs a NEW approval). With a live PR the link
+ *  line leads — the ping brief is `question.slice(0, 300)`
+ *  (factory-ask.js), so the mobile link must sit inside the first ~180
+ *  chars; without a PR the text is byte-identical to today's. */
+export const approvalAskText = ({ tier, reasons, sha, prUrl }) =>
+  (prUrl ? `Review the diff & approve from your phone: ${prUrl}\n` : '') +
   `Approval required (risk tier ${tier}: ${reasons.join('; ')}). ` +
   `Merge+Deploy of sha ${sha} is held until a human approves THIS sha. ` +
   `To approve, post a comment containing the sha, e.g. "[HUMAN] APPROVED ${sha}". ` +
   `Comments keyed to another sha do not count — after a rebase/QA re-run a new approval is required.`;
+
+/** Board mirror of a GitHub PR review approval (docs/factory.md "Gate
+ *  protocol"): the PR-side decision rides the board — comments are the
+ *  state. Bot-authored, so `findApprovalComment` ignores it (no
+ *  self-approval, no double-count); the GitHub review stays the source. */
+export const prMirrorText = ({ sha, number, login }) =>
+  `[HUMAN] APPROVED ${sha} — GitHub PR #${number} review approved by ${login}`;
 
 // --- Tier classification (pure) ---------------------------------------------
 
@@ -238,20 +268,36 @@ export function findApprovalComment(actions, { sha, bot } = {}) {
 /**
  * The risk gate (docs/factory.md "Risk-tiered approval before Deploy").
  * Deps injectable: t (trello client), git, notify (defaults to sendOwnerPing;
- * failure recorded, never thrown), sleep/now (clock seams).
+ * failure recorded, never thrown), sleep/now (clock seams), ensurePr /
+ * checkPrApprovals (GitHub PR surface, scripts/lib/factory-pr.js) + prMeta
+ * (CLI-resolved `{ enabled, slug, baseBranch, approvers }`; null/undefined ⇒
+ * the PR feature is off for this run, zero PR calls, result identical to
+ * today's).
  * Flow:
  *   tier (auto-classified via getDiffStat when not supplied) low →
- *     { required:false, approved:true } with ZERO board calls (criterion 2).
+ *     { required:false, approved:true } with ZERO board calls (criterion 2)
+ *     and ZERO GitHub calls (the PR machinery runs only after this check).
  *   else: existing sha-keyed approval (ANY date — an approval the human
  *     posted earlier, even before this run started, counts: comments are the
- *     state) → { approved:true, via:'existing-comment' }, zero addComment.
- *   else: ONE askHuman({ noWait:true }) post + Discord ping, then a loop of
- *     waitForHuman (date-based; ask once, wait many times). Each qualifying
- *     human reply is re-checked for the sha; a wrong-sha reply is skipped and
- *     the window advances past it (ONE ask post/ping for the whole window,
- *     deadline = original ask + timeoutMs). Expiry → timedOut.
+ *     state) → { approved:true, via:'existing-comment' }, zero addComment,
+ *     short-circuiting BEFORE ensurePr.
+ *   else: best-effort ensurePr (push + open/update the PR) → best-effort PR
+ *     approval scan (late-approve recovery: a review already at the sha
+ *     mirrors `[HUMAN] APPROVED <sha> — GitHub PR #<n> …` to the board and
+ *     exits approved, no ask).
+ *   else: ONE askHuman({ noWait:true }) post + Discord ping (the ask leads
+ *     with the PR URL when live; degraded ⇒ today's text byte-identical),
+ *     then the wait. Without a PR: the exact old loop of waitForHuman
+ *     (date-based; ask once, wait many times) — each qualifying human reply
+ *     is re-checked for the sha; a wrong-sha reply is skipped and the window
+ *     advances past it (ONE ask post/ping for the whole window, deadline =
+ *     original ask + timeoutMs). With a PR: the same wait in bounded
+ *     intervalMs slices, and each cycle also re-checks the PR reviews (two
+ *     GETs; an API failure degrades that cycle and self-heals next poll;
+ *     wrong-sha / non-allowlisted reviews never re-post the ask). Expiry →
+ *     timedOut.
  * → { tier, reasons, required, approved, via?, timedOut?, sha, askCommentId?,
- *     reply?, discord?, polls, waitedMs }
+ *     reply?, discord?, pr?, reviews?, polls, waitedMs }
  */
 export async function approvalGate({
   cardId,
@@ -267,6 +313,9 @@ export async function approvalGate({
   notify = sendOwnerPing,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   now = () => new Date().toISOString(),
+  prMeta = null,
+  ensurePr = defaultEnsurePr,
+  checkPrApprovals = defaultCheckPrApprovals,
 } = {}) {
   const startMs = Date.parse(now());
   let cls = { tier, reasons: reasons ?? [] };
@@ -288,6 +337,67 @@ export async function approvalGate({
   if (existing) {
     return { ...out, required: true, approved: true, via: 'existing-comment', reply: existing, polls, waitedMs: Date.parse(now()) - startMs };
   }
+  // --- Best-effort GitHub PR surface (docs/factory.md "The PR as the mobile
+  // approval surface"). Every failure here is recorded, never thrown: the
+  // gate's exit semantics and the sha-only ask text stay exactly today's.
+  let pr = null; // { number, url } while live
+  let prReviews = null; // non-qualifying reviews seen while waiting
+  let prSeenMs = 0; // reviews at/ before this are already recorded — never re-processed
+  if (prMeta) {
+    if (prMeta.enabled && prMeta.slug) {
+      try {
+        const res = await ensurePr({
+          prMeta,
+          branch,
+          sha,
+          tier: cls.tier,
+          reasons: cls.reasons,
+          files: cls.files ?? [],
+          cardId,
+          git,
+          t,
+        });
+        if (res?.number) pr = { number: res.number, url: res.url };
+        else out.pr = { degraded: true, error: res?.error ?? 'ensurePr returned no PR' };
+      } catch (e) {
+        out.pr = { degraded: true, error: String(e?.message ?? e) };
+      }
+    } else {
+      out.pr = { degraded: true, error: prMeta.disabledReason ?? 'PR approvals disabled' };
+    }
+  }
+  if (pr) {
+    // Existing PR approval scan (covers late-approve recovery: timeout →
+    // needs-human park → the human approves the still-open PR on their phone
+    // → drag back to Ready → this scan finds the review, mirrors it, exits
+    // 0). A check failure degrades the scan only — the ask below still runs.
+    let scan = null;
+    try {
+      scan = await checkPrApprovals({ pr, slug: prMeta.slug, sha, approvers: prMeta.approvers ?? [] });
+    } catch {
+      /* API failure → today's sha-only wait; self-heals in the loop */
+    }
+    if (scan) {
+      const merged = collectReviews(prReviews, scan, prSeenMs);
+      prReviews = merged.reviews;
+      prSeenMs = merged.seenMs;
+    }
+    if (scan?.approval) {
+      const mirror = prMirrorText({ sha, number: pr.number, login: scan.approval.login });
+      const posted = await t.addComment(cardId, mirror);
+      return {
+        ...out,
+        required: true,
+        approved: true,
+        via: 'github-pr-review',
+        reply: { text: mirror, date: posted?.date ?? now(), author: scan.approval.login, via: 'github' },
+        pr,
+        ...(prReviews ? { reviews: prReviews } : {}),
+        polls,
+        waitedMs: Date.parse(now()) - startMs,
+      };
+    }
+  }
   // Date floor: the ask moment captured BEFORE askHuman (post + getCard +
   // Discord ping cost seconds), truncated to whole seconds — the ask
   // protocol's comment-date semantics (factory-ask.js floors at the `[ASK]`
@@ -301,7 +411,7 @@ export async function approvalGate({
   const askFloorIso = new Date(Math.floor(Date.parse(now()) / 1000) * 1000).toISOString();
   const asked = await askHuman({
     cardId,
-    question: approvalAskText({ tier: cls.tier, reasons: cls.reasons, sha }),
+    question: approvalAskText({ tier: cls.tier, reasons: cls.reasons, sha, prUrl: pr?.url }),
     noWait: true,
     t,
     notify,
@@ -317,22 +427,79 @@ export async function approvalGate({
   let sinceIso = askFloorIso;
   const deadlineMs = Date.parse(sinceIso) + timeoutMs;
   let waitedMs = Date.parse(now()) - startMs;
+  const prReturn = (extra) => ({
+    ...out0,
+    ...(pr ? { pr } : {}),
+    ...(prReviews ? { reviews: prReviews } : {}),
+    ...extra,
+  });
+  // One PR review cycle: two authenticated GETs; failures degrade THIS cycle
+  // and self-heal next poll. Returns the approval (mirror posted) or null.
+  const prCycle = async () => {
+    let scan = null;
+    try {
+      scan = await checkPrApprovals({ pr, slug: prMeta.slug, sha, approvers: prMeta.approvers ?? [] });
+    } catch {
+      return null;
+    }
+    if (!scan) return null;
+    const merged = collectReviews(prReviews, scan, prSeenMs);
+    prReviews = merged.reviews;
+    prSeenMs = merged.seenMs;
+    if (!scan.approval) return null;
+    const mirror = prMirrorText({ sha, number: pr.number, login: scan.approval.login });
+    const posted = await t.addComment(cardId, mirror);
+    return prReturn({
+      approved: true,
+      via: 'github-pr-review',
+      reply: { text: mirror, date: posted?.date ?? now(), author: scan.approval.login, via: 'github' },
+      polls,
+      waitedMs,
+    });
+  };
   for (;;) {
     const remaining = deadlineMs - Date.parse(now());
     if (remaining <= 0) {
-      return { ...out0, approved: false, timedOut: true, polls, waitedMs };
+      return prReturn({ approved: false, timedOut: true, polls, waitedMs });
     }
+    if (pr) {
+      // PR live: bounded intervalMs slices (NOT one blocking wait to the
+      // deadline) so each cycle can also poll the PR reviews; the deadline
+      // check above preserves timeout/park semantics exactly.
+      const res = await waitForHuman({ cardId, sinceIso, timeoutMs: Math.min(intervalMs, remaining), intervalMs, t, sleep, now });
+      polls += res.polls ?? 0;
+      waitedMs = Date.parse(now()) - startMs;
+      if (res.replied) {
+        // The reply already passed the ask protocol's qualification (author
+        // rules, bot exclusion, date window); all that remains is the sha
+        // keying — checked directly so the reply object's author/via are
+        // preserved.
+        if (shaMentionRe(sha).test(res.reply.text)) {
+          return prReturn({ approved: true, via: res.reply.via, reply: res.reply, polls, waitedMs });
+        }
+        // Wrong-sha human reply: does not count, does NOT re-post the ask —
+        // advance the window past it and keep waiting until the deadline.
+        // (+1 ms: the ask protocol keeps same-second comments — without the
+        // bump the window could never move past a reply dated exactly at it.)
+        sinceIso = new Date(Date.parse(res.reply.date) + 1).toISOString();
+      }
+      const ok = await prCycle();
+      if (ok) return ok;
+      continue;
+    }
+    // No PR (disabled/degraded): the exact old single-call loop — poll-count
+    // behavior byte-identical to before the PR surface existed.
     const res = await waitForHuman({ cardId, sinceIso, timeoutMs: remaining, intervalMs, t, sleep, now });
     polls += res.polls ?? 0;
     waitedMs = Date.parse(now()) - startMs;
     if (!res.replied) {
-      return { ...out0, approved: false, timedOut: true, polls, waitedMs };
+      return prReturn({ approved: false, timedOut: true, polls, waitedMs });
     }
     // The reply already passed the ask protocol's qualification (author rules,
     // bot exclusion, date window); all that remains is the sha keying —
     // checked directly so the reply object's author/via are preserved.
     if (shaMentionRe(sha).test(res.reply.text)) {
-      return { ...out0, approved: true, via: res.reply.via, reply: res.reply, polls, waitedMs };
+      return prReturn({ approved: true, via: res.reply.via, reply: res.reply, polls, waitedMs });
     }
     // Wrong-sha human reply: does not count, does NOT re-post the ask —
     // advance the window past it and keep waiting until the deadline.
@@ -446,4 +613,22 @@ export async function planApprovalGate({
     // advance the window past it and keep waiting until the deadline.
     sinceIso = new Date(Date.parse(res.reply.date) + 1).toISOString();
   }
+}
+
+/** Merge one PR review scan into the recorded `reviews` list, honoring the
+ *  seen-window (`seenMs`): wrong-sha and non-allowlisted reviews advance the
+ *  window too, so each is recorded once, never re-processed, and the ask is
+ *  NEVER re-posted for them. Pure.
+ * → { reviews: [...] | null, seenMs } */
+function collectReviews(acc, scan, seenMs = 0) {
+  const records = [...(scan?.changesRequested ?? []), ...(scan?.staleApprovals ?? []), ...(scan?.unrecognized ?? [])];
+  const fresh = [];
+  let maxMs = seenMs;
+  for (const r of records) {
+    const ms = Date.parse(r?.date ?? '');
+    if (Number.isFinite(ms) && ms <= seenMs) continue; // already recorded
+    if (Number.isFinite(ms) && ms + 1 > maxMs) maxMs = ms + 1;
+    fresh.push({ login: r?.login ?? null, state: r?.state ?? 'review', commitId: r?.commitId ?? null, reason: r?.reason ?? null, date: r?.date ?? null });
+  }
+  return { reviews: fresh.length ? [...(acc ?? []), ...fresh] : acc ?? null, seenMs: maxMs };
 }

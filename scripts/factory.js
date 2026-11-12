@@ -18,6 +18,7 @@ import { mergeGuard } from './lib/factory-merge-guard.js';
 import { getContext, CONTEXT_STAGES } from './lib/factory-context.js';
 import { runMetricsReport } from './lib/factory-metrics.js';
 import { getDiffStat, classifyDiff, approvalGate, planApprovalGate } from './lib/factory-risk.js';
+import { prGateConfig } from './lib/factory-pr.js';
 import { checkCommands, tipShaOf, runCheckSuite, checkCommentText } from './lib/factory-blocking-checks.js';
 import {
   CASES_PATH,
@@ -714,7 +715,12 @@ const commands = {
     if (!/^[0-9a-f]{7,40}$/.test(sha))
       die('Usage: factory.js approve <card> <sha> [branch] [--timeout <ms>] [--interval <ms>]  (sha = 7-40 hex chars — the QA-passed HEAD)');
     const branch = positional[2] || gitAt(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
-    const res = await approvalGate({ cardId: id, sha, branch, ...flags, git: gitAt });
+    // GitHub PR surface (docs/factory.md "The PR as the mobile approval
+    // surface"): resolve slug from origin, base from the registry, approvers
+    // and the enabled flag from env — best-effort, no argv changes; when
+    // disabled/degraded the gate is byte-identical to sha-only mode.
+    const prMeta = prGateConfig({ git: gitAt, baseBranch: rp.baseBranch || 'master' });
+    const res = await approvalGate({ cardId: id, sha, branch, ...flags, git: gitAt, prMeta });
     out(res);
     process.exit(res.approved ? 0 : 1);
   },
