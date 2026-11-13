@@ -26,6 +26,7 @@ import {
   approvalTimeoutDefault,
   planApprovalGate,
   planApprovalAskText,
+  recentApprovalAsk,
   prMirrorText,
   HIGH_CHURN_LINES,
   HIGH_FILE_COUNT,
@@ -1195,4 +1196,120 @@ test('gate: ensurePr returning degraded (no token) → sha-only mode, ask byte-i
   assert.equal(res.approved, true);
   assert.equal(t.calls.add[0].text, `[ASK] ${approvalAskText({ tier: 'medium', reasons: ['code diff with edits'], sha: SHA })}`);
   assert.equal(res.pr.degraded, true);
+});
+
+// ---------------------------------------------------------------------------
+// 11. Re-ask dedup (card 6af67602dd513e15f44f4d10, 2026-11-13): a gate
+// re-invoked after a crash-resume with the SAME sha must not stack identical
+// `[ASK]` comments — ONE plan approval earned THREE asks and a very unhappy
+// human. `recentApprovalAsk` keys to the sha + its window; both gates then
+// skip the post AND the ping and keep waiting on the existing ask.
+// ---------------------------------------------------------------------------
+
+const askAct = (id, date, sha) =>
+  act(id, date, `[ASK] ${approvalAskText({ tier: 'medium', reasons: ['code diff'], sha })}`, BOT);
+const planAskAct = (id, date) =>
+  act(id, date, `[ASK] ${planApprovalAskText({ cardId: CARD, sha: SHA })}`, BOT);
+
+test('recentApprovalAsk: newest dated ask quoting the sha inside the window; stale/other-sha/untagged/undated → null', () => {
+  const now = () => '2026-01-01T00:00:00.000Z';
+  const timeoutMs = 3_600_000;
+  const fresh1 = askAct('a1', '2025-12-31T23:30:00.000Z', SHA);
+  const fresh2 = askAct('a2', '2025-12-31T23:59:00.000Z', SHA); // newest in-window
+  assert.equal(recentApprovalAsk([fresh1, fresh2], { sha: SHA, timeoutMs, now }).id, 'a2');
+  // Window floor is EXCLUSIVE: dated exactly at now − timeout is stale → fresh post
+  assert.equal(recentApprovalAsk([askAct('b', '2025-12-31T23:00:00.000Z', SHA)], { sha: SHA, timeoutMs, now }), null);
+  // An ask quoting another sha is another era (rebase/re-plan) → fresh post
+  assert.equal(recentApprovalAsk([askAct('c', '2025-12-31T23:59:00.000Z', 'feedface' + SHA.slice(8))], { sha: SHA, timeoutMs, now }), null);
+  // A human comment quoting the sha is an approval, never an ask
+  assert.equal(recentApprovalAsk([act('d', '2025-12-31T23:59:00.000Z', `APPROVED ${SHA}`)], { sha: SHA, timeoutMs, now }), null);
+  // Undated → null (unprovable); a 7-char-prefix ask inside the full-sha text still keys
+  assert.equal(recentApprovalAsk([{ data: { text: `[ASK] ${SHA}` } }], { sha: SHA, timeoutMs, now }), null);
+  assert.equal(recentApprovalAsk([askAct('e', '2025-12-31T23:59:00.000Z', SHA.slice(0, 7))], { sha: SHA, timeoutMs, now }).id, 'e');
+  assert.equal(recentApprovalAsk(undefined, { sha: SHA, timeoutMs, now }), null);
+});
+
+test('planApprovalGate re-invoke with a live ask: ZERO new posts, ZERO pings — the wait continues on the existing ask', async () => {
+  const clock = virtualClock();
+  const pings = [];
+  const t = fakeGateTrello({
+    comments: [
+      [planAskAct('a1', '2025-12-31T23:59:30.000Z')], // scan: the still-live ask (30 s old, window 60 s)
+      [],                                              // poll 1: nothing yet
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)], // poll 2: the approval
+    ],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    notify: async ({ text }) => {
+      pings.push(text);
+      return { sent: true };
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.askDeduped, true);
+  assert.equal(res.askCommentId, 'a1'); // the EXISTING ask id — no new comment
+  assert.equal(res.discord, undefined); // no ping on the dedup path
+  assert.equal(t.calls.add.length, 0); // THREE-ASK trail dead: zero ask posts
+  assert.equal(pings.length, 0);
+});
+
+test('approvalGate re-invoke with a live ask: zero posts/pings; stale ask or new sha still posts fresh', async () => {
+  const clock = virtualClock();
+  const pings = [];
+  const t = fakeGateTrello({
+    comments: [
+      [askAct('a1', '2025-12-31T23:59:30.000Z', SHA)], // scan: live ask (window 60 s)
+      [act('r1', '2026-01-01T00:00:01.000Z', `ok ship ${SHA}`)], // poll 1: sha-bearing human reply
+    ],
+  });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async ({ text }) => {
+      pings.push(text);
+      return { sent: true };
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.askDeduped, true);
+  assert.equal(res.askCommentId, 'a1');
+  assert.equal(t.calls.add.length, 0);
+  assert.equal(pings.length, 0);
+  // Fresh era (ask quotes an OLD sha): the gate posts + pings as ever.
+  const clock2 = virtualClock();
+  const t2 = fakeGateTrello({
+    comments: [
+      [askAct('a0', '2025-12-31T23:59:30.000Z', 'feedface' + SHA.slice(8))], // another era's ask
+      [act('r1', '2026-01-01T00:00:01.000Z', `ok ship ${SHA}`)],
+    ],
+  });
+  const res2 = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t: t2,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    ...clock2,
+  });
+  assert.equal(res2.approved, true);
+  assert.equal(res2.askDeduped, undefined);
+  assert.equal(t2.calls.add.length, 1); // fresh post for the new sha
+  assert.match(t2.calls.add[0].text, new RegExp(SHA, 'i'));
 });

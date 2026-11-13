@@ -549,10 +549,18 @@ node scripts/factory-daemon.js uninstall
   from scratch) happens **only** for crashes before the first stage
   comment — nothing is committed yet, so the re-run redoes nothing.
   A card outside the in-flight lists (Done/Ready/To Do — e.g. an agent
-  that exited non-zero *after* moving itself to Done) is left untouched.
-  At `FACTORY_CRASH_RETRIES` (2) crashes the card parks `needs-human`
-  where it stands. `[DAEMON-CRASH]` counts are read from the card's
-  comments, so the cap survives daemon restarts. When the run log exists
+  that exited non-zero *after* moving itself to Done) is left untouched,
+  and this hold **outranks the crash cap**: a card that left the pipeline
+  is never parked, never labeled, never DM'd (card
+  6af623a7c8924f3e7df3c109: a healthy `[VERIFY:PASS]` → Done arrival got a
+  park report + `needs-human` because the LIFETIME crash count had spent
+  the cap mid-pipeline). At `FACTORY_CRASH_RETRIES` (2) **CONSECUTIVE**
+  trailing `[DAEMON-CRASH]` comments — a streak with no other comment
+  between — the card parks `needs-human` where it stands; any progress
+  between stops (a stage verdict, a human reply) resets the count, so a
+  card that keeps moving forward never burns its cap on end-of-turn
+  stalls. Streaks are read from the card's comments, so the cap survives
+  daemon restarts. When the run log exists
   the comment also embeds the last ≤40 lines / ≤4000 chars of
   `data/factory-daemon/<card>.log` (newest content first, `… (trimmed)`
   marker on a char trim) after the exit-code head line, so the recovering
@@ -593,10 +601,25 @@ node scripts/factory-daemon.js uninstall
   healthy finish stays silent: an exit-0 stall whose card already left the
   in-flight lists (Done etc.) posts NO crash comment — the Done arrival is
   already pinged by done-watch — while non-zero crashes keep posting
-  byte-for-byte. A pending `[ASK]` always decides `hold` (zero move, zero
+  byte-for-byte. The **healthy handoff** stays silent too (D4 extension,
+  card 6af623a7c8924f3e7df3c109): an exit-0 stall whose run posted an AGENT
+  stage verdict after its own run-log spawn header (`# dispatch`/`# resume`)
+  ended its turn on purpose — `[DEPLOY]` → exit before Verify, `[ROLLBACK]`
+  bounce → exit before the fix-forward re-run — resumes stage-aware with NO
+  `[DAEMON-CRASH]` comment; the verdict IS the progress record (`agentVerdictAfterMs`
+  vs `lastSectionStartMs`; unreadable log → unknown start → the comment
+  posts, byte-identical to before). A stall with no fresh verdict since its
+  run started — the loop-protection trail the cap reads — still posts. A
+  pending `[ASK]` always decides `hold` (zero move, zero
   spawn; at the cap the park still out-ranks it and applies `needs-human`
   where the card stands) and no recovery ever restarts work under the
-  human's feet. Stall-family recovery posts **no** `[DAEMON-CRASH]` comment
+  human's feet — and a daemon GATE verdict `[CHECK:*]` NEVER supersedes a
+  pending `[ASK]` for ANY reader (`isAskPending` and `decideAskLift` share
+  ONE supersede set: AGENT verdicts supersede, gate verdicts never do): a
+  `[CHECK:PASS]` landing 9 s after an approval ask used to make crash
+  recovery resume the run under the human's feet and force the identical
+  re-ask (card 6af623a7c8924f3e7df3c109, the double-`[ASK]` + first cap
+  burn). Stall-family recovery posts **no** `[DAEMON-CRASH]` comment
   while an ask is pending (card 6aee77a4db0dd0de45c77d7c): the pending
   `[ASK]` comment IS the board-visible "waiting on you" — the ask protocol
   already Discord-pings the owner — and a report head + run-log tail only
@@ -967,6 +990,15 @@ node scripts/factory.js plan-approve <card> <sha> [--timeout ms] [--interval ms]
   degraded identity → tagged-only. A **wrong-sha reply does not count and
   does not re-post the ask** (one ask post/ping per window; the wait
   window advances past it).
+- **Re-ask dedup for a re-invoked gate** (both gates, `recentApprovalAsk`):
+  a gate re-invoked with the SAME sha while a dated `[ASK]` quoting that sha
+  is still inside its approval window (newer than now − timeout) makes ZERO
+  new posts and ZERO new pings and keeps waiting on the existing ask — a
+  crash-resumed run must not stack identical asks (card
+  6af67602dd513e15f44f4d10: ONE plan approval, THREE identical `[ASK]`s,
+  each from a fresh gate call after a resume). A stale ask (outside its
+  window) or an ask quoting another sha (post-rebase/re-plan era) still
+  posts fresh.
 - **Timeout** → exit 1 → the scheduler labels `needs-human`, leaves the
   card in **Plan**, and stops the run. This is a **park, not a bounce**:
   the gate posts no `[REVIEW:CHANGES]/[QA:FAIL]/[VERIFY:FAIL]`, so the
@@ -1050,6 +1082,11 @@ node scripts/factory.js approve <card> <sha> [branch] [--timeout ms] [--interval
   gate re-asks — including a PRE-MERGE GUARD re-gate rebase: if the tip sha
   changed after approval, re-run `approve` on the new `git rev-parse HEAD`
   (medium/high re-ask and block) before the merge.
+- **Re-ask dedup for a re-invoked gate** — same `recentApprovalAsk` rule as
+  the plan gate above: SAME sha + an ask quoting it still inside its window
+  → zero new posts, zero new pings, the wait continues on the existing ask
+  (visible top-of-card via the daemon's ask-lift). A new sha or a stale ask
+  posts fresh.
 - **Timeout** → exit 1 → the scheduler labels `needs-human`, leaves the card
   in QA, does NOT merge, and stops the run. This is a **park, not a bounce**:
   the gate posts no `[REVIEW:CHANGES]/[QA:FAIL]/[VERIFY:FAIL]`, so the

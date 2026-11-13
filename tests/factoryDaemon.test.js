@@ -21,6 +21,7 @@ import {
   crashTail,
   crashCommentText,
   sigtermStopped,
+  lastSectionStartMs,
   handleRunCrash,
   exitCodeStr,
   isStallCode,
@@ -1092,7 +1093,12 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     expect(t.calls.commentsWritten).toHaveLength(1)
   })
 
-  it('a sweep orphan stall at the cap under a pending [ASK] parks silently (the sweep-race mirror of the example comment)', async () => {
+  it('a sweep orphan stall with OLD crash history + a pending [ASK] holds silently — the ask outranks stale crashes (streak cap)', async () => {
+    // Card-29 semantics: the two crashes (14:26/14:38) are superseded
+    // history — the [ASK] (15:56) is newer than both, so the CONSECUTIVE
+    // trailing crash streak is 0: no park, ask-pending holds, the pending
+    // [ASK] owns the trail (silent; comment 6af1ed5c4b3dd164aeeee2e0 could
+    // not have posted), and the ask is ALREADY newest → lift byte-dedups (D5).
     const asked = [
       cmt('2026-11-09T15:56:02.821Z', '[ASK] Approval required — approve deploy 539e8a4?'),
       crashCmt('2026-11-09T14:26:00.000Z', 1),
@@ -1101,11 +1107,13 @@ describe('handleRunCrash (stage-aware crash recovery — card 6ae96770d68eed22d6
     ]
     const t = fakeT({ comments: asked, idList: VERIFY.id })
     const spawned = []
-    await handleRunCrash({ readRunLog: () => '', card, code: 'stalled (orphan, silent 195 min)', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]), notify: async () => ({ sent: true }) })
-    expect(t.calls.labelAdded).toEqual([[card.id, NEEDS_HUMAN.id]]) // park decision stands
-    expect(t.calls.commentsWritten).toHaveLength(0) // comment 6af1ed5c4b3dd164aeeee2e0 could not have posted; the ask is ALREADY newest here → byte-dedup (D5), so the lift is a no-op too
+    const pings = []
+    await handleRunCrash({ readRunLog: () => '', card, code: 'stalled (orphan, silent 195 min)', t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]), notify: async (p) => { pings.push(p); return { sent: true } } })
+    expect(t.calls.labelAdded).toEqual([]) // stale crashes never park a waiting card
+    expect(t.calls.commentsWritten).toHaveLength(0)
     expect(t.calls.moves).toEqual([])
     expect(spawned).toHaveLength(0)
+    expect(pings).toHaveLength(0) // no park → no DM
   })
 
   // ---- ask-on-top invariant sequences (card 6af60d6a85947225f6ed75a0) ----
@@ -1663,5 +1671,143 @@ describe('FM-5 install/status/uninstall platform dispatch (docs/factory-migratio
 
   it('darwin dispatches to launchd with zero probing — the launchd suites above are the UNCHANGED proof', () => {
     expect(detectServiceManager({ platform: 'darwin', env: {} })).toBe('launchd')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Crash-recovery noise cuts (card 6af623a7c8924f3e7df3c109, 2026-11-13): a
+// healthy card must never accumulate crash-report noise — Done outranks the
+// cap, verdicts between crashes reset the cap, deliberate turn-ends are
+// silent handoffs, and gate verdicts never supersede a pending [ASK].
+// ---------------------------------------------------------------------------
+
+describe('crash-recovery noise cuts (card 6af623a7c8924f3e7df3c109)', () => {
+  const READY = { id: 'L-ready', name: 'Ready', closed: false }
+  const IMPL = { id: 'L-impl', name: 'Implement', closed: false }
+  const VERIFY = { id: 'L-verify', name: 'Verify', closed: false }
+  const DONE = { id: 'L-done', name: 'Done', closed: false }
+  const NEEDS_HUMAN = { id: 'L-needs', name: 'needs-human' }
+  const card = { id: '6af623a7c8924f3e7df3c109', name: 'Noise cuts card', url: 'https://trello.com/c/x' }
+  const cmt = (date, text) => ({ id: `c-${date}`, date, data: { text }, memberCreator: { id: 'botid' } })
+  const crashCmt = (date, n) => cmt(date, `${CRASH_TAG} run exited 1; stage-aware resume at Implement (crash ${n}/3)`)
+  const deployVerdict = (date) => cmt(date, '[DEPLOY] sha=abc123 img=x')
+  const implVerdict = cmt('2026-11-04T01:00:00.000Z', '[IMPL] evidence — commit abc123')
+
+  const fakeT = ({ comments = [], idList = IMPL.id } = {}) => {
+    const calls = { commentsWritten: [], moves: [], labelAdded: [] }
+    return {
+      calls,
+      getCardComments: async () => comments,
+      getCard: async (id) => ({ id, idList }),
+      getLists: async () => [READY, IMPL, VERIFY, DONE, { id: 'L-closed', name: 'Archive', closed: true }],
+      addComment: async (id, text) => {
+        calls.commentsWritten.push({ id, text })
+      },
+      moveCard: async (id, listId) => calls.moves.push([id, listId]),
+      getLabels: async () => [NEEDS_HUMAN],
+      addLabelToCard: async (id, labelId) => calls.labelAdded.push([id, labelId]),
+    }
+  }
+  const noop = () => {}
+  const header = (iso) => `# dispatch ${iso} omp ["-p","--auto-approve"]\nWorking...\n`
+
+  it('lastSectionStartMs: newest dispatch/resume header wins; missing/unparseable → null', () => {
+    expect(lastSectionStartMs('# dispatch 2026-11-04T01:00:00.000Z omp []\nwork\n# resume 2026-11-04T02:00:00.000Z omp []\nmore')).toBe(Date.parse('2026-11-04T02:00:00.000Z'))
+    expect(lastSectionStartMs('no headers here')).toBeNull()
+    expect(lastSectionStartMs('# dispatch not-a-date omp []')).toBeNull()
+    expect(lastSectionStartMs('')).toBeNull()
+  })
+
+  it('D4 EXTENSION: exit-0 stall with a verdict posted AFTER the run header = silent stage-aware resume', async () => {
+    // The card-29 [DEPLOY]→Verify handoff shape: run dispatched 00:30,
+    // [DEPLOY] at 01:00, clean turn end — resume at Verify, ZERO comments.
+    const t = fakeT({ comments: [deployVerdict('2026-11-04T01:00:00.000Z'), implVerdict], idList: VERIFY.id })
+    const spawned = []
+    const logLines = []
+    await handleRunCrash({
+      readRunLog: () => header('2026-11-04T00:30:00.000Z'),
+      card,
+      code: STALL_EXIT_CODE,
+      t,
+      readyList: READY,
+      log: (m) => logLines.push(m),
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(spawned).toHaveLength(1) // the contract continues
+    expect(spawned[0][1]).toContain('continue from Verify')
+    expect(t.calls.commentsWritten).toHaveLength(0) // no [DAEMON-CRASH] on a deliberate handoff
+    expect(t.calls.moves).toEqual([])
+    expect(logLines.some((l) => l.includes('healthy handoff') && l.includes('silent stage-aware resume at Verify'))).toBe(true)
+  })
+
+  it('a stall with NO verdict since the run header is still reported (cap memory intact)', async () => {
+    // Same comments, but the run started AFTER the last verdict — this exit
+    // made no progress: the stall trail that feeds the streak cap must post.
+    const t = fakeT({ comments: [deployVerdict('2026-11-04T01:00:00.000Z'), implVerdict], idList: VERIFY.id })
+    const spawned = []
+    await handleRunCrash({
+      readRunLog: () => header('2026-11-04T01:30:00.000Z'),
+      card,
+      code: STALL_EXIT_CODE,
+      t,
+      readyList: READY,
+      log: noop,
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+    })
+    expect(spawned).toHaveLength(1)
+    expect(t.calls.commentsWritten).toHaveLength(1)
+    expect(t.calls.commentsWritten[0].text).toContain('stage-aware resume at Verify')
+  })
+
+  it('card-29 regression: a Done card at the crash-streak cap exits-0 SILENTLY — no report, no label, no DM', async () => {
+    // The exact 04:10Z [VERIFY:PASS] → Done shape: 3 older crash comments
+    // sit on the card, the run finished cleanly and moved the card to Done.
+    const t = fakeT({
+      comments: [cmt('2026-11-04T04:00:00.000Z', '[VERIFY:PASS] verify-deploy.js exit 0 — verdict PASS 6/6'), crashCmt('2026-11-04T03:00:00.000Z', 3), crashCmt('2026-11-04T02:00:00.000Z', 2), crashCmt('2026-11-04T01:00:00.000Z', 1), implVerdict],
+      idList: DONE.id,
+    })
+    const spawned = []
+    const pings = []
+    const logLines = []
+    await handleRunCrash({
+      readRunLog: () => '',
+      card,
+      code: STALL_EXIT_CODE,
+      t,
+      readyList: READY,
+      log: (m) => logLines.push(m),
+      crashRetries: 2,
+      spawnResumeRun: (c, p) => spawned.push([c, p]),
+      notify: async (p) => { pings.push(p); return { sent: true } },
+    })
+    expect(t.calls.commentsWritten).toHaveLength(0) // the Done arrival is done-watch's announcement
+    expect(t.calls.labelAdded).toEqual([]) // NEVER stamp needs-human on a finished card
+    expect(spawned).toHaveLength(0)
+    expect(pings).toHaveLength(0)
+  })
+
+  it('progress between crashes resets the cap streak — resume with the storm count, never park', async () => {
+    const t = fakeT({ comments: [crashCmt('2026-11-04T03:30:00.000Z', 1), deployVerdict('2026-11-04T03:15:00.000Z'), crashCmt('2026-11-04T03:00:00.000Z', 1), implVerdict] })
+    const spawned = []
+    await handleRunCrash({ readRunLog: () => '', card, code: 1, t, readyList: READY, log: noop, crashRetries: 2, spawnResumeRun: (c, p) => spawned.push([c, p]) })
+    expect(spawned).toHaveLength(1) // streak = 1 < cap 2 — the [DEPLOY] between the crashes is progress
+    expect(t.calls.labelAdded).toEqual([])
+    expect(t.calls.commentsWritten[0].text).toContain('(crash 2/3)') // prior = trailing streak 1, not lifetime
+  })
+
+  it('gate verdict never supersedes a pending [ASK]: crash recovery holds SILENTLY and lifts the ask back on top', async () => {
+    // The card-29 22:27Z shape: [ASK] at 02:00, [CHECK:PASS] at 02:30 (the
+    // daemon's OWN gate verdict), exit-0 stall. Old behavior: resumed the
+    // run under the human's feet + burned the cap. New: silent hold + lift.
+    const t = fakeT({ comments: [cmt('2026-11-04T02:30:00.000Z', '[CHECK:PASS] all 1 blocking checks green'), cmt('2026-11-04T02:00:00.000Z', '[ASK] Approval required — approve the deploy sha?'), implVerdict], idList: VERIFY.id })
+    const spawned = []
+    const logLines = []
+    await handleRunCrash({ readRunLog: () => '', card, code: STALL_EXIT_CODE, t, readyList: READY, log: (m) => logLines.push(m), crashRetries: 2, spawnResumeRun: () => spawned.push(1) })
+    expect(spawned).toHaveLength(0) // no resume under the human's feet
+    expect(t.calls.labelAdded).toEqual([])
+    expect(t.calls.commentsWritten).toEqual([{ id: card.id, text: '[ASK] Approval required — approve the deploy sha?' }]) // only the VERBATIM lift
+    expect(logLines.some((l) => l.includes('pending [ASK] owns the reply'))).toBe(true)
   })
 })

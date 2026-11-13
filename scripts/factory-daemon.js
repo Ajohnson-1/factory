@@ -96,7 +96,7 @@ import { runDoneWatch } from './lib/factory-done-ping.js';
 import { ensureBootstrapped, launchctl } from './lib/factory-launchd.js';
 import { detectServiceManager } from './lib/factory-platform.js';
 import * as platformSystemd from './lib/factory-platform-systemd.js';
-import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending, countRestartStops, liftPendingAsk, supersededApprovalAsk } from './lib/factory-comment-resume.js';
+import { runCommentResumeWatch, buildResumePrompt, decideCrashRecovery, crashCommentText, isAskPending, countRestartStops, countConsecutiveCrashComments, agentVerdictAfterMs, liftPendingAsk, supersededApprovalAsk } from './lib/factory-comment-resume.js';
 import { bootStallSweep, superviseStallSweep, runStallSweepWatch } from './lib/factory-stall-sweep.js';
 import { runBlockingChecksWatch } from './lib/factory-blocking-checks.js';
 import { askHuman, sendOwnerPing } from './lib/factory-ask.js';
@@ -176,6 +176,20 @@ export function sigtermStopped(logText) {
   const s = String(logText ?? '');
   const i = s.lastIndexOf('# dispatch');
   return s.slice(i === -1 ? 0 : i).includes(SIGTERM_STOP_MARKER);
+}
+
+/**
+ * Start time (ms) of the run-log's LAST dispatch/resume section — the spawn
+ * header line (`# dispatch <ISO> …` / `# resume <ISO> …`, written by the
+ * daemon on EVERY spawn) of the section that just died. No header or an
+ * unparseable date → null (unknown: the healthy-handoff check degrades to
+ * posting, i.e. today's byte-identical behavior).
+ */
+export function lastSectionStartMs(logText) {
+  const s = String(logText ?? '');
+  const m = [...s.matchAll(/^# (?:dispatch|resume) (\S+)/gm)].pop();
+  const ms = m ? Date.parse(m[1]) : NaN;
+  return Number.isFinite(ms) ? ms : null;
 }
 
 // The [DAEMON-CRASH] comment builder itself lives in the stage-aware resume
@@ -416,10 +430,12 @@ export async function superviseCommentWatch({
  *     touch nothing. Zero-move is the safe degraded mode — a human comment
  *     then reaches the comment watcher; a drag back to Ready re-runs via
  *     the ordinary poll loop.
- *  4. `decideCrashRecovery`: park at the comment-derived crash cap; resume
+ *  4. `decideCrashRecovery`: hold when the card already left the in-flight
+ *     lists (Done/Ready/To Do/… — FIRST, so a finished card is never
+ *     parked); park at the CONSECUTIVE trailing `[DAEMON-CRASH] streak
+ *     (any verdict or human reply between crashes resets the count); resume
  *     at the current stage once a stage verdict exists (committed work is
- *     never redone); full Ready re-run ONLY before the first stage verdict;
- *     hold when the card already left the in-flight lists (Done/Ready/…).
+ *     never redone); full Ready re-run ONLY before the first stage verdict.
  *     Runs whose log ends in a SIGTERM stop block (`sigtermStopped` — the
  *     self-deploy class: the daemon's own restart killed them) bypass the
  *     crash cap and are tracked via `[DAEMON-RESTART]` comments instead;
@@ -433,7 +449,13 @@ export async function superviseCommentWatch({
  *     hold posts NOTHING (healthy finish — done-watch already pinged it);
  *     ask-pending holds on true-crash codes and degraded holds still post —
  *     a stall-family call under a pending `[ASK]` is the wait itself and
- *     posts NOTHING (card 6aee77a4db0dd0de45c77d7c).
+ *     posts NOTHING (card 6aee77a4db0dd0de45c77d7c). D4 EXTENSION: a
+ *     stall-family RESUME whose run posted an agent stage verdict after its
+ *     own spawn header (`agentVerdictAfterMs` vs `lastSectionStartMs`) is a
+ *     deliberate end-of-turn handoff — it posts NOTHING; the stage-aware
+ *     resume continues the contract without board ceremony (card
+ *     6af623a7c8924f3e7df3c109: `[DEPLOY]`/`[ROLLBACK]` turn-ends burned
+ *     the cap on comments no one asked for).
  *  6. Apply the mode. The crashed run already freed its slot (`runs.delete`
  *     fires before this handler), so the immediate respawn is cap-neutral;
  *     `deferResume(entry)` absorbs the race where the comment watcher
@@ -475,9 +497,11 @@ export async function handleRunCrash({
     logText = readRunLog(logPath);
   } catch {}
   const restartStopped = sigtermStopped(logText);
-  const prior = restartStopped
-    ? countRestartStops(comments)
-    : comments.filter((c) => (c.data?.text ?? '').startsWith(CRASH_TAG)).length;
+  // The cap reads the CONSECUTIVE trailing stop-streak, not the lifetime
+  // total: verdicts between crashes are progress and reset the count (the
+  // card-29 cascade — a healthy 7-hour card spent its cap on end-of-turn
+  // stalls and got parked mid-pipeline, then again at Done).
+  const prior = restartStopped ? countRestartStops(comments) : countConsecutiveCrashComments(comments);
   let listName = '';
   let degraded = false;
   try {
@@ -516,13 +540,22 @@ export async function handleRunCrash({
   // into an approval wait). Every recovery DECISION is unchanged — park still
   // applies needs-human, silently.
   const waitingOnHuman = askPending && !degraded && !restartStopped && isStallCode(code);
+  // D4 EXTENSION (card 6af623a7c8924f3e7df3c109, 2026-11-13): an exit-0 stall
+  // whose run posted a stage verdict AFTER its own spawn header ended its
+  // turn ON PURPOSE — the D20-era pattern of `[DEPLOY]` → exit before Verify,
+  // `[ROLLBACK]` bounce → exit before fix-forward. The stage-aware resume
+  // continues the contract; the handoff itself deserves no `[DAEMON-CRASH]`
+  // comment. A stall with no fresh verdict (or an unreadable log — run start
+  // unknown) still posts: those comments are the stall-loop cap memory.
+  const runStartMs = lastSectionStartMs(logText);
+  const healthyHandoff = mode === 'resume' && isStallCode(code) && agentVerdictAfterMs(comments, runStartMs);
   // (logPath/logText were read up-front: the log tail decides crash vs.
   // restart-stop AND is embedded below so the recovering run self-heals from
   // real failure text, not just an exit number — Factor 9; [VERIFY:FAIL]-
   // embeds-JSON precedent. A missing/unreadable log NEVER blocks the comment
   // or any recovery mode — crashCommentText falls back to the byte-identical
   // exit-code-only head when logText is empty.)
-  if (!silentHold && !waitingOnHuman) {
+  if (!silentHold && !waitingOnHuman && !healthyHandoff) {
     await t
       .addComment(
         card.id,
@@ -531,6 +564,8 @@ export async function handleRunCrash({
       .catch((e) => log(`crash comment failed: ${e.message}`));
   } else if (waitingOnHuman) {
     log(`stall for ${card.id} (${code}) while a pending [ASK] owns the reply — crash comment suppressed (${mode}${stage ? ` at ${stage}` : ''})`);
+  } else if (healthyHandoff) {
+    log(`healthy handoff for ${card.id} (${code}); stage verdict posted since run start — silent stage-aware resume at ${stage}`);
   } else {
     log(`healthy exit for ${card.id} (${code}); card sits in ${stage || 'an unknown list'} — outside the pipeline, comment suppressed`);
   }

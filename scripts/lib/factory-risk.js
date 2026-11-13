@@ -263,6 +263,37 @@ export function findApprovalComment(actions, { sha, bot } = {}) {
   return matches[0] ?? null;
 }
 
+// --- Re-ask dedup -------------------------------------------------------------
+
+/**
+ * The card's NEWEST dated `[ASK]` comment quoting `sha` (≥7-char prefix, the
+ * `shaMentionRe` matcher approvals use) that is still inside its approval
+ * window (dated after `now − timeoutMs`), else null. Re-ask dedup for BOTH
+ * gates: a gate re-invoked by a resumed run with the SAME sha must not
+ * duplicate the ask — the sha keying makes any ask quoting THIS sha the ask
+ * of the current era (a re-plan/rebase changes the sha → null → fresh post).
+ * An ask OLDER than the window is stale — its wait died with its run and the
+ * human may have walked away → null → fresh post + ping (card 6af67602dd513e15f44f4d10,
+ * 2026-11-13: ONE plan approval, THREE identical `[ASK]` comments, each from
+ * a fresh gate call after a crash-resume).
+ */
+export function recentApprovalAsk(actions, { sha, timeoutMs = approvalTimeoutDefault(), now = () => new Date().toISOString() } = {}) {
+  const re = shaMentionRe(sha);
+  const floorMs = Date.parse(now()) - timeoutMs;
+  let best = null;
+  let bestMs = -Infinity;
+  for (const a of Array.isArray(actions) ? actions : []) {
+    const text = String(a?.data?.text ?? a?.text ?? '').trim();
+    if (!/^\[ASK\]/i.test(text)) continue;
+    if (!re.test(text)) continue;
+    const ms = Date.parse(a?.date ?? '');
+    if (!Number.isFinite(ms) || ms <= floorMs || ms <= bestMs) continue;
+    best = a;
+    bestMs = ms;
+  }
+  return best;
+}
+
 // --- The gate ------------------------------------------------------------------
 
 /**
@@ -409,20 +440,30 @@ export async function approvalGate({
   // untagged, so the ask protocol's qualification (author rules + `[HUMAN]`
   // tag) drops it on every poll, never the date window.
   const askFloorIso = new Date(Math.floor(Date.parse(now()) / 1000) * 1000).toISOString();
-  const asked = await askHuman({
-    cardId,
-    question: approvalAskText({ tier: cls.tier, reasons: cls.reasons, sha, prUrl: pr?.url }),
-    noWait: true,
-    t,
-    notify,
-    sleep,
-    now,
-  });
+  // Re-ask dedup: a fresh gate call from a RESUMED run must not duplicate an
+  // ask still inside its window for THIS sha (the trail of card
+  // 6af67602dd513e15f44f4d10: one approval, three identical `[ASK]`s). The
+  // board keeps the wait visible on its own — the daemon's ask-lift re-posts
+  // the pending ask top-of-card after every bookkeeping post — so skip the
+  // comment AND the ping (the original ping already reached the owner; the
+  // timeout park DM is the final escalation). Waiting proceeds unchanged.
+  const dupAsk = recentApprovalAsk(actions, { sha, timeoutMs, now });
+  const asked = dupAsk
+    ? { askCommentId: dupAsk.id, askDeduped: true }
+    : await askHuman({
+        cardId,
+        question: approvalAskText({ tier: cls.tier, reasons: cls.reasons, sha, prUrl: pr?.url }),
+        noWait: true,
+        t,
+        notify,
+        sleep,
+        now,
+      });
   const out0 = {
     ...out,
     required: true,
     askCommentId: asked.askCommentId,
-    discord: asked.discord,
+    ...(asked.askDeduped ? { askDeduped: true } : { discord: asked.discord }),
   };
   let sinceIso = askFloorIso;
   const deadlineMs = Date.parse(sinceIso) + timeoutMs;
@@ -530,7 +571,10 @@ export const planApprovalAskText = ({ cardId, sha }) =>
  * diff gets NO low-tier auto-pass (that would defeat the gate); scan-first
  * (findApprovalComment, any date — comments are the state); else ONE
  * askHuman({noWait:true}) post + Discord ping, then waitForHuman until the
- * deadline; wrong-sha replies don't count, don't re-post, window advances;
+ * deadline; a re-invoke with the SAME sha while an ask quoting it is still
+ * inside its window dedups to ZERO new posts/pings (recentApprovalAsk —
+ * resumed runs never stack identical asks); wrong-sha replies don't count,
+ * don't re-post, window advances;
  * timeout → {required:true, approved:false, timedOut:true} → CLI exit 1 →
  * scheduler parks needs-human IN PLAN (a park, not a bounce).
  * Deps injectable: t (trello client), notify (defaults to sendOwnerPing;
@@ -573,21 +617,28 @@ export async function planApprovalGate({
   // never pass as the approval — it never does: bot-authored, so the ask
   // protocol's qualification drops it on every poll, never the date window.
   const askFloorIso = new Date(Math.floor(Date.parse(now()) / 1000) * 1000).toISOString();
-  const asked = await askHuman({
-    cardId,
-    question: planApprovalAskText({ cardId, sha }),
-    noWait: true,
-    board,
-    t,
-    notify,
-    sleep,
-    now,
-  });
+  // Re-ask dedup (same rule as approvalGate — this gate produced the THREE
+  // identical plan asks on card 6af67602dd513e15f44f4d10): an ask quoting
+  // THIS plan sha inside its window means the wait is alive on the board →
+  // skip the post + ping, keep waiting.
+  const dupAsk = recentApprovalAsk(actions, { sha, timeoutMs, now });
+  const asked = dupAsk
+    ? { askCommentId: dupAsk.id, askDeduped: true }
+    : await askHuman({
+        cardId,
+        question: planApprovalAskText({ cardId, sha }),
+        noWait: true,
+        board,
+        t,
+        notify,
+        sleep,
+        now,
+      });
   const out0 = {
     ...out,
     required: true,
     askCommentId: asked.askCommentId,
-    discord: asked.discord,
+    ...(asked.askDeduped ? { askDeduped: true } : { discord: asked.discord }),
   };
   let sinceIso = askFloorIso;
   const deadlineMs = Date.parse(sinceIso) + timeoutMs;

@@ -27,6 +27,8 @@ import {
   hasStageVerdict,
   decideCrashRecovery,
   countRestartStops,
+  countConsecutiveCrashComments,
+  agentVerdictAfterMs,
   crashCommentText,
   isAskPending,
   decideAskLift,
@@ -962,14 +964,27 @@ test('35. decideCrashRecovery: park / resume / requeue / hold from the card log'
     }),
     { mode: 'requeue', stage: 'Plan' },
   );
-  // park: prior crash count ≥ cap wins over resume/hold; names where it stands
+  // park: CONSECUTIVE trailing crash streak ≥ cap wins over resume; names
+  // where it stands.
   const atCap = [
     cmt('k2', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] run exited 1; stage-aware resume at Implement (crash 2/3)', botMember),
     cmt('k0', '2026-11-03T01:30:00.000Z', '[DAEMON-CRASH] run exited 1; re-queueing to Ready (crash 1/3)', botMember),
     ...implVerdict,
   ];
   assert.deepEqual(decideCrashRecovery({ comments: atCap, listName: 'Implement', crashRetries: 2 }), { mode: 'park', stage: 'Implement' });
-  assert.deepEqual(decideCrashRecovery({ comments: atCap, listName: 'Done', crashRetries: 2 }), { mode: 'park', stage: 'Done' });
+  // The out-of-pipeline hold OUTRANKS the cap (card 6af623a7c8924f3e7df3c109:
+  // a healthy [VERIFY:PASS] → Done arrival got parked needs-human because the
+  // lifetime crash count spent the cap). A finished card is never parked.
+  assert.deepEqual(decideCrashRecovery({ comments: atCap, listName: 'Done', crashRetries: 2 }), { mode: 'hold', stage: 'Done' });
+  // PROGRESS between crashes resets the streak: verdicts (or a human reply)
+  // between the crashes mean the card keeps moving — resume, never park.
+  const progressBetween = [
+    cmt('k2', '2026-11-03T04:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember),
+    cmt('d1', '2026-11-03T03:30:00.000Z', '[DEPLOY] sha=7d048ab', botMember),
+    cmt('k1', '2026-11-03T03:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember),
+    ...implVerdict,
+  ];
+  assert.deepEqual(decideCrashRecovery({ comments: progressBetween, listName: 'Implement', crashRetries: 2 }), { mode: 'resume', stage: 'Implement' });
   // hold: verdict exists but the card left the pipeline (finished, died on exit)
   assert.deepEqual(decideCrashRecovery({ comments: implVerdict, listName: 'Done', crashRetries: 2 }), { mode: 'hold', stage: 'Done' });
   assert.deepEqual(decideCrashRecovery({ comments: implVerdict, listName: 'Ready', crashRetries: 2 }), { mode: 'hold', stage: 'Ready' });
@@ -1100,6 +1115,11 @@ test('39. isAskPending: pending until answered or superseded', () => {
   assert.equal(isAskPending([cmt('k1', '2026-11-03T02:00:00.000Z', '[DAEMON-CRASH] run exited 1; …', botMember), ask]), true);
   assert.equal(isAskPending([cmt('r1', '2026-11-03T02:00:00.000Z', '[RESUME] ack', botMember), ask]), true);
   assert.equal(isAskPending([cmt('a2', '2026-11-03T02:00:00.000Z', '[ASK] still waiting?', botMember), ask]), true);
+  // a daemon GATE verdict does NOT supersede (card 6af623a7c8924f3e7df3c109:
+  // a [CHECK:PASS] 9 s after an approval ask resumed the run under the
+  // human's feet and forced the identical re-ask)
+  assert.equal(isAskPending([cmt('g1', '2026-11-03T02:00:00.000Z', '[CHECK:PASS] all 1 blocking checks green', botMember), ask]), true);
+  assert.equal(isAskPending([cmt('g2', '2026-11-03T02:00:00.000Z', '[CHECK:FAIL] npm test exit 1', botMember), ask]), true);
   // a stage verdict supersedes it (the pipeline moved on)
   assert.equal(isAskPending([cmt('v2', '2026-11-03T02:00:00.000Z', '[IMPL] done', botMember), ask]), false);
   assert.equal(isAskPending([cmt('v3', '2026-11-03T02:00:00.000Z', '[PROD-CLOSE] layer=qa', botMember), ask]), false);
@@ -1545,4 +1565,47 @@ test('56. ACCEPTANCE replay: card-28 trail — ask top-of-card zero-tail while w
   assert.match(lines[0], /after 2 prior crash\(es\); parking needs-human where it stands \(Review\)/); // line 1: cap record
   assert.equal(lines[1], 'needs you: reply anything (e.g. "resume") to restart at Review.'); // line 2: the action
   assert.equal(lines[2], 'the earlier approval ask for sha 539e8a4f2c1d was superseded by [REVIEW:CHANGES]; a fresh approval ask will follow the re-run.'); // line 3: the stale approval
+});
+
+// 57. countConsecutiveCrashComments + agentVerdictAfterMs (card
+// 6af623a7c8924f3e7df3c109): the cap reads the CONSECUTIVE trailing crash
+// streak — progress between stops resets it — and the healthy-handoff signal
+// reads agent verdicts after a moment (gate verdicts excluded).
+test('57. countConsecutiveCrashComments: trailing streak, progress breaks it; agentVerdictAfterMs excludes gate verdicts', () => {
+  const k = (id, date, n) => cmt(id, date, `[DAEMON-CRASH] run exited 1; … (crash ${n}/3)`, botMember);
+  const r = (id, date) => cmt(id, date, '[DAEMON-RESTART] run stopped by SIGTERM (daemon restart); …', botMember);
+  assert.equal(countConsecutiveCrashComments([]), 0);
+  assert.equal(countConsecutiveCrashComments(undefined), 0);
+  // trailing consecutive, newest-first (fixtures vary in array order)
+  assert.equal(countConsecutiveCrashComments([k('k2', '2026-11-04T02:00:00.000Z', 2), k('k1', '2026-11-04T01:00:00.000Z', 1)]), 2);
+  assert.equal(countConsecutiveCrashComments([k('k1', '2026-11-04T01:00:00.000Z', 1), k('k2', '2026-11-04T02:00:00.000Z', 2)]), 2);
+  // a verdict between crashes BREAKS the streak (progress)
+  assert.equal(
+    countConsecutiveCrashComments([k('k2', '2026-11-04T04:00:00.000Z', 2), cmt('v', '2026-11-04T03:00:00.000Z', '[DEPLOY] sha=abc', botMember), k('k1', '2026-11-04T02:00:00.000Z', 1)]),
+    1,
+  );
+  // a human reply breaks it too
+  assert.equal(
+    countConsecutiveCrashComments([k('k2', '2026-11-04T04:00:00.000Z', 2), cmt('h', '2026-11-04T03:00:00.000Z', 'continue please', HUMAN), k('k1', '2026-11-04T02:00:00.000Z', 1)]),
+    1,
+  );
+  // [DAEMON-RESTART] breaks the CRASH streak — restart stops never burn a
+  // crash retry (card 6af1fa46fecb634350948a5d stays byte-green)
+  assert.equal(countConsecutiveCrashComments([k('k1', '2026-11-04T01:00:00.000Z', 1), r('r1', '2026-11-04T00:00:00.000Z')]), 1);
+  assert.equal(countConsecutiveCrashComments([r('r1', '2026-11-04T02:00:00.000Z'), k('k1', '2026-11-04T01:00:00.000Z', 1)]), 0);
+  // mid-sentence tag mentions never count (first-token rule)
+  assert.equal(countConsecutiveCrashComments([cmt('x', '2026-11-04T03:00:00.000Z', 'a human asks about [DAEMON-CRASH] mid-sentence', HUMAN), k('k1', '2026-11-04T02:00:00.000Z', 1)]), 0);
+
+  const startMs = Date.parse('2026-11-04T01:00:00.000Z');
+  // agent verdict newer than the run start → healthy handoff
+  assert.equal(agentVerdictAfterMs([cmt('v1', '2026-11-04T01:30:00.000Z', '[DEPLOY] sha=abc', botMember)], startMs), true);
+  // older verdict → not this run's progress
+  assert.equal(agentVerdictAfterMs([cmt('v0', '2026-11-04T00:30:00.000Z', '[IMPL] evidence', botMember)], startMs), false);
+  // a DAEMON GATE verdict is not the run's progress
+  assert.equal(agentVerdictAfterMs([cmt('g1', '2026-11-04T01:30:00.000Z', '[CHECK:PASS] all green', botMember)], startMs), false);
+  // bookkeeping and human comments never qualify
+  assert.equal(agentVerdictAfterMs([cmt('a1', '2026-11-04T01:30:00.000Z', '[ASK] ok?', botMember), cmt('h1', '2026-11-04T01:40:00.000Z', 'approved', HUMAN)], startMs), false);
+  // undated comments and bad moments → false (unprovable)
+  assert.equal(agentVerdictAfterMs([{ data: { text: '[DEPLOY] sha=abc' }, memberCreator: botMember }], startMs), false);
+  assert.equal(agentVerdictAfterMs([cmt('v1', '2026-11-04T01:30:00.000Z', '[DEPLOY] sha=abc', botMember)], null), false);
 });

@@ -124,16 +124,19 @@ export const STAGE_VERDICT_TAGS = STAGE_TAGS.filter((tag) => !BOOKKEEPING_TAGS.i
 /**
  * The daemon GATE verdicts (blocking-checks poller) — registered in
  * `STAGE_TAGS` above, and the only `STAGE_VERDICT_TAGS` members the DAEMON
- * itself posts rather than a stage agent. Crash-recovery DECISIONS keep
- * treating them as superseding exactly like agent verdicts
- * (`isAskPending` byte-green). The ask-on-top invariant (card
- * 6af60d6a85947225f6ed75a0) owns the supersede-set difference:
- * `decideAskLift` EXCLUDES these two from its supersede set — a gate
- * verdict is bookkeeping noise over a waiting human, exactly what the
- * invariant lifts above (accepted consequence: the re-posted ask makes
- * `isAskPending` true again, so crash recovery holds conservatively until
- * the human replies — the same semantics a live ask already gets, and
- * `findApprovalComment` accepts the reply at any date).
+ * itself posts rather than a stage agent. A gate verdict is bookkeeping
+ * noise over a waiting human — NOT an answer and NOT pipeline progress — so
+ * it NEVER supersedes a pending `[ASK]` (docs/factory.md "Independent
+ * blocking checks": "a daemon gate verdict is bookkeeping noise, not
+ * supersession"). The pending-ask supersede set (`verdictSupersedes`, shared
+ * by `isAskPending` and `decideAskLift`) EXCLUDES these two for that
+ * reason. The card-29 regression (card 6af623a7c8924f3e7df3c109,
+ * 2026-11-12): a `[CHECK:PASS]` landing 9 s AFTER an approval `[ASK]`
+ * superseded it under the old isAskPending set, so crash recovery resumed
+ * the run under the human's feet — burning a crash retry AND forcing the
+ * resumed run to re-post the identical `[ASK]`. `supersededApprovalAsk`
+ * still counts gate verdicts (a gate FAIL did move the pipeline on — the
+ * bounce is real stage progress for THAT report).
  */
 export const DAEMON_GATE_TAGS = ['[CHECK:PASS]', '[CHECK:FAIL]'];
 
@@ -151,34 +154,44 @@ export function hasStageVerdict(comments) {
   });
 }
 
-/** Prior `[DAEMON-CRASH]` comments — byte-compatible with the daemon's cap filter. */
-function countCrashComments(comments) {
-  return (Array.isArray(comments) ? comments : []).filter((c) => textOf(c).startsWith(CRASH_TAG)).length;
+/**
+ * Trailing CONSECUTIVE comments opening with `tag` — date-sorted newest-first
+ * via the shared `newestFirst` ordering. ANY other comment between stops (a
+ * stage verdict, a human reply, another tag) breaks the streak: stops with no
+ * progress between them are what "the pipeline keeps dying in place" looks
+ * like, while a card that keeps landing verdicts between stops is making
+ * progress and never accumulates a streak.
+ */
+function countTagStreak(comments, tag) {
+  let n = 0;
+  for (const { c } of newestFirst(comments)) {
+    if (!textOf(c).startsWith(tag)) break;
+    n += 1;
+  }
+  return n;
 }
 
 /**
  * CONSECUTIVE trailing `[DAEMON-RESTART]` comments — the restart-stop storm
- * signal. Sorted newest-first by date like `latestStageTag` (Trello returns
- * newest-first; fixtures vary), so this is the leading run of restart
- * bookkeeping: ANY other comment between stops (a stage verdict, a crash, a
- * human reply) breaks the streak — stops with no progress between them are
- * what "the daemon keeps dying mid-run" looks like, while a card that
- * self-deploys once an evening never accumulates one.
+ * signal (daemon flap without progress). A card that self-deploys once an
+ * evening never accumulates one.
  */
 export function countRestartStops(comments) {
-  const list = (Array.isArray(comments) ? comments : [])
-    .map((c, i) => ({ c, i, ms: msOf(c) }))
-    .sort((x, y) => {
-      const xm = Number.isFinite(x.ms) ? x.ms : Number.NEGATIVE_INFINITY;
-      const ym = Number.isFinite(y.ms) ? y.ms : Number.NEGATIVE_INFINITY;
-      return ym - xm || x.i - y.i;
-    });
-  let n = 0;
-  for (const { c } of list) {
-    if (!textOf(c).startsWith(RESTART_TAG)) break;
-    n += 1;
-  }
-  return n;
+  return countTagStreak(comments, RESTART_TAG);
+}
+
+/**
+ * CONSECUTIVE trailing `[DAEMON-CRASH]` comments — the crash-storm signal the
+ * retry cap reads ([DAEMON-RESTART] breaks the streak: restart stops stay
+ * invisible to the crash cap, card 6af1fa46fecb634350948a5d). CONSECUTIVE is
+ * the whole point (card 6af623a7c8924f3e7df3c109, 2026-11-13): a healthy
+ * 7-hour card posted verdicts between every crash, yet the LIFETIME total
+ * spent the cap and parked its finished Done card `needs-human` with a crash
+ * report on top of [VERIFY:PASS]. Progress between crashes resets the count;
+ * only a card dying in place escalates to park.
+ */
+export function countConsecutiveCrashComments(comments) {
+  return countTagStreak(comments, CRASH_TAG);
 }
 
 /**
@@ -194,11 +207,24 @@ function isInFlightList(listName) {
 /**
  * Pure crash-recovery decision (card 6ae96770d68eed22d6069c6e — Factor 12:
  * resume from the log, never redo committed work). The daemon's crashed runs
- * (dispatch OR resume) ask the card itself what to do:
+ * (dispatch OR resume) ask the card itself what to do, in this order:
  *
- *  - `park`   — prior `[DAEMON-CRASH]` count ≥ `crashRetries`: needs-human
- *               where the card stands; no move, no spawn (comment-derived
- *               counting keeps the cap surviving daemon restarts).
+ *  - `hold` (first)  — card NOT in-flight (Done / Ready / To Do / unknown /
+ *               unreadable board state): log only, zero moves, zero labels.
+ *               A card that LEFT the pipeline is finished or parked by a
+ *               human — the crash cap NEVER parks it (card
+ *               6af623a7c8924f3e7df3c109: a healthy [VERIFY:PASS] → Done
+ *               arrival got a `[DAEMON-CRASH] park (Done)` + `needs-human`
+ *               because the lifetime crash count outranked this check).
+ *               An agent that exits non-zero AFTER moving the card to Done
+ *               finished the contract; re-queuing that card would re-run a
+ *               completed pipeline. A human drag back to Ready re-runs via
+ *               the ordinary poll loop.
+ *  - `park`   — `crashRetries` CONSECUTIVE trailing `[DAEMON-CRASH] comments
+ *               (`countConsecutiveCrashComments` — any other comment between
+ *               crashes, verdict or human reply, resets the count): needs-
+ *               human where the card stands; no move, no spawn. Comment-
+ *               derived counting keeps the cap surviving daemon restarts.
  *  - `resume` — a stage verdict exists AND the card sits in an open in-flight
  *               list: re-enter at `deriveResumeStage` — the stuck-Verify and
  *               `[ROLLBACK]`→Implement traps apply to crash recovery for free
@@ -207,18 +233,13 @@ function isInFlightList(listName) {
  *               nothing is committed, so the fold loses nothing when it
  *               restarts (the reservation the old comment-resume exception
  *               made general).
- *  - `hold`   — card NOT in-flight (Done / Ready / To Do / unknown / unreadable
- *               board state): log only, zero moves. An agent that exits
- *               non-zero AFTER moving the card to Done finished the contract;
- *               re-queuing that card would re-run a completed pipeline. A
- *               human drag back to Ready re-runs via the ordinary poll loop.
  *  - `askPending` (card 6aebab9a65613358f4ca333a — D2) — caller passes the
  *               `isAskPending(comments)` verdict: a pending `[ASK]` means the
  *               card is WAITING ON A HUMAN, so hold (zero move, zero spawn)
  *               even mid-pipeline — a stage-aware resume would restart work
  *               under the human's feet while their answer is still owed.
  *               Evaluated AFTER the park cap so stall/ask loops still
- *               escalate to `needs-human` at the comment-derived cap.
+ *               escalate to `needs-human` at the cap.
  *  - `restartStopped` (the self-deploy class, card 6af1fa46fecb634350948a5d)
  *               — caller passes `sigtermStopped(runLogText)`: the run died to
  *               a SIGTERM from the daemon's OWN (re)start (a `factory` run
@@ -235,16 +256,18 @@ function isInFlightList(listName) {
  */
 export function decideCrashRecovery({ comments, listName, crashRetries = 2, askPending = false, restartStopped = false } = {}) {
   const name = String(listName ?? '').trim();
+  // Finished / parked-by-a-human beats EVERYTHING — especially the park cap:
+  // parking a card that already left the pipeline stamps needs-human on a
+  // completed card (the card-29 Done park).
+  if (!isInFlightList(name)) return { mode: 'hold', stage: name };
   if (restartStopped) {
     if (countRestartStops(comments) >= crashRetries) return { mode: 'park', stage: name };
     if (askPending) return { mode: 'hold', stage: name };
-    if (!isInFlightList(name)) return { mode: 'hold', stage: name };
     if (!hasStageVerdict(comments)) return { mode: 'requeue', stage: 'Plan' };
     return { mode: 'resume', stage: deriveResumeStage({ listName: name, comments }) };
   }
-  if (countCrashComments(comments) >= crashRetries) return { mode: 'park', stage: name };
+  if (countConsecutiveCrashComments(comments) >= crashRetries) return { mode: 'park', stage: name };
   if (askPending) return { mode: 'hold', stage: name };
-  if (!isInFlightList(name)) return { mode: 'hold', stage: name };
   if (!hasStageVerdict(comments)) return { mode: 'requeue', stage: 'Plan' };
   return { mode: 'resume', stage: deriveResumeStage({ listName: name, comments }) };
 }
@@ -406,10 +429,34 @@ function findPendingAsk(comments, supersedes) {
   return ask;
 }
 
+// The single pending-ask supersede set (shared by `isAskPending` and
+// `decideAskLift`): only AGENT stage verdicts move the pipeline on. DAEMON
+// GATE verdicts ([CHECK:*]) are explicitly NOT supersession — the blocking-
+// checks poller posts them regardless of the human's reply, and one landing
+// above a live approval ask used to make crash recovery resume the run
+// under the human's feet (the card-29 double-[ASK] + cap burn).
 const verdictSupersedes = (c) => {
   const t = textOf(c).trimStart().toUpperCase();
-  return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag));
+  return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag) && !DAEMON_GATE_TAGS.includes(tag));
 };
+
+/**
+ * True when some comment opens with an AGENT stage VERDICT tag (gate verdicts
+ * excluded, same set as `verdictSupersedes`) and is dated strictly after
+ * `ms`. The healthy-handoff signal for crash recovery (D4 extension): a run
+ * whose own section posted a verdict after its `# dispatch`/`# resume` header
+ * ENDED ITS TURN ON PURPOSE — stage-aware resume continues it, but the exit
+ * is a handoff, not a stall, and deserves no `[DAEMON-CRASH]` comment.
+ * Undated comments never qualify (unprovable, same rule as `findPendingAsk`).
+ */
+export function agentVerdictAfterMs(comments, ms) {
+  if (!Number.isFinite(ms)) return false;
+  return (Array.isArray(comments) ? comments : []).some((c) => {
+    if (!verdictSupersedes(c)) return false;
+    const cm = msOf(c);
+    return Number.isFinite(cm) && cm > ms;
+  });
+}
 
 /**
  * True when a blocking `[ASK]` on this card is still UNANSWERED (D2, card
@@ -417,8 +464,10 @@ const verdictSupersedes = (c) => {
  * comment answers or supersedes it. Authorship needs no `getMe` identity —
  * the board contract tags every bot comment (the ask protocol's degraded
  * fast-path and the `factory-context.js` curator use the same signal):
- * a later UNTAGGED comment or `[HUMAN]` relay ANSWERS the ask; a later stage
- * VERDICT tag supersedes it (the pipeline moved on); later `[ASK]`/`[RESUME]`/
+ * a later UNTAGGED comment or `[HUMAN]` relay ANSWERS the ask; a later AGENT
+ * stage VERDICT tag supersedes it (the pipeline moved on) — daemon GATE
+ * verdicts `[CHECK:*]` do NOT (bookkeeping noise, not supersession; the
+ * card-29 double-[ASK] regression). Later `[ASK]`/`[RESUME]`/
  * `[DAEMON-CRASH]` bookkeeping leaves it pending (crash comments landing on a
  * waiting card must not erase the human's owed answer). Same-second comments
  * after the ask do NOT count as replies (fail toward pending = fail toward
@@ -437,16 +486,12 @@ export function isAskPending(comments) {
  * restamp or move it; API-verified 2026-11-12). Null when nothing should
  * post: no pending ask, answered/superseded, or the newest comment already
  * byte-equals the ask text (dedup, D5 — repeated lifts are impossible while
- * nothing newer lands). The supersede set differs from `isAskPending`'s by
- * EXCLUDING `DAEMON_GATE_TAGS` (D1): daemon gate verdicts are exactly the
- * bookkeeping noise to lift above; AGENT verdicts supersede — no lift.
+ * nothing newer lands). One supersede set board-wide (`verdictSupersedes`):
+ * AGENT verdicts supersede — no lift; DAEMON gate verdicts never do (they
+ * are exactly the bookkeeping noise the invariant lifts above).
  */
 export function decideAskLift(comments) {
-  const agentVerdictSupersedes = (c) => {
-    const t = textOf(c).trimStart().toUpperCase();
-    return STAGE_VERDICT_TAGS.some((tag) => t.startsWith(tag) && !DAEMON_GATE_TAGS.includes(tag));
-  };
-  const ask = findPendingAsk(comments, agentVerdictSupersedes);
+  const ask = findPendingAsk(comments, verdictSupersedes);
   if (!ask) return null;
   const askText = textOf(ask.c);
   const latest = newestFirst(comments).find(({ ms }) => Number.isFinite(ms));
