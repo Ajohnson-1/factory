@@ -734,6 +734,12 @@ and acts on the exit code. No LLM can skip it.
 
 ## CLI
 
+`<card>` accepts the internal 24-char hex id, a `trello.com/c/<token>` URL
+(including a `#comment-…` fragment), or the bare 8-char short link from that
+URL. Short links are CASE-SENSITIVE; the CLI resolves one to the internal id
+with a single API call, so `factory/<id>` branches, worktrees, and daemon
+state keys are identical whichever form was pasted.
+
 ```sh
 node scripts/factory.js init                     # ensure lists + needs-human label
 node scripts/factory.js status                   # board snapshot JSON

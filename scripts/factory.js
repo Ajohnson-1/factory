@@ -45,10 +45,19 @@ const die = (msg) => {
   process.exit(1);
 };
 
-function parseCardId(s) {
-  const m = String(s ?? '').match(t.CARD_ID_RE);
-  if (!m) die(`Not a Trello card id or URL: ${s}`);
-  return m[0].toLowerCase();
+// Accepts a 24-char card id, an 8-char short link, or a trello.com/c/… URL;
+// short links resolve to the internal id over one API call (trello.js
+// resolveCardId), so branches/worktrees/state keys stay id-based whichever
+// form the caller pasted.
+async function parseCardId(s) {
+  let id = null;
+  try {
+    id = await t.resolveCardId(s);
+  } catch (e) {
+    die(`Not a Trello card id or URL: ${s} (${String(e.message).split('\n')[0]})`);
+  }
+  if (!id) die(`Not a Trello card id or URL: ${s}`);
+  return id;
 }
 
 async function findList(name, board) {
@@ -215,7 +224,7 @@ const commands = {
   },
 
   async desc() {
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     let text = args.slice(1).join(' ');
     if (text === '-') text = await readStdin();
     if (!text.trim()) die('Empty description text (pass text, or "-" to read stdin)');
@@ -312,7 +321,7 @@ const commands = {
   },
 
   async read() {
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     const [card, comments] = await Promise.all([t.getCard(id), t.getCardComments(id)]);
     out({
       ...card,
@@ -331,7 +340,7 @@ const commands = {
   // unknown-layer precedent); logic lives in scripts/lib/factory-context.js.
   async context() {
     const { positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     // parseFlags keeps unknown --flags (and their values) positional; pull
     // the value flag out of the remainder by hand (prod-close precedent).
     const takeValue = (name) => {
@@ -368,7 +377,7 @@ const commands = {
     const board = boardOf();
     const noCloseCheck = args.includes('--no-close-check');
     const { flags, positional } = parseFlags(args.filter((a) => a !== '--no-close-check'));
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     if (!positional[1]) die('Usage: factory.js move <card> <listName>');
     const list = await findList(positional[1], board);
     if (list.name.toLowerCase() === 'done' && !noCloseCheck) {
@@ -406,7 +415,7 @@ const commands = {
   },
 
   async comment() {
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     let text = args.slice(1).join(' ');
     if (text === '-') text = await readStdin();
     if (!text.trim()) die('Empty comment text (pass text, or "-" to read stdin)');
@@ -421,7 +430,7 @@ const commands = {
   // Unknown layer → exit 1 with the valid list.
   async 'prod-close'() {
     const { positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     // parseFlags keeps unknown --flags (and their values) positional; pull
     // the value flags out of the remainder by hand (seed-audit precedent).
     const takeValue = (name) => {
@@ -579,7 +588,7 @@ const commands = {
 
   async label() {
     const board = boardOf();
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     const name = args[1] || 'needs-human';
     const boardInfo = await t.getBoard({ board });
     let label = (await t.getLabels({ board })).find((l) => l.name === name);
@@ -614,7 +623,7 @@ const commands = {
   async ask() {
     const board = boardOf();
     const { flags, positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     let question = positional.slice(1).join(' ');
     if (question === '-') question = await readStdin();
     if (!question.trim())
@@ -629,7 +638,7 @@ const commands = {
   async wait() {
     const board = boardOf();
     const { flags, positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     const res = await waitForHuman({ cardId: id, ...flags, board });
     out(res);
     if (res.timedOut) process.exit(1);
@@ -709,7 +718,7 @@ const commands = {
     const rp = repoOf();
     const gitAt = gitIn(rp.repoDir);
     const { flags, positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     const sha = String(positional[1] ?? '').toLowerCase();
     if (!/^[0-9a-f]{7,40}$/.test(sha))
       die('Usage: factory.js approve <card> <sha> [branch] [--timeout <ms>] [--interval <ms>]  (sha = 7-40 hex chars — the QA-passed HEAD)');
@@ -729,7 +738,7 @@ const commands = {
   async 'plan-approve'() {
     const board = boardOf();
     const { flags, positional } = parseFlags(args);
-    const id = parseCardId(positional[0]);
+    const id = await parseCardId(positional[0]);
     const sha = (positional[1] || '').toLowerCase();
     if (!/^[0-9a-f]{7,40}$/.test(sha))
       die('Usage: factory.js plan-approve <card> <sha> [--timeout <ms>] [--interval <ms>]  (sha = plan-commit HEAD — 7-40 hex chars)');
@@ -749,7 +758,7 @@ const commands = {
   async 'blocking-checks'() {
     const board = boardOf();
     if (!args[0]) die('Usage: factory.js blocking-checks <card>');
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     // Repo routing FIRST (§4.4/D3): the card's repo comes from its
     // labels/board; unroutable cards fall back to the registry defaultRepo,
     // exactly like the CLI's flagless default today. The branch tip is then
@@ -809,7 +818,7 @@ const commands = {
   // [REVIEW:CHANGES], bad JSON payload, unknown index/verdict) exits 1 so a
   // broken classifications payload can never silently proceed.
   async 'review-verify'() {
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     let raw = args[1];
     if (raw === '-') raw = await readStdin();
     if (!raw || !raw.trim())
@@ -829,7 +838,7 @@ const commands = {
   // with no [REVIEW:VERIFY] yet + # [SEC:FINDINGS] + # [QA:FAIL] +
   // # [VERIFY:FAIL]). Read-only.
   async bounces() {
-    const id = parseCardId(args[0]);
+    const id = await parseCardId(args[0]);
     out(await countBounces(await t.getCardComments(id)));
   },
 

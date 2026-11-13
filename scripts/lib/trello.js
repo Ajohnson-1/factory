@@ -30,6 +30,29 @@ const creds = {
 
 export const BOARD = process.env.TRELLO_BOARD || fileEnv.TRELLO_BOARD || 'ZHkVYBN1';
 export const CARD_ID_RE = /[0-9a-f]{24}/i;
+// Card references come in two forms: the internal 24-char hex id (accepted
+// case-insensitively) and the 8-char alphanumeric SHORT LINK that Trello
+// URLs carry — `https://trello.com/c/<token>/91-slug`. The REST API resolves
+// a short link on /cards/{id}, but short links are CASE-SENSITIVE: never
+// lowercase one. The URL branch runs first because a card URL's
+// `#comment-<24hex>` fragment holds the comment's id, which the bare-id
+// regex would otherwise extract (the exact misparse this ordering prevents).
+const CARD_SHORT_URL_RE = /trello\.com\/c\/([0-9a-zA-Z]{8})(?:[/?#]|$)/;
+const CARD_SHORT_RE = /^[0-9a-zA-Z]{8}$/;
+
+// Pure classifier for CLI card args: a trello.com/c/… URL, a bare 8-char
+// short link, or a 24-char internal id (matched anywhere, so legacy URLs
+// embedding the id still resolve). Returns { kind: 'id' | 'short', value }
+// — ids lowercased, short links case-preserved — or null when unparseable.
+export function parseCardRef(s) {
+  const str = String(s ?? '').trim();
+  const url = str.match(CARD_SHORT_URL_RE);
+  if (url) return { kind: 'short', value: url[1] };
+  const id = str.match(CARD_ID_RE);
+  if (id) return { kind: 'id', value: id[0].toLowerCase() };
+  if (CARD_SHORT_RE.test(str)) return { kind: 'short', value: str };
+  return null;
+}
 
 const BASE = 'https://api.trello.com/1';
 
@@ -83,6 +106,18 @@ export const getBoardCards = (fields = 'id,name,idList,labels,due,url', opts = {
   request('GET', `/boards/${B(opts)}/cards`, { fields, limit: 250 });
 export const getCard = (id, fields = 'id,name,desc,url,idList,labels', opts = {}) =>
   request('GET', `/cards/${id}`, { fields });
+// Resolve any accepted card reference (parseCardRef) to the internal 24-char
+// id — everything downstream keys on it: the factory/<id> branch + worktree,
+// daemon state JSON, [PROD-WATCH] eval seeds. An id passes through with zero
+// API calls; a short link costs one GET (card-scoped calls ignore `board`,
+// so none is threaded here). `fetchCard` is injectable for tests.
+export async function resolveCardId(s, fetchCard = getCard) {
+  const ref = parseCardRef(s);
+  if (!ref) return null;
+  if (ref.kind === 'id') return ref.value;
+  const card = await fetchCard(ref.value, 'id');
+  return card && card.id ? String(card.id).toLowerCase() : null;
+}
 // Bot identity for the ask protocol's author matching (factory-ask.js): { id, username, fullName, ... }
 // NOTE: the path is /members/me — /members/me/all 404s on the live API (the
 // `all` association suffix is not accepted for `me`), which had silently
