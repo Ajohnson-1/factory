@@ -143,6 +143,12 @@ reasons + the sha twice + reply/stale-sha rules — plus a Discord ping. **No
 diff**: the human must `git diff` or open GitHub themselves to see what is
 changing. That is the card's complaint, and Delta's answer.
 
+> **Update (card 6af61f32ed767688104029e0):** the Phase-1 *record + approval
+> visibility* answer now ships first-party as the GitHub PR the gate opens when
+> it asks (docs/factory.md "The PR as the mobile approval surface") — phone-readable
+> diff + review-approve at the sha, mirrored `[HUMAN]` on the card. The Delta
+> phases below are unaffected; this study remains the richer long-term path.
+
 **What changes for the gate under Delta (Phases 1–2):**
 
 1. The `[ASK]` comment gains the card's **Delta thread link** (shared to the

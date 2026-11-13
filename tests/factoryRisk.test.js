@@ -26,6 +26,7 @@ import {
   approvalTimeoutDefault,
   planApprovalGate,
   planApprovalAskText,
+  prMirrorText,
   HIGH_CHURN_LINES,
   HIGH_FILE_COUNT,
   ALWAYS_HUMAN,
@@ -128,7 +129,7 @@ test('classifyDiff: mixed code edit with deletions → medium', () => {
   assert.equal(r.tier, 'medium');
 });
 
-test('classifyDiff: churn ≥ 500 lines → high (blast radius)', () => {
+test('classifyDiff: churn ≥ 1500 lines → high (blast radius)', () => {
   const r = classifyDiff([{ path: 'src/a.js', additions: 300, deletions: HIGH_CHURN_LINES - 300 }]);
   assert.equal(r.tier, 'high');
   assert.match(r.reasons.join(' '), new RegExp(`churn ${HIGH_CHURN_LINES}`));
@@ -145,9 +146,9 @@ test('classifyDiff: file count ≥ 25 → high (blast radius)', () => {
   assert.match(r.reasons.join(' '), new RegExp(`${HIGH_FILE_COUNT} files`));
 });
 
-test('classifyDiff: churn 499 + 24 files with deletions → medium (edge)', () => {
+test('classifyDiff: churn 1499 + 24 files with deletions → medium (edge)', () => {
   const files = [
-    { path: 'src/big.js', additions: 452, deletions: 1 },
+    { path: 'src/big.js', additions: 1452, deletions: 1 },
     ...Array.from({ length: 23 }, (_, i) => ({ path: `src/f${i}.js`, additions: 1, deletions: 1 })),
   ];
   const total = files.reduce((s, f) => s + f.additions + f.deletions, 0);
@@ -845,4 +846,353 @@ test('package.json test script runs factoryRisk.test.js via node --test AND excl
     testScript.includes("'tests/factoryRisk.test.js'"),
     'jest --testPathIgnorePatterns allowlist must include tests/factoryRisk.test.js',
   );
+});
+
+// ---------------------------------------------------------------------------
+// 13. GitHub PR approval surface (card 6af61f32ed767688104029e0;
+//     scripts/lib/factory-pr.js wired through approvalGate).
+//     ensurePr/checkPrApprovals are injected fakes — zero live GitHub.
+// ---------------------------------------------------------------------------
+
+const PR_URL = 'https://github.com/Ajohnson-1/factory/pull/5';
+const PR_META = { enabled: true, slug: 'Ajohnson-1/factory', baseBranch: 'master', approvers: ['ajohnson-1'] };
+const EMPTY_SCAN = { approval: null, changesRequested: [], staleApprovals: [], unrecognized: [] };
+const prApproval = { login: 'ajohnson-1', reviewId: 'r1', commitId: SHA, date: '2026-01-01T00:00:02.000Z' };
+
+/** ensurePr that records calls and returns a canned result. */
+function fakeEnsurePr(result) {
+  const calls = [];
+  const fn = async (args) => {
+    calls.push(args);
+    if (result instanceof Error) throw result;
+    return result;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+/** checkPrApprovals returning canned scans in order (last sticks). */
+function fakeCheck(scans) {
+  const calls = [];
+  const list = [...scans];
+  const fn = async (args) => {
+    calls.push(args);
+    const s = list.length > 1 ? list.shift() : list[0] ?? EMPTY_SCAN;
+    if (s instanceof Error) throw s;
+    return s;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+test('prMirrorText: pinned mirror comment shape (docs/factory.md Gate protocol)', () => {
+  assert.equal(
+    prMirrorText({ sha: SHA, number: 5, login: 'ajohnson-1' }),
+    `[HUMAN] APPROVED ${SHA} — GitHub PR #5 review approved by ajohnson-1`,
+  );
+});
+
+test('mirror comment never self-approves: bot-authored, board scan drops it', () => {
+  const m = findApprovalComment(
+    [act('mirror', T0, prMirrorText({ sha: SHA, number: 5, login: 'ajohnson-1' }), BOT)],
+    { sha: SHA, bot: BOT },
+  );
+  assert.equal(m, null);
+});
+
+test('gate low tier: PR machinery never runs (zero GitHub calls, no pr key)', async () => {
+  const clock = virtualClock();
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'low',
+    reasons: ['docs-only diff'],
+    t: throwingTrello(),
+    git: throwingGit,
+    notify: async () => {
+      throw new Error('no ping');
+    },
+    prMeta: PR_META,
+    ensurePr: () => {
+      throw new Error('PR must not run for low tier');
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.pr, undefined);
+});
+
+test('gate: existing Trello approval short-circuits BEFORE ensurePr (zero PR calls)', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({ comments: [[act('pre', '2025-12-31T23:00:00.000Z', `[HUMAN] APPROVED ${SHA}`)]] });
+  const ensure = fakeEnsurePr({ number: 5, url: PR_URL });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'high',
+    reasons: ['always-human paths'],
+    t,
+    git: throwingGit,
+    prMeta: PR_META,
+    ensurePr: ensure,
+    ...clock,
+  });
+  assert.equal(res.via, 'existing-comment');
+  assert.equal(ensure.calls.length, 0);
+  assert.equal(res.pr, undefined);
+});
+
+test('gate: PR approval already at the sha → via github-pr-review + ONE mirror comment, no ask', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({ comments: [[]] }); // board scan: nothing
+  const ensure = fakeEnsurePr({ number: 5, url: PR_URL });
+  const check = fakeCheck([{ ...EMPTY_SCAN, approval: prApproval }]);
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    t,
+    git: throwingGit,
+    prMeta: PR_META,
+    ensurePr: ensure,
+    checkPrApprovals: check,
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.via, 'github-pr-review');
+  assert.deepEqual(res.pr, { number: 5, url: PR_URL });
+  assert.equal(t.calls.add.length, 1); // exactly ONE comment: the mirror, no ask
+  assert.equal(t.calls.add[0].text, prMirrorText({ sha: SHA, number: 5, login: 'ajohnson-1' }));
+  assert.equal(res.reply.author, 'ajohnson-1');
+  assert.match(res.reply.text, new RegExp(SHA));
+  assert.equal(check.calls.length, 1);
+  assert.deepEqual(check.calls[0], { pr: { number: 5, url: PR_URL }, slug: 'Ajohnson-1/factory', sha: SHA, approvers: ['ajohnson-1'] });
+});
+
+test('gate: live PR → ask + ping carry the PR URL early (survives the 300-char brief)', async () => {
+  const clock = virtualClock();
+  const pings = [];
+  const t = fakeGateTrello({
+    comments: [
+      [], // board scan
+      [], // wait slice 1: nothing
+      [act('r1', '2026-01-01T00:00:02.000Z', `[HUMAN] APPROVED ${SHA}`)], // slice 2: board approval still works
+    ],
+  });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async ({ text }) => {
+      pings.push(text);
+      return { sent: true };
+    },
+    prMeta: PR_META,
+    ensurePr: fakeEnsurePr({ number: 5, url: PR_URL }),
+    checkPrApprovals: fakeCheck([]),
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.via, 'tag'); // board reply still wins the race it wins ([HUMAN] tag path)
+  assert.equal(t.calls.add.length, 1);
+  assert.match(t.calls.add[0].text, /^\[ASK\] Review the diff & approve from your phone: https:\/\/github\.com\/.*\nApproval required \(risk tier medium/);
+  assert.equal(pings.length, 1);
+  const urlAt = pings[0].indexOf(PR_URL);
+  assert.ok(urlAt > -1, 'ping carries the PR URL');
+  assert.ok(urlAt + PR_URL.length <= 180 + 300, 'URL inside the brief window');
+  assert.ok(urlAt < 180, 'URL starts inside the first ~180 chars');
+  assert.deepEqual(res.pr, { number: 5, url: PR_URL });
+});
+
+test('gate: PR approval mid-wait → mirror posted (shape pinned), stale review recorded ONCE, one ask only', async () => {
+  const clock = virtualClock();
+  const stale = {
+    login: 'someone-else',
+    reviewId: 'r0',
+    commitId: 'cafebabedeadbeefcafebabe1234567890abcdef99',
+    reason: 'not-allowlisted',
+    date: '2026-01-01T00:00:00.500Z',
+  };
+  const t = fakeGateTrello({ comments: [[]] }); // board never replies
+  const ensure = fakeEnsurePr({ number: 5, url: PR_URL });
+  // cycle 1: stale review only; cycle 2+: the same stale review PLUS approval
+  // (GitHub re-reports history — dedupe must keep the record single).
+  const check = fakeCheck([{ ...EMPTY_SCAN, staleApprovals: [stale] }, { ...EMPTY_SCAN, staleApprovals: [stale], approval: prApproval }]);
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'high',
+    reasons: ['always-human paths'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: PR_META,
+    ensurePr: ensure,
+    checkPrApprovals: check,
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.via, 'github-pr-review');
+  assert.equal(t.calls.add.length, 2); // one ask + one mirror
+  assert.match(t.calls.add[0].text, /^\[ASK\] Review the diff/);
+  assert.equal(t.calls.add[1].text, prMirrorText({ sha: SHA, number: 5, login: 'ajohnson-1' }));
+  assert.equal(res.reviews.length, 1); // wrong-sha/non-allowlisted review recorded once, window advanced
+  assert.equal(res.reviews[0].login, 'someone-else');
+  assert.equal(res.reviews[0].reason, 'not-allowlisted');
+});
+
+test('gate: sliced PR wait still times out at the deadline (park semantics intact)', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({ comments: [[]] }); // never replies
+  const check = fakeCheck([]); // never approves (two GETs per slice, canned)
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 5000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: PR_META,
+    ensurePr: fakeEnsurePr({ number: 5, url: PR_URL }),
+    checkPrApprovals: check,
+    ...clock,
+  });
+  assert.equal(res.approved, false);
+  assert.equal(res.timedOut, true);
+  assert.ok(res.waitedMs >= 5000, `waitedMs ${res.waitedMs} ≥ 5000`);
+  assert.equal(t.calls.add.length, 1); // ONE ask for the whole window
+  assert.ok(check.calls.length >= 4, `PR re-checked every slice (${check.calls.length})`);
+  assert.deepEqual(res.pr, { number: 5, url: PR_URL });
+});
+
+test('gate: PR API failure mid-wait degrades the cycle, self-heals next slice', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({ comments: [[]] });
+  const check = fakeCheck([new Error('HTTP 502'), { ...EMPTY_SCAN, approval: prApproval }]);
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: PR_META,
+    ensurePr: fakeEnsurePr({ number: 5, url: PR_URL }),
+    checkPrApprovals: check,
+    ...clock,
+  });
+  assert.equal(res.approved, true); // cycle 2 found the review
+  assert.equal(res.via, 'github-pr-review');
+  assert.equal(t.calls.add.length, 2); // ask + mirror
+});
+
+test('gate: degraded PR (ensurePr throws) → today\'s ask text byte-identical, old single-call loop, result only +pr:{degraded}', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [
+      [], // scan
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)], // the blocking wait finds it
+    ],
+  });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: PR_META,
+    ensurePr: fakeEnsurePr(new Error('push failed: connection reset')),
+    checkPrApprovals: () => {
+      throw new Error('no PR → zero PR polling');
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(t.calls.add.length, 1);
+  assert.equal(
+    t.calls.add[0].text,
+    `[ASK] ${approvalAskText({ tier: 'medium', reasons: ['code diff with edits'], sha: SHA })}`, // byte-identical to today
+  );
+  assert.deepEqual(res.pr, { degraded: true, error: 'push failed: connection reset' });
+  assert.equal(res.timedOut, undefined);
+});
+
+test('gate: kill switch (prMeta.enabled=false) → zero PR calls, byte-identical ask, degraded reason recorded', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [
+      [],
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)],
+    ],
+  });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: { ...PR_META, enabled: false, disabledReason: 'disabled (FACTORY_PR_APPROVALS=0)' },
+    ensurePr: () => {
+      throw new Error('PR must not run when disabled');
+    },
+    checkPrApprovals: () => {
+      throw new Error('PR must not run when disabled');
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(t.calls.add[0].text, `[ASK] ${approvalAskText({ tier: 'medium', reasons: ['code diff with edits'], sha: SHA })}`);
+  assert.deepEqual(res.pr, { degraded: true, error: 'disabled (FACTORY_PR_APPROVALS=0)' });
+});
+
+test('gate: ensurePr returning degraded (no token) → sha-only mode, ask byte-identical', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [
+      [],
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)],
+    ],
+  });
+  const res = await approvalGate({
+    cardId: CARD,
+    sha: SHA,
+    tier: 'medium',
+    reasons: ['code diff with edits'],
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    git: throwingGit,
+    notify: async () => ({ sent: true }),
+    prMeta: PR_META,
+    ensurePr: fakeEnsurePr({ degraded: true, error: 'no GitHub token (GITHUB_TOKEN / FACTORY_GITHUB_TOKEN)' }),
+    checkPrApprovals: () => {
+      throw new Error('no PR → zero PR polling');
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(t.calls.add[0].text, `[ASK] ${approvalAskText({ tier: 'medium', reasons: ['code diff with edits'], sha: SHA })}`);
+  assert.equal(res.pr.degraded, true);
 });
