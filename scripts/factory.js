@@ -17,7 +17,7 @@ import { PROD_LAYERS, closeProdCard, moveDoneGate } from './lib/factory-prod-clo
 import { mergeGuard } from './lib/factory-merge-guard.js';
 import { getContext, CONTEXT_STAGES } from './lib/factory-context.js';
 import { runMetricsReport } from './lib/factory-metrics.js';
-import { getDiffStat, classifyDiff, approvalGate } from './lib/factory-risk.js';
+import { getDiffStat, classifyDiff, approvalGate, planApprovalGate } from './lib/factory-risk.js';
 import { checkCommands, tipShaOf, runCheckSuite, checkCommentText } from './lib/factory-blocking-checks.js';
 import {
   CASES_PATH,
@@ -719,6 +719,25 @@ const commands = {
     process.exit(res.approved ? 0 : 1);
   },
 
+  // Plan-approval gate (docs/factory.md "Plan approval gate before
+  // Implement"): unconditional, keyed to the PLAN COMMIT sha. No git — the
+  // sha is argv (the scheduler run passes `git rev-parse HEAD` of the worktree
+  // right after the planner commits the plan file). Timeout → exit 1 → the
+  // scheduler labels needs-human and leaves the card in Plan (park, not a
+  // bounce). Recovery = approve on the card + drag back to Ready (scan
+  // short-circuits; comments are the state).
+  async 'plan-approve'() {
+    const board = boardOf();
+    const { flags, positional } = parseFlags(args);
+    const id = parseCardId(positional[0]);
+    const sha = (positional[1] || '').toLowerCase();
+    if (!/^[0-9a-f]{7,40}$/.test(sha))
+      die('Usage: factory.js plan-approve <card> <sha> [--timeout <ms>] [--interval <ms>]  (sha = plan-commit HEAD — 7-40 hex chars)');
+    const res = await planApprovalGate({ cardId: id, sha, board, ...flags });
+    out(res);
+    process.exit(res.approved ? 0 : 1);
+  },
+
   // Independent blocking-checks gate (docs/factory.md "Independent blocking
   // checks"): deterministic one-shot reproduction of the daemon poller for
   // ONE card — run the blocking suite (`npm test` as package.json defines
@@ -849,6 +868,8 @@ const commands = {
         '  metrics [--no-post] [--since <ISO8601>]  factory+reviewer metrics report (JSON); default posts one [METRICS] summary onto the report card',
         '  risk <branch> [target]      risk tier from the branch diff (exit 0; default HEAD vs origin/master)',
         '  approve <card> <sha> [branch]  risk gate: exit 0 when low tier OR a human comment keys THIS sha',
+        '      [--timeout <ms>] [--interval <ms>]  (defaults FACTORY_APPROVAL_TIMEOUT_MS/1h / FACTORY_ASK_POLL_MS/30s)',
+        '  plan-approve <card> <sha>   plan gate: exit 0 only when a human comment keys THIS plan-commit sha',
         '      [--timeout <ms>] [--interval <ms>]  (defaults FACTORY_APPROVAL_TIMEOUT_MS/1h / FACTORY_ASK_POLL_MS/30s)',
         '  archive <listName>          close (archive) a list',
         '  reorder                     order lists: To Do→Ready→…→Done',

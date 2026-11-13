@@ -88,7 +88,7 @@ toward the 3-bounce rule.
 
 | Stage | Subagent role | Input | Output | On success | On failure |
 | --- | --- | --- | --- | --- | --- |
-| Plan | planner | card name/desc via `factory.js context <id> plan` + repo read + `docs/factory-prompts/planner.md` | `plans/factory/<id>-plan.md` (committed on branch) + `[PLAN]` comment | → Implement | → bounce |
+| Plan | planner | card name/desc via `factory.js context <id> plan` + repo read + `docs/factory-prompts/planner.md` | `plans/factory/<id>-plan.md` (committed on branch) + `[PLAN]` comment | → plan approval gate (factory.js plan-approve, sha-keyed human approval) → Implement | → bounce |
 | Implement | implementer | `factory.js context <id> implement` (description + plan pointer + live findings + resolved digest) + plan file + own worktree + `docs/factory-prompts/implementer.md` | committed code + `[IMPL]` comment with verification evidence — exact commands run + observed output (Board contract) | → Review | → bounce |
 | Review | reviewer | `factory.js context <id> review` (description + latest `[IMPL]` evidence) + diff `git diff master...factory/<id>` + `factory.js mergeable` + risk tier (`factory.js risk`, fallback rules: reviewer brief) + `docs/factory-prompts/reviewer.md` + per-area review docs (`docs/review-guide/`, matched areas only) | `[REVIEW:APPROVE]` / `[REVIEW:CHANGES]` (itemized findings — **each finding on its own line tagged `[Important]` / `[Nit]` / `[Pre-existing]`** — mergeability noted; missing `[IMPL]` evidence or missing per-finding Findings-disposition enumeration on a bounce = automatic finding) | → security pass | → Review-verify |
 | Review-verify | verifier(s) — one fresh-context read-only subagent per finding | latest `[REVIEW:CHANGES]` findings + diff `git diff origin/master...factory/<id>` + worktree (to check master for pre-existence) | per-finding classifications → `factory.js review-verify <card> -` → `[REVIEW:VERIFY]` verdict (`decision=bounce` iff ≥1 CONFIRMED Important finding) | `decision=proceed` → security pass (no bounce) | `decision=bounce` → Implement (counts once) |
@@ -275,6 +275,10 @@ while cards = pull Ready (cap FACTORY_MAX_PARALLEL, default 1):
   fan out per card:
     worktree bootstrap (branch factory/<id> cut from origin/master)
     move → Plan;      planner;      expect [PLAN] comment
+    PLAN GATE: node scripts/factory.js plan-approve <id> <sha>  (sha = plan-commit HEAD, captured in the worktree)
+                ANY card: exit 0 → move → Implement; exit 1 (timeout) → needs-human, card stays in Plan,
+                stop the run — a park, NOT a bounce (3-bounce budget untouched). Comments are the state:
+                a late human approval + drag back to Ready re-runs and the gate's scan short-circuits.
     move → Implement; implementer;  expect [IMPL]
     MERGE GATE: rebase onto origin/master; factory.js mergeable factory/<id> master
                 must exit 0 — conflict → one implementer rebase, else needs-human
@@ -751,6 +755,7 @@ node scripts/factory.js merge-guard <br> [target=master]  # fresh-master gate: f
 node scripts/factory.js security-check <br> <target>  # security footprint probe: {securitySensitive, matchedPaths}; exit 0 always
 node scripts/factory.js risk <branch> [target]        # risk tier from the diff (exit 0)
 node scripts/factory.js approve <card> <sha> [branch] [--timeout ms] [--interval ms]  # risk gate; exit 1 unless approved
+node scripts/factory.js plan-approve <card> <sha> [--timeout ms] [--interval ms]  # plan gate; exit 1 unless a human comment keys the plan-commit sha (see "Plan approval gate before Implement")
 node scripts/factory.js watch                    # poll Ready; print NEW <id> <name>
 node scripts/factory.js done-watch [Done] [--interval ms] [--once]  # ping owner on Done arrivals (see below)
 node scripts/factory.js resume-watch [--interval ms] [--once] [--dry-run]  # resume in-flight cards a human commented on (see "Listening for human comments")
@@ -913,6 +918,60 @@ unparseable findings, bad classifications JSON, unknown index/verdict — so a
 broken classifications payload can never silently proceed. Logic lives in
 `scripts/lib/factory-review-verify.js` (dependency-injectable, tested by
 `tests/factoryReviewVerify.test.js`).
+
+## Plan approval gate before Implement
+
+A card never flows into Implement without a human reading the plan.
+`[PLAN]` is a bot verdict and is NEVER an approval: implementer compute is
+expensive and follows the plan verbatim, so a human must look at the plan
+BEFORE it is built. This gate is the Plan→Implement analogue of the risk
+gate below — the same sha-keyed approval machinery, keyed to the **plan
+commit sha** instead of the QA-passed code sha.
+
+```sh
+node scripts/factory.js plan-approve <card> <sha> [--timeout ms] [--interval ms]
+```
+
+- **Unconditional: every card, every tier.** The plan commit is a docs-only
+  diff, so the deploy gate's low-tier auto-pass would defeat this gate;
+  there is no tier escape hatch and no opt-out knob. Human overrides are
+  the contract's existing ones: a late sha-keyed approval comment satisfies
+  the scan, and dragging the card past Plan→Implement is a human advance
+  instruction (the resume rules answer the pending ask).
+- **`sha` = the plan-commit HEAD** — `git rev-parse HEAD` in the card
+  worktree immediately after the planner commits
+  `plans/factory/<id>-plan.md`. Any re-plan is a new commit = new sha =
+  the old approval goes stale and the gate re-asks (mirrors the deploy
+  gate's rebase rule). If the plan file is untouched, HEAD is unchanged
+  and a re-run's scan short-circuits.
+- **Scan-first**: a qualifying approval already on the card → exit 0 with
+  ZERO new board writes (comments are the state). Otherwise the gate
+  **reuses the ask protocol** (`scripts/lib/factory-ask.js`): ONE
+  `ask --no-wait` post (`[ASK] Plan approval required ...`) + Discord
+  ping, then date-based `wait` polls until timeout
+  (`FACTORY_APPROVAL_TIMEOUT_MS`, default `FACTORY_ASK_TIMEOUT_MS` or 1 h).
+- An **approval comment** qualifies exactly as in the deploy gate below:
+  it mentions the plan sha (full or any ≥7-char prefix, word-bounded) AND
+  passes the ask protocol's human-reply rules — human-authored, or
+  `[HUMAN]`-tagged and not bot-authored; **bot-authored NEVER counts**;
+  degraded identity → tagged-only. A **wrong-sha reply does not count and
+  does not re-post the ask** (one ask post/ping per window; the wait
+  window advances past it).
+- **Timeout** → exit 1 → the scheduler labels `needs-human`, leaves the
+  card in **Plan**, and stops the run. This is a **park, not a bounce**:
+  the gate posts no `[REVIEW:CHANGES]/[QA:FAIL]/[VERIFY:FAIL]`, so the
+  3-bounce counter is untouched. Recovery: approve on the card (a comment
+  containing the plan sha) and drag it back to Ready — the re-run's scan
+  finds the approval; or a plain `[HUMAN]` reply on the pending ask resumes
+  the run at Plan via the comment-resume watcher. While the gate's `[ASK]`
+  is pending the ask-pending guardrails apply unchanged (silent watcher,
+  stall-hold).
+
+The gate runs **inside the scheduler run**, after the `[PLAN]` comment and
+before `move → Implement` (docs "Scheduler loop" PLAN GATE step; the daemon
+poller is unchanged). Logic lives in `scripts/lib/factory-risk.js`
+(`planApprovalGate`, dependency-injectable, tested by
+`tests/factoryRisk.test.js`) behind the `factory.js plan-approve` CLI.
 
 ## Risk-tiered approval before Deploy
 

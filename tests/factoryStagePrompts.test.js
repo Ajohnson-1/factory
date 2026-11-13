@@ -434,6 +434,74 @@ describe('scheduler prompts seed the stage docs', () => {
   });
 });
 
+// The plan approval gate (card 6af61f965d1abaa7ca5275a8; docs/factory.md
+// "Plan approval gate before Implement"): the PLAN GATE sits between the
+// [PLAN] verdict and the Implement move in docs + run prompt, the contract
+// section/CLI/table name it, and the planner doc carries the
+// ask-when-ambiguous guidance it points at.
+describe('plan approval gate before Implement (card 6af61f965d1abaa7ca5275a8)', () => {
+  it('scheduler loop keeps the order [PLAN] → PLAN GATE → Implement → QA → RISK GATE; no merge/deploy-gate line between Plan and Implement', () => {
+    const plan = factoryDoc.indexOf('expect [PLAN] comment');
+    const gate = factoryDoc.indexOf('PLAN GATE: node scripts/factory.js plan-approve');
+    const impl = factoryDoc.indexOf('move → Implement;');
+    const qa = factoryDoc.indexOf('move → QA;');
+    const risk = factoryDoc.indexOf('RISK GATE: node scripts/factory.js approve');
+    const merge = factoryDoc.indexOf('git merge --ff-only factory/<id> → master; run npm test   ←');
+    expect(plan).toBeGreaterThanOrEqual(0);
+    expect(gate).toBeGreaterThan(plan);
+    expect(impl).toBeGreaterThan(gate);
+    expect(qa).toBeGreaterThan(impl);
+    expect(risk).toBeGreaterThan(qa);
+    expect(merge).toBeGreaterThan(risk);
+    // the slice from the PLAN GATE to the merge still contains the whole
+    // deploy-gate chain: the new gate never displaces the RISK GATE
+    const between = factoryDoc.slice(gate, merge);
+    expect(between).toContain('RISK GATE: node scripts/factory.js approve');
+    expect(between).toContain('move → QA;');
+    // a merge never precedes implementation and the deploy gate never moves
+    // up into the Plan→Implement slice (`factory.js approve ` with the
+    // trailing space never matches `plan-approve`)
+    const planToImpl = factoryDoc.slice(factoryDoc.indexOf('move → Plan;'), impl);
+    expect(planToImpl).not.toMatch(/git merge --ff-only|factory\.js approve /);
+  });
+
+  it('buildRunPrompt carries the PLAN GATE step: plan-approve, needs-human, park-not-bounce stop', () => {
+    const p = buildRunPrompt({ id: 'abc', name: 'X' });
+    expect(p).toContain('PLAN GATE after [PLAN] and BEFORE the Implement move');
+    expect(p).toContain('node scripts/factory.js plan-approve');
+    expect(p).toContain('needs-human');
+    expect(p).toContain('leave the card in Plan');
+    expect(p).toMatch(/a park, NOT a bounce/);
+  });
+
+  it('docs/factory.md carries the gate: section before the deploy gate, CLI line, Stages-table Plan row', () => {
+    expect(factoryDoc).toContain('## Plan approval gate before Implement');
+    // the two sha-keyed approval gates sit adjacent, plan gate first
+    expect(factoryDoc.indexOf('## Plan approval gate before Implement')).toBeLessThan(
+      factoryDoc.indexOf('## Risk-tiered approval before Deploy'),
+    );
+    expect(factoryDoc).toMatch(
+      /node scripts\/factory\.js plan-approve <card> <sha> \[--timeout ms\] \[--interval ms\]/,
+    );
+    const planRow = factoryDoc.split('\n').find((l) => /^\|\s*Plan\s*\|/.test(l));
+    expect(planRow).toBeDefined();
+    expect(planRow).toContain('plan approval gate');
+    expect(planRow).toContain('plan-approve');
+    expect(planRow).toContain('→ Implement');
+  });
+
+  it('planner doc carries the ask-when-ambiguous guidance and the approval-gate pointer', () => {
+    const doc = docOf('planner');
+    expect(doc).toMatch(/## Ask when ambiguous/);
+    expect(doc).toContain('factory.js ask');
+    expect(doc).toMatch(/one .{0,2}ASK/i); // ONE [ASK] — grouped
+    expect(doc).toContain('numbered');
+    expect(doc).toContain('factory.js wait'); // re-entry: ask once, wait many times
+    expect(doc).toMatch(/do NOT post .{0,2}PLAN/i); // timeout: no fake [PLAN]
+    expect(doc).toMatch(/plan-approve|plan approval/i);
+  });
+});
+
 // FM-2 (§4.3): the REPO CONTEXT block — the run/resume prompts must carry the
 // exact repo paths, bootstrap recipe, and deploy command lines from
 // config/factory-repos.json, so the stage agents never guess where the repo,

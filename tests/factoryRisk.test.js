@@ -24,6 +24,8 @@ import {
   approvalGate,
   approvalAskText,
   approvalTimeoutDefault,
+  planApprovalGate,
+  planApprovalAskText,
   HIGH_CHURN_LINES,
   HIGH_FILE_COUNT,
   ALWAYS_HUMAN,
@@ -581,6 +583,212 @@ test('approvalTimeoutDefault: env chain FACTORY_APPROVAL_TIMEOUT_MS → ASK → 
 });
 
 // ---------------------------------------------------------------------------
+// 10b. planApprovalGate (card 6af61f965d1abaa7ca5275a8 — docs/factory.md
+// "Plan approval gate before Implement"): the same seams as the approvalGate
+// tests above; the gate has NO tiering and NO git — the sha arrives as argv.
+// ---------------------------------------------------------------------------
+
+test('planApprovalGate: required for EVERY card — no tiering, no git, a docs-only plan gets no auto-pass (existing approval, zero writes)', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [[act('pre', '2025-12-31T23:00:00.000Z', `[HUMAN] APPROVED ${SHA}`)]],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    t,
+    git: throwingGit, // the gate has no git dependency at all — a throwing stub injected anywhere is never called
+    notify: async () => {
+      throw new Error('no ping expected on the scan-first path');
+    },
+    ...clock,
+  });
+  assert.equal(res.required, true); // unconditional: every card, every tier
+  assert.equal(res.approved, true);
+  assert.equal(res.via, 'existing-comment');
+  assert.equal(res.tier, undefined); // no classification in the result — no low-tier escape hatch
+  assert.equal(t.calls.add.length, 0); // zero new board writes (comments are the state)
+});
+
+test('planApprovalGate: no approval → ONE plan-gate [ASK]+ping, sha-bearing human reply → approved (full sha)', async () => {
+  const clock = virtualClock();
+  const pings = [];
+  const t = fakeGateTrello({
+    comments: [
+      [], // scan: nothing yet
+      [], // poll 1: nothing yet
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)], // poll 2: the approval
+    ],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    notify: async ({ text }) => {
+      pings.push(text);
+      return { sent: true };
+    },
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.required, true);
+  assert.equal(res.askCommentId, 'ask1');
+  assert.equal(res.via, 'tag');
+  assert.equal(t.calls.add.length, 1); // exactly ONE ask post
+  assert.match(t.calls.add[0].text, /^\[ASK\] Plan approval required/);
+  assert.match(t.calls.add[0].text, new RegExp(SHA, 'i'));
+  assert.match(t.calls.add[0].text, new RegExp(`plans/factory/${CARD}-plan\\.md`)); // names the plan file
+  assert.equal(pings.length, 1); // exactly one ping
+  assert.match(pings[0], new RegExp(SHA, 'i')); // ask question quoted into the ping
+  assert.equal(res.discord?.sent, true);
+});
+
+test('planApprovalGate: 7-char sha prefix reply approves', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [
+      [], // scan
+      [act('r1', '2026-01-01T00:00:01.000Z', '[HUMAN] APPROVED deadbee')], // ≥7-char prefix
+    ],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.match(res.reply.text, /deadbee/);
+});
+
+test('planApprovalGate: degraded identity (getMe throws) → [HUMAN]-tagged reply counts', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    meThrows: new Error('identity lookup failed'),
+    comments: [
+      [], // scan
+      [], // poll 1
+      [act('r1', '2026-01-01T00:00:01.000Z', `[HUMAN] APPROVED ${SHA}`)],
+    ],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(res.via, 'tag');
+});
+
+test('planApprovalGate: degraded identity → author-only sha comment NEVER approves (fail-closed → timeout)', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    meThrows: new Error('identity lookup failed'),
+    // human-authored + sha-mentioning but UNTAGGED: while the bot identity is
+    // unknown only [HUMAN]-tagged comments qualify (ask protocol fail-closed)
+    comments: [[act('h1', '2026-01-01T00:00:01.000Z', `APPROVED ${SHA}`, HUMAN)]],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 5000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, false);
+  assert.equal(res.timedOut, true);
+  assert.equal(res.required, true);
+  assert.equal(t.calls.add.length, 1);
+});
+
+test('planApprovalGate: bot-authored comment containing the sha NEVER approves, even [HUMAN]-tagged', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [[act('b1', '2025-12-31T23:00:00.000Z', `[HUMAN] APPROVED ${SHA}`, BOT)]],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 5000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, false);
+  assert.equal(res.timedOut, true);
+  assert.equal(res.required, true);
+  assert.equal(t.calls.add.length, 1); // the gate asked instead of accepting the bot echo
+});
+
+test('planApprovalGate: wrong-sha reply skipped, ask NOT re-posted, later approval counts', async () => {
+  const clock = virtualClock();
+  const wrong = act('w1', '2026-01-01T00:00:01.000Z', '[HUMAN] APPROVED 1111111122222222333333334444444455555555');
+  const right = act('w2', '2026-01-01T00:00:02.000Z', `[HUMAN] APPROVED ${SHA}`);
+  const t = fakeGateTrello({
+    comments: [
+      [], // scan
+      [wrong], // poll 1: human reply keyed to ANOTHER sha
+      [wrong, right], // poll 2: the real approval
+    ],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 60_000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, true);
+  assert.equal(t.calls.add.length, 1); // still ONE ask post — wrong-sha reply does not re-ask
+  assert.match(res.reply.text, new RegExp(SHA)); // the accepted reply carries the sha
+  assert.ok(Date.parse(res.reply.date) > Date.parse(wrong.date)); // window advanced past the wrong reply
+});
+
+test('planApprovalGate: timeout → {required:true, approved:false, timedOut:true}, clock ≥ timeout, ONE ask', async () => {
+  const clock = virtualClock();
+  const t = fakeGateTrello({
+    comments: [[act('n1', '2026-01-01T00:00:01.000Z', '[HUMAN] no sha here')]],
+  });
+  const res = await planApprovalGate({
+    cardId: CARD,
+    sha: SHA,
+    timeoutMs: 5000,
+    intervalMs: 1000,
+    t,
+    notify: async () => ({ sent: true }),
+    ...clock,
+  });
+  assert.equal(res.approved, false);
+  assert.equal(res.timedOut, true);
+  assert.equal(res.required, true);
+  assert.ok(res.waitedMs >= 5000, `waitedMs ${res.waitedMs} ≥ 5000`);
+  assert.equal(t.calls.add.length, 1);
+});
+
+test('planApprovalAskText: plan path, branch, sha (twice), re-plan invalidation', () => {
+  const text = planApprovalAskText({ cardId: CARD, sha: SHA });
+  assert.match(text, /Plan approval required/);
+  assert.match(text, new RegExp(`plans/factory/${CARD}-plan\\.md`));
+  assert.match(text, new RegExp(`factory/${CARD}`));
+  assert.equal((text.match(new RegExp(SHA, 'g')) ?? []).length, 2); // display + reply instruction
+  assert.match(text, /re-plan a new approval is required/);
+});
+
+// ---------------------------------------------------------------------------
 // 11. CLI wiring via spawnSync — usage paths die BEFORE any network call.
 // ---------------------------------------------------------------------------
 
@@ -592,6 +800,7 @@ test('CLI help lists risk and approve', () => {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /^\s+risk <branch>/m);
   assert.match(r.stdout, /^\s+approve <card> <sha>/m);
+  assert.match(r.stdout, /^\s+plan-approve <card> <sha>/m);
 });
 
 test('CLI approve without sha → exit 1 usage before any network', () => {
@@ -602,6 +811,18 @@ test('CLI approve without sha → exit 1 usage before any network', () => {
 
 test('CLI approve with malformed sha → exit 1 usage', () => {
   const r = runCli('approve', CARD, 'zzzzz');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /7-40 hex/);
+});
+
+test('CLI plan-approve without sha → exit 1 usage before any network', () => {
+  const r = runCli('plan-approve', CARD);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /Usage: factory\.js plan-approve/);
+});
+
+test('CLI plan-approve with malformed sha → exit 1 usage before any network', () => {
+  const r = runCli('plan-approve', CARD, 'zzzzz');
   assert.equal(r.status, 1);
   assert.match(r.stderr, /7-40 hex/);
 });

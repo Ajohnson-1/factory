@@ -341,3 +341,109 @@ export async function approvalGate({
     sinceIso = new Date(Date.parse(res.reply.date) + 1).toISOString();
   }
 }
+
+// --- The plan-approval gate ---------------------------------------------------
+
+/** The plan-gate `[ASK]` question template (docs/factory.md "Plan approval
+ *  gate before Implement"). Keys to the PLAN COMMIT sha; states the
+ *  re-plan invalidation rule. */
+export const planApprovalAskText = ({ cardId, sha }) =>
+  `Plan approval required. Implementation of card ${cardId} is held until a ` +
+  `human approves the plan on branch factory/${cardId} ` +
+  `(plans/factory/${cardId}-plan.md @ sha ${sha}). ` +
+  `To approve, post a comment containing the sha, e.g. "[HUMAN] APPROVED ${sha}". ` +
+  `Comments keyed to another sha do not count — after a re-plan a new approval is required.`;
+
+/**
+ * The plan-approval gate (docs/factory.md "Plan approval gate before
+ * Implement"): unconditional human approval keyed to the PLAN COMMIT sha,
+ * between the [PLAN] verdict and the move to Implement. Same primitives as
+ * approvalGate, no tiering and NO git (the sha arrives as argv; the CLI runs
+ * from the factory checkout): required for every card — a docs-only plan
+ * diff gets NO low-tier auto-pass (that would defeat the gate); scan-first
+ * (findApprovalComment, any date — comments are the state); else ONE
+ * askHuman({noWait:true}) post + Discord ping, then waitForHuman until the
+ * deadline; wrong-sha replies don't count, don't re-post, window advances;
+ * timeout → {required:true, approved:false, timedOut:true} → CLI exit 1 →
+ * scheduler parks needs-human IN PLAN (a park, not a bounce).
+ * Deps injectable: t (trello client), notify (defaults to sendOwnerPing;
+ * failure recorded, never thrown), sleep/now (clock seams) — the same fakes
+ * as the approvalGate tests (tests/factoryRisk.test.js).
+ * → { required:true, approved, via?, timedOut?, sha, askCommentId?, discord?,
+ *     reply?, polls, waitedMs }
+ */
+export async function planApprovalGate({
+  cardId,
+  sha,
+  timeoutMs = approvalTimeoutDefault(),
+  intervalMs = envNum('FACTORY_ASK_POLL_MS', 30_000),
+  board = undefined,
+  t = trello,
+  notify = sendOwnerPing,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now = () => new Date().toISOString(),
+} = {}) {
+  const startMs = Date.parse(now());
+  const out = { sha };
+  let polls = 0;
+  let bot = null;
+  try {
+    if (typeof t.getMe === 'function') bot = (await t.getMe()) ?? null;
+  } catch {
+    /* identity degraded → tag-only, same fail-closed mode as the ask protocol */
+  }
+  const actions = await t.getCardComments(cardId);
+  polls += 1;
+  const existing = findApprovalComment(actions, { sha, bot });
+  if (existing) {
+    return { ...out, required: true, approved: true, via: 'existing-comment', reply: existing, polls, waitedMs: Date.parse(now()) - startMs };
+  }
+  // Date floor: the ask moment captured BEFORE askHuman (post + getCard +
+  // Discord ping cost seconds), truncated to whole seconds — same ask-date
+  // semantics as approvalGate above: approvals stamped in the ask's own
+  // second survive the `ms >= sinceMs` filter instead of burning the full
+  // timeout. The `[ASK]` question quotes the sha, so the bot's own echo must
+  // never pass as the approval — it never does: bot-authored, so the ask
+  // protocol's qualification drops it on every poll, never the date window.
+  const askFloorIso = new Date(Math.floor(Date.parse(now()) / 1000) * 1000).toISOString();
+  const asked = await askHuman({
+    cardId,
+    question: planApprovalAskText({ cardId, sha }),
+    noWait: true,
+    board,
+    t,
+    notify,
+    sleep,
+    now,
+  });
+  const out0 = {
+    ...out,
+    required: true,
+    askCommentId: asked.askCommentId,
+    discord: asked.discord,
+  };
+  let sinceIso = askFloorIso;
+  const deadlineMs = Date.parse(sinceIso) + timeoutMs;
+  let waitedMs = Date.parse(now()) - startMs;
+  for (;;) {
+    const remaining = deadlineMs - Date.parse(now());
+    if (remaining <= 0) {
+      return { ...out0, approved: false, timedOut: true, polls, waitedMs };
+    }
+    const res = await waitForHuman({ cardId, sinceIso, timeoutMs: remaining, intervalMs, board, t, sleep, now });
+    polls += res.polls ?? 0;
+    waitedMs = Date.parse(now()) - startMs;
+    if (!res.replied) {
+      return { ...out0, approved: false, timedOut: true, polls, waitedMs };
+    }
+    // The reply already passed the ask protocol's qualification (author rules,
+    // bot exclusion, date window); all that remains is the sha keying —
+    // checked directly so the reply object's author/via are preserved.
+    if (shaMentionRe(sha).test(res.reply.text)) {
+      return { ...out0, approved: true, via: res.reply.via, reply: res.reply, polls, waitedMs };
+    }
+    // Wrong-sha human reply: does not count, does NOT re-post the ask —
+    // advance the window past it and keep waiting until the deadline.
+    sinceIso = new Date(Date.parse(res.reply.date) + 1).toISOString();
+  }
+}
